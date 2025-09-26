@@ -98,7 +98,7 @@ def run_search(kw, category, service, use_fts_flag=True, limit=5000):
                 return rows
 
         # Fallback: case-insensitive substring search across all fields + Keywords
-        conds_like = conds + [
+        like_expr = (
             "LOWER("
             "COALESCE(category,'')||' '||"
             "COALESCE(service,'')||' '||"
@@ -106,10 +106,19 @@ def run_search(kw, category, service, use_fts_flag=True, limit=5000):
             "COALESCE(contact_name,'')||' '||"
             "COALESCE(phone,'')||' '||"
             "COALESCE(address,'')||' '||"
-            "COALESCE(we
+            "COALESCE(website,'')||' '||"
+            "COALESCE(notes,'')||' '||"
+            "COALESCE(Keywords,'')"
+            ") LIKE ?"
+        )
+        conds_like = conds + [like_expr]
+        params_like = params + [f"%{kw.strip().lower()}%"]
+        sql_like = base + " WHERE " + " AND ".join(conds_like) + " ORDER BY business_name COLLATE NOCASE LIMIT ?"
+        return q(conn, sql_like, tuple(params_like + [limit]))
+    else:
+        sql = base + (" WHERE " + " AND ".join(conds) if conds else "") + " ORDER BY business_name COLLATE NOCASE LIMIT ?"
+        return q(conn, sql, tuple(params + [limit]))
 
-
-# ------------------------------------------------------------
 # ------------------------------------------------------------
 # Table + CSV (CORRECT mapping: website=URL, notes=text)
 # ------------------------------------------------------------
