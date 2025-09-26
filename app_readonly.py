@@ -1,4 +1,3 @@
-
 import os, sqlite3
 from pathlib import Path
 import streamlit as st
@@ -16,6 +15,7 @@ DB_PATH = Path(os.getenv("VENDORS_DB", REPO_DB))
 # DB helpers (READ-ONLY connection)
 # ------------------------------------------------------------
 def get_conn_ro(path: Path):
+    # Open SQLite in read-only mode via URI
     uri = f"file:{path.as_posix()}?mode=ro"
     conn = sqlite3.connect(uri, uri=True, check_same_thread=False)
     conn.row_factory = sqlite3.Row
@@ -27,7 +27,12 @@ def q(conn, sql, params=()):
     return cur.fetchall()
 
 def get_distinct(conn, col):
-    rows = q(conn, f"SELECT DISTINCT {col} AS v FROM vendors WHERE {col} IS NOT NULL AND {col}<>'' ORDER BY {col} COLLATE NOCASE")
+    rows = q(
+        conn,
+        f"SELECT DISTINCT {col} AS v FROM vendors "
+        f"WHERE {col} IS NOT NULL AND {col}<>'' "
+        f"ORDER BY {col} COLLATE NOCASE"
+    )
     return [""] + [r["v"] for r in rows]
 
 def fts_available(conn):
@@ -38,7 +43,7 @@ def render_link(u):
     if not u:
         return ""
     s = str(u).strip()
-    if s.startswith(("http://","https://")):
+    if s.startswith(("http://", "https://")):
         return f"[{s}]({s})"
     if s.startswith("www."):
         return f"[http://{s}](http://{s})"
@@ -64,9 +69,12 @@ use_fts = st.sidebar.checkbox("Use FTS (exact-word search)", value=fts_available
 # ------------------------------------------------------------
 st.title("Vendor Directory (Read-Only)")
 
-col1, col2, col3 = st.columns([3,2,2], gap="large")
+col1, col2, col3 = st.columns([3, 2, 2], gap="large")
 with col1:
-    kw = st.text_input("Keyword (names, notes text, URLs)", value="")
+    kw = st.text_input(
+        "Keyword (names, notes text, URLs, and Keywords field)",
+        value=""
+    )
 with col2:
     category = st.selectbox("Category (optional)", get_distinct(conn, "category"))
 with col3:
@@ -90,12 +98,21 @@ def run_search(kw, category, service, use_fts_flag=True, limit=5000):
     if kw.strip():
         # Try FTS first if available and requested
         if use_fts_flag and fts_available(conn):
-            conds_fts = conds + ["rowid IN (SELECT rowid FROM vendors_fts WHERE vendors_fts MATCH ?)"]
+            conds_fts = conds + [
+                "rowid IN (SELECT rowid FROM vendors_fts WHERE vendors_fts MATCH ?)"
+            ]
             params_fts = params + [kw.strip()]
-            sql_fts = base + " WHERE " + " AND ".join(conds_fts) + " ORDER BY business_name COLLATE NOCASE LIMIT ?"
-            rows = q(conn, sql_fts, tuple(params_fts + [limit]))
-            if rows:
-                return rows
+            sql_fts = (
+                base + " WHERE " + " AND ".join(conds_fts) +
+                " ORDER BY business_name COLLATE NOCASE LIMIT ?"
+            )
+            try:
+                rows = q(conn, sql_fts, tuple(params_fts + [limit]))
+                if rows:
+                    return rows
+            except Exception:
+                # If FTS query fails, silently fall back to LIKE
+                pass
 
         # Fallback: case-insensitive substring search across all fields + Keywords
         like_expr = (
@@ -113,18 +130,35 @@ def run_search(kw, category, service, use_fts_flag=True, limit=5000):
         )
         conds_like = conds + [like_expr]
         params_like = params + [f"%{kw.strip().lower()}%"]
-        sql_like = base + " WHERE " + " AND ".join(conds_like) + " ORDER BY business_name COLLATE NOCASE LIMIT ?"
+        sql_like = (
+            base + " WHERE " + " AND ".join(conds_like) +
+            " ORDER BY business_name COLLATE NOCASE LIMIT ?"
+        )
         return q(conn, sql_like, tuple(params_like + [limit]))
     else:
-        sql = base + (" WHERE " + " AND ".join(conds) if conds else "") + " ORDER BY business_name COLLATE NOCASE LIMIT ?"
+        sql = (
+            base + (" WHERE " + " AND ".join(conds) if conds else "") +
+            " ORDER BY business_name COLLATE NOCASE LIMIT ?"
+        )
         return q(conn, sql, tuple(params + [limit]))
+
+# Guarded call so 'rows' is always defined and errors are visible to you
+try:
+    rows = run_search(kw, category, service, use_fts_flag=use_fts, limit=5000)
+except Exception as e:
+    st.error("Search failed. See details below if you own the app.")
+    st.exception(e)
+    rows = []
+
+st.subheader(f"Results ({len(rows)})")
+
 # ------------------------------------------------------------
 # Table + CSV (CORRECT mapping: website=URL, notes=text)
 # ------------------------------------------------------------
 if rows:
     df = pd.DataFrame([dict(r) for r in rows])
 
-    # Ensure Keywords exists even if empty (belt + suspenders)
+    # Ensure Keywords exists even if empty (SELECT coalesces, this is extra-safe)
     if "Keywords" not in df.columns:
         df["Keywords"] = ""
 
@@ -136,8 +170,8 @@ if rows:
     # Show/Hide Keywords in the table (search always includes it)
     show_kw = st.toggle("Show Keywords column", value=True)
     base_display_cols = [
-        "category","service","business_name","contact_name","phone",
-        "address","Website (URL)","Notes (text)"
+        "category", "service", "business_name", "contact_name", "phone",
+        "address", "Website (URL)", "Notes (text)"
     ]
     display_cols = base_display_cols + (["Keywords"] if show_kw else [])
 
@@ -145,8 +179,8 @@ if rows:
 
     # CSV export (include Keywords for QA)
     csv_cols = [
-        "category","service","business_name","contact_name","phone",
-        "address","website","notes","Keywords"
+        "category", "service", "business_name", "contact_name", "phone",
+        "address", "website", "notes", "Keywords"
     ]
     st.download_button(
         "Download results as CSV",
@@ -157,5 +191,3 @@ if rows:
 else:
     st.info("No matches. Try a shorter keyword or clear filters.")
 
-
-st.caption("Public read-only app. DB normalized: website = URL, notes = free-text.")
