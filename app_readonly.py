@@ -76,7 +76,11 @@ with col3:
 # Search
 # ------------------------------------------------------------
 def run_search(kw, category, service, use_fts_flag=True, limit=5000):
-    base = "SELECT id, category, service, business_name, contact_name, phone, address, website, notes FROM vendors"
+    base = (
+        "SELECT id, category, service, business_name, contact_name, phone, "
+        "address, website, notes, COALESCE(Keywords,'') AS Keywords "
+        "FROM vendors"
+    )
     conds, params = [], []
     if category:
         conds.append("category = ?"); params.append(category)
@@ -84,6 +88,7 @@ def run_search(kw, category, service, use_fts_flag=True, limit=5000):
         conds.append("service = ?"); params.append(service)
 
     if kw.strip():
+        # Try FTS first if available and requested
         if use_fts_flag and fts_available(conn):
             conds_fts = conds + ["rowid IN (SELECT rowid FROM vendors_fts WHERE vendors_fts MATCH ?)"]
             params_fts = params + [kw.strip()]
@@ -91,20 +96,18 @@ def run_search(kw, category, service, use_fts_flag=True, limit=5000):
             rows = q(conn, sql_fts, tuple(params_fts + [limit]))
             if rows:
                 return rows
-        # Fallback substring search
-        conds_like = conds + [
-            "LOWER(COALESCE(category,'')||' '||COALESCE(service,'')||' '||COALESCE(business_name,'')||' '||"
-            "COALESCE(contact_name,'')||' '||COALESCE(address,'')||' '||COALESCE(website,'')||' '||COALESCE(notes,'')) LIKE ?"
-        ]
-        params_like = params + [f"%{kw.strip().lower()}%"]
-        sql_like = base + " WHERE " + " AND ".join(conds_like) + " ORDER BY business_name COLLATE NOCASE LIMIT ?"
-        return q(conn, sql_like, tuple(params_like + [limit]))
-    else:
-        sql = base + (" WHERE " + " AND ".join(conds) if conds else "") + " ORDER BY business_name COLLATE NOCASE LIMIT ?"
-        return q(conn, sql, tuple(params + [limit]))
 
-rows = run_search(kw, category, service, use_fts_flag=use_fts, limit=5000)
-st.subheader(f"Results ({len(rows)})")
+        # Fallback: case-insensitive substring search across all fields + Keywords
+        conds_like = conds + [
+            "LOWER("
+            "COALESCE(category,'')||' '||"
+            "COALESCE(service,'')||' '||"
+            "COALESCE(business_name,'')||' '||"
+            "COALESCE(contact_name,'')||' '||"
+            "COALESCE(phone,'')||' '||"
+            "COALESCE(address,'')||' '||"
+            "COALESCE(we
+
 
 # ------------------------------------------------------------
 # Table + CSV (CORRECT mapping: website=URL, notes=text)
