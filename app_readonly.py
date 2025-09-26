@@ -118,7 +118,6 @@ def run_search(kw, category, service, use_fts_flag=True, limit=5000):
     else:
         sql = base + (" WHERE " + " AND ".join(conds) if conds else "") + " ORDER BY business_name COLLATE NOCASE LIMIT ?"
         return q(conn, sql, tuple(params + [limit]))
-
 # ------------------------------------------------------------
 # Table + CSV (CORRECT mapping: website=URL, notes=text)
 # ------------------------------------------------------------
