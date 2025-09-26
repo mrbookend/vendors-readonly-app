@@ -110,23 +110,44 @@ def run_search(kw, category, service, use_fts_flag=True, limit=5000):
 
 
 # ------------------------------------------------------------
+# ------------------------------------------------------------
 # Table + CSV (CORRECT mapping: website=URL, notes=text)
 # ------------------------------------------------------------
 if rows:
-    df = pd.DataFrame([dict(r) for r in rows])[
-        ["category","service","business_name","contact_name","phone","address","website","notes"]
-    ]
-    df = df.rename(columns={"website": "Website (URL)", "notes": "Notes (text)"})
+    df = pd.DataFrame([dict(r) for r in rows])
+
+    # Ensure Keywords exists even if empty (belt + suspenders)
+    if "Keywords" not in df.columns:
+        df["Keywords"] = ""
+
+    # Build display copy with pretty columns/links
     df_display = df.copy()
-    df_display["Website (URL)"] = df_display["Website (URL)"].apply(render_link)
-    st.dataframe(df_display, use_container_width=True, hide_index=True)
+    df_display["Website (URL)"] = df_display["website"].apply(render_link)
+    df_display = df_display.rename(columns={"notes": "Notes (text)"})
+
+    # Show/Hide Keywords in the table (search always includes it)
+    show_kw = st.toggle("Show Keywords column", value=True)
+    base_display_cols = [
+        "category","service","business_name","contact_name","phone",
+        "address","Website (URL)","Notes (text)"
+    ]
+    display_cols = base_display_cols + (["Keywords"] if show_kw else [])
+
+    st.dataframe(df_display[display_cols], use_container_width=True, hide_index=True)
+
+    # CSV export (include Keywords for QA)
+    csv_cols = [
+        "category","service","business_name","contact_name","phone",
+        "address","website","notes","Keywords"
+    ]
     st.download_button(
         "Download results as CSV",
-        df.to_csv(index=False).encode("utf-8"),
+        df[csv_cols].to_csv(index=False).encode("utf-8"),
         "vendors_results.csv",
         "text/csv"
     )
 else:
     st.info("No matches. Try a shorter keyword or clear filters.")
+
 
 st.caption("Public read-only app. DB normalized: website = URL, notes = free-text.")
