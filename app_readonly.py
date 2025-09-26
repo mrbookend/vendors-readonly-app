@@ -81,12 +81,24 @@ rows = run_search(kw, category, service, use_fts_flag=use_fts, limit=5000)
 st.subheader(f"Results ({len(rows)})")
 
 if rows:
-    df = pd.DataFrame([dict(r) for r in rows])[["category","service","business_name","contact_name","phone","address","website","notes"]]
-    df = df.rename(columns={"website": "Notes (text)", "notes": "Website (URL)"})
-    df_display = df.copy()
-    df_display["Website (URL)"] = df_display["Website (URL)"].apply(render_link)
-    st.dataframe(df_display, use_container_width=True, hide_index=True)
-    st.download_button("Download results as CSV", df.to_csv(index=False).encode("utf-8"), "vendors_results.csv", "text/csv")
+   df = pd.DataFrame([dict(r) for r in rows])[[
+    "category","service","business_name","contact_name","phone","address","website","notes"
+]]
+# CORRECT mapping for a normalized DB:
+#   website = URL, notes = free-text
+df = df.rename(columns={"website": "Website (URL)", "notes": "Notes (text)"})
+
+df_display = df.copy()
+df_display["Website (URL)"] = df_display["Website (URL)"].apply(render_link)
+
+st.dataframe(df_display, use_container_width=True, hide_index=True)
+st.download_button(
+    "Download results as CSV",
+    df.to_csv(index=False).encode("utf-8"),
+    "vendors_results.csv",
+    "text/csv"
+)
+
 else:
     st.info("No matches. Try a shorter keyword or clear filters.")
 
