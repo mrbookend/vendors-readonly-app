@@ -89,70 +89,57 @@ def init_schema_if_needed():
 
 init_schema_if_needed()
 
-# ---------- Query helpers ----------
-def q(sql: str, params=()):
-    cur = conn.execute(sql, params)
-    return cur.fetchall()
+# ---------- DEBUG (temporary; remove after green) ----------
+with st.expander("DEBUG (remove after)", expanded=True):
+    st.write("Secrets present:",
+             bool(st.secrets.get("LIBSQL_URL")),
+             bool(st.secrets.get("LIBSQL_AUTH_TOKEN")))
+    try:
+        conn.execute("SELECT 1")
+        conn.execute("CREATE TABLE IF NOT EXISTS _write_test (x INT)")
+        conn.execute("DROP TABLE _write_test")
+        st.write("Write test: OK (token can write)")
+    except Exception as e:
+        st.write("Write test FAILED (likely read-only token):")
+        st.exception(e)
+    try:
+        names = [r[0] for r in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' ORDER BY 1")]
+        st.write("Tables:", names)
+    except Exception as e:
+        st.write("Listing tables failed:")
+        st.exception(e)
 
-def one(sql: str, params=()):
-    cur = conn.execute(sql, params)
-    return cur.fetchone()
-
-def upsert_category(name: str):
-    name = (name or "").strip()
-    if not name:
-        return None
-    with conn:
-        conn.execute("INSERT OR IGNORE INTO categories(name) VALUES (?)", (name,))
-    row = one("SELECT id FROM categories WHERE name = ? COLLATE NOCASE", (name,))
-    return row[0] if row else None
-
-def upsert_services(csv_names: str):
-    if not csv_names:
-        return []
-    ids = []
-    for raw in [n.strip() for n in csv_names.split(",") if n.strip()]:
-        with conn:
-            conn.execute("INSERT OR IGNORE INTO services(name) VALUES (?)", (raw,))
-        r = one("SELECT id FROM services WHERE name = ? COLLATE NOCASE", (raw,))
-        if r:
-            ids.append(r[0])
-    return ids
-
-def vendor_services_ids(vendor_id: int):
-    rows = q("SELECT service_id FROM vendor_services WHERE vendor_id = ?", (vendor_id,))
-    return [r[0] for r in rows]
-
-def save_vendor(vid, business_name, contact_name, phone, address, notes, website, category_id, service_ids, is_active=True):
-    with conn:
-        if vid:
-            conn.execute(
-                """UPDATE vendors
-                   SET business_name=?, contact_name=?, phone=?, address=?, notes=?, website=?, category_id=?, is_active=?
-                   WHERE id=?""",
-                (business_name, contact_name, phone, address, notes, website, category_id, 1 if is_active else 0, vid),
-            )
-            conn.execute("DELETE FROM vendor_services WHERE vendor_id = ?", (vid,))
-            for sid in service_ids:
-                conn.execute("INSERT OR IGNORE INTO vendor_services(vendor_id, service_id) VALUES (?,?)", (vid, sid))
+# ---------- Query helpers (hardened) ----------
+def q(sql: str, params=None):
+    try:
+        if params:
+            p = tuple(params) if isinstance(params, (list, tuple)) else params
+            cur = conn.execute(sql, p)
         else:
-            cur = conn.execute(
-                """INSERT INTO vendors(business_name, contact_name, phone, address, notes, website, category_id, is_active)
-                   VALUES (?,?,?,?,?,?,?,?)""",
-                (business_name, contact_name, phone, address, notes, website, category_id, 1 if is_active else 0),
-            )
-            vid = cur.lastrowid
-            for sid in service_ids:
-                conn.execute("INSERT OR IGNORE INTO vendor_services(vendor_id, service_id) VALUES (?,?)", (vid, sid))
-    return vid
+            cur = conn.execute(sql)
+        return cur.fetchall()
+    except Exception as e:
+        st.error("SQL failed")
+        st.code(sql)
+        st.write("params:", params)
+        st.exception(e)
+        raise
 
-def soft_delete_vendor(vid: int):
-    with conn:
-        conn.execute("UPDATE vendors SET is_active=0 WHERE id=?", (vid,))
-
-def hard_delete_vendor(vid: int):
-    with conn:
-        conn.execute("DELETE FROM vendors WHERE id=?", (vid,))
+def one(sql: str, params=None):
+    try:
+        if params:
+            p = tuple(params) if isinstance(params, (list, tuple)) else params
+            cur = conn.execute(sql, p)
+        else:
+            cur = conn.execute(sql)
+        return cur.fetchone()
+    except Exception as e:
+        st.error("SQL failed (one)")
+        st.code(sql)
+        st.write("params:", params)
+        st.exception(e)
+        raise
 
 # ---------- UI ----------
 st.title("Vendors - Admin")
@@ -201,7 +188,7 @@ current = (
     if vid
     else None
 )
-cur_services = set(vendor_services_ids(vid)) if vid else set()
+cur_services = set([r[0] for r in q("SELECT service_id FROM vendor_services WHERE vendor_id = ?", (vid,))]) if vid else set()
 
 st.subheader("Edit / Create Vendor")
 with st.form("vendor_form", clear_on_submit=False):
@@ -248,36 +235,56 @@ with st.form("vendor_form", clear_on_submit=False):
 
         category_id = cat_ids[cat_index]
         if new_cat_name.strip():
-            category_id = upsert_category(new_cat_name.strip())
+            conn.execute("INSERT OR IGNORE INTO categories(name) VALUES (?)", (new_cat_name.strip(),))
+            r = one("SELECT id FROM categories WHERE name = ? COLLATE NOCASE", (new_cat_name.strip(),))
+            if r:
+                category_id = r[0]
 
         selected_ids = [svc_ids[i] for i in svc_sel_ix] if svc_ids else []
-        selected_ids += upsert_services(new_svcs_csv.strip())
+        if new_svcs_csv.strip():
+            for raw in [n.strip() for n in new_svcs_csv.split(",") if n.strip()]:
+                conn.execute("INSERT OR IGNORE INTO services(name) VALUES (?)", (raw,))
+                r = one("SELECT id FROM services WHERE name = ? COLLATE NOCASE", (raw,))
+                if r:
+                    selected_ids.append(r[0])
         selected_ids = sorted(set(selected_ids))
 
-        new_vid = save_vendor(
-            vid,
-            business_name.strip(),
-            contact_name.strip(),
-            phone.strip(),
-            address.strip(),
-            notes.strip(),
-            website.strip(),
-            category_id,
-            selected_ids,
-            is_active=is_active,
-        )
+        with conn:
+            if vid:
+                conn.execute(
+                    """UPDATE vendors
+                       SET business_name=?, contact_name=?, phone=?, address=?, notes=?, website=?, category_id=?, is_active=?
+                       WHERE id=?""",
+                    (business_name.strip(), contact_name.strip(), phone.strip(), address.strip(), notes.strip(),
+                     website.strip(), category_id, 1 if is_active else 0, vid),
+                )
+                conn.execute("DELETE FROM vendor_services WHERE vendor_id = ?", (vid,))
+                for sid in selected_ids:
+                    conn.execute("INSERT OR IGNORE INTO vendor_services(vendor_id, service_id) VALUES (?,?)", (vid, sid))
+                new_vid = vid
+            else:
+                cur = conn.execute(
+                    """INSERT INTO vendors(business_name, contact_name, phone, address, notes, website, category_id, is_active)
+                       VALUES (?,?,?,?,?,?,?,?)""",
+                    (business_name.strip(), contact_name.strip(), phone.strip(), address.strip(), notes.strip(),
+                     website.strip(), category_id, 1 if is_active else 0),
+                )
+                new_vid = cur.lastrowid
+                for sid in selected_ids:
+                    conn.execute("INSERT OR IGNORE INTO vendor_services(vendor_id, service_id) VALUES (?,?)", (new_vid, sid))
         _sync()
         st.success(f"Saved vendor ID {new_vid}.")
         st.rerun()
 
     if delete_soft and vid:
-        soft_delete_vendor(vid)
+        conn.execute("UPDATE vendors SET is_active=0 WHERE id=?", (vid,))
         _sync()
         st.warning(f"Vendor {vid} soft-deleted (inactive).")
         st.rerun()
 
     if delete_hard and vid and hard_confirm.strip() == "DELETE":
-        hard_delete_vendor(vid)
+        with conn:
+            conn.execute("DELETE FROM vendors WHERE id=?", (vid,))
         _sync()
         st.error(f"Vendor {vid} permanently deleted.")
         st.rerun()
