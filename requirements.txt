@@ -1,3 +1,2 @@
-streamlit>=1.36
-libsql>=0.3
-pandas>=2.2
+streamlit==1.37.1
+libsql==0.1.11
