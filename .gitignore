@@ -22,3 +22,4 @@ vendors_dump.sql
 .vscode/
 .idea/
 .DS_Store
+.streamlit/
