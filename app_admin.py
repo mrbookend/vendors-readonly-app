@@ -1,49 +1,10 @@
-git add app_admin.py requirements.txt
-git commit -m "Replace admin stub with full CRUD"
-git push
-import os
-import streamlit as st
-import libsql
-
-st.set_page_config(page_title="Vendors Admin", layout="wide")
-
-# --- Simple password gate ---
-def ok():
-    pw = st.session_state.get("admin_pw","")
-    expected = st.secrets.get("ADMIN_PASSWORD") or os.getenv("ADMIN_PASSWORD")
-    return bool(expected) and pw == expected
-
-st.sidebar.subheader("Admin Login")
-st.session_state["admin_pw"] = st.sidebar.text_input("Password", type="password")
-if not ok():
-    st.stop()
-
-# --- Connect to Turso/libSQL ---
-conn = libsql.connect(
-    "vendors_local.db",
-    sync_url=st.secrets["LIBSQL_URL"],
-    auth_token=st.secrets["LIBSQL_AUTH_TOKEN"],
-    sync_interval=60,
-)
-conn.execute("PRAGMA foreign_keys = ON;")
-
-st.title("Vendors — Admin (Smoke Test)")
-# Basic health checks
-c_vendors = conn.execute("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='vendors'").fetchone()[0]
-st.write("Table 'vendors' present:", bool(c_vendors))
-if c_vendors:
-    count = conn.execute("SELECT COUNT(*) FROM vendors").fetchone()[0]
-    st.write("Vendors rows:", count)
-st.success("Connected and authenticated.")
-# app_admin.py — Vendors Admin (Full CRUD)
-# Requires: streamlit>=1.36, libsql>=0.3, pandas>=2.2
 import os
 import contextlib
 import pandas as pd
 import streamlit as st
 import libsql
 
-st.set_page_config(page_title="Vendors Admin", layout="wide")
+st.set_page_config(page_title="Vendors - Admin", layout="wide")
 
 # ---------- Password gate ----------
 def _pw_ok() -> bool:
@@ -64,10 +25,10 @@ def _conn():
     url = st.secrets["LIBSQL_URL"]
     tok = st.secrets["LIBSQL_AUTH_TOKEN"]
     c = libsql.connect(
-        "vendors_local.db",           # local replica file; safe to keep
+        "vendors_local.db",
         sync_url=url,
         auth_token=tok,
-        sync_interval=60,             # seconds between background syncs
+        sync_interval=60,
     )
     c.execute("PRAGMA foreign_keys = ON;")
     return c
@@ -194,4 +155,131 @@ def hard_delete_vendor(vid: int):
         conn.execute("DELETE FROM vendors WHERE id=?", (vid,))
 
 # ---------- UI ----------
-st.title("Vendors — A
+st.title("Vendors - Admin")
+
+with st.expander("Find / pick a vendor to edit", expanded=True):
+    colf, colc = st.columns([2, 1])
+    with colf:
+        search = st.text_input("Search name/address/phone", placeholder="Type to filter...")
+    with colc:
+        show_inactive = st.checkbox("Show inactive (soft-deleted)", value=False)
+
+    clauses, params = [], []
+    if search:
+        like = f"%{search}%"
+        clauses.append("(v.business_name LIKE ? OR v.contact_name LIKE ? OR v.phone LIKE ? OR v.address LIKE ?)")
+        params += [like, like, like, like]
+    if not show_inactive:
+        clauses.append("v.is_active = 1")
+    where_clause = (" WHERE " + " AND ".join(clauses)) if clauses else ""
+
+    rows = q(
+        f"""
+        SELECT v.id, v.business_name, COALESCE(c.name,''), v.phone, v.address, v.website, v.is_active
+        FROM vendors v
+        LEFT JOIN categories c ON c.id = v.category_id
+        {where_clause}
+        ORDER BY v.business_name COLLATE NOCASE ASC
+        LIMIT 500
+        """,
+        params,
+    )
+
+    df = pd.DataFrame(rows, columns=["id", "Business", "Category", "Phone", "Address", "Website", "Active"])
+    st.dataframe(df.drop(columns=["id"]), use_container_width=True, hide_index=True)
+
+    options = ["New vendor..."] + [f"{r[1]} - {r[2]}" for r in rows]
+    pick_ix = st.selectbox("Select to edit", range(len(options)), index=0, format_func=lambda i: options[i])
+    vid = None if pick_ix == 0 else rows[pick_ix - 1][0]
+
+current = (
+    one(
+        """SELECT id, business_name, contact_name, phone, address, notes, website, category_id, is_active
+           FROM vendors WHERE id = ?""",
+        (vid,),
+    )
+    if vid
+    else None
+)
+cur_services = set(vendor_services_ids(vid)) if vid else set()
+
+st.subheader("Edit / Create Vendor")
+with st.form("vendor_form", clear_on_submit=False):
+    business_name = st.text_input("Business Name *", value=(current[1] if current else ""))
+    contact_name = st.text_input("Contact Name", value=(current[2] if current else ""))
+    phone = st.text_input("Phone", value=(current[3] if current else ""))
+    address = st.text_input("Address", value=(current[4] if current else ""))
+    website = st.text_input("Website (URL)", value=(current[6] if current else ""))
+    notes = st.text_area("Notes", value=(current[5] if current else ""), height=100)
+
+    # Category selection (existing or new)
+    cats = q("SELECT id, name FROM categories ORDER BY name")
+    cat_ids = [None] + [c[0] for c in cats]
+    cat_names = ["(none)"] + [c[1] for c in cats]
+    default_cat_index = 0
+    if current and current[7] in cat_ids:
+        default_cat_index = cat_ids.index(current[7])
+    cat_index = st.selectbox("Category", range(len(cat_ids)), index=default_cat_index, format_func=lambda i: cat_names[i])
+    new_cat_name = st.text_input("New Category (optional)")
+
+    # Services multiselect (existing + add new via CSV)
+    svcs = q("SELECT id, name FROM services ORDER BY name")
+    svc_ids = [s[0] for s in svcs]
+    svc_names = [s[1] for s in svcs]
+    default_svc_indices = [svc_ids.index(sid) for sid in cur_services if sid in svc_ids]
+    svc_sel_ix = st.multiselect("Services", range(len(svc_ids)), default=default_svc_indices, format_func=lambda i: svc_names[i])
+    new_svcs_csv = st.text_input("New Services (comma-separated, optional)")
+
+    is_active = st.checkbox("Active", value=(bool(current[8]) if current else True))
+
+    cL, cM, cR = st.columns([1, 1, 1])
+    with cL:
+        save = st.form_submit_button("Save / Update", type="primary")
+    with cM:
+        delete_soft = st.form_submit_button("Soft Delete")
+    with cR:
+        hard_confirm = st.text_input("Type DELETE to hard-delete", value="")
+        delete_hard = st.form_submit_button("Hard Delete", disabled=(hard_confirm.strip() != "DELETE"))
+
+    if save:
+        if not business_name.strip():
+            st.error("Business Name is required.")
+            st.stop()
+
+        category_id = cat_ids[cat_index]
+        if new_cat_name.strip():
+            category_id = upsert_category(new_cat_name.strip())
+
+        selected_ids = [svc_ids[i] for i in svc_sel_ix] if svc_ids else []
+        selected_ids += upsert_services(new_svcs_csv.strip())
+        selected_ids = sorted(set(selected_ids))
+
+        new_vid = save_vendor(
+            vid,
+            business_name.strip(),
+            contact_name.strip(),
+            phone.strip(),
+            address.strip(),
+            notes.strip(),
+            website.strip(),
+            category_id,
+            selected_ids,
+            is_active=is_active,
+        )
+        _sync()
+        st.success(f"Saved vendor ID {new_vid}.")
+        st.rerun()
+
+    if delete_soft and vid:
+        soft_delete_vendor(vid)
+        _sync()
+        st.warning(f"Vendor {vid} soft-deleted (inactive).")
+        st.rerun()
+
+    if delete_hard and vid and hard_confirm.strip() == "DELETE":
+        hard_delete_vendor(vid)
+        _sync()
+        st.error(f"Vendor {vid} permanently deleted.")
+        st.rerun()
+
+st.caption("Writes go to your Turso database; the public read-only app should reflect updates immediately.")
