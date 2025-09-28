@@ -204,7 +204,7 @@ CHAR_WIDTHS: Dict[str, int] = {
     "Business Name": 36,
     "Category": 36,
     "Phone": 30,
-    "Address": 40,
+    "Address": 80,
     "Notes": 36,
     # NOTE: Service and Keywords are intentionally omitted (not shown).
     # Website is a hyperlink; we don't clip its display text here.
