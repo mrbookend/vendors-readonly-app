@@ -263,7 +263,7 @@ else:
         "Notes":         st.column_config.TextColumn("Notes",         width="medium"),
     }
     if "Website" in show.columns:
-        col_cfg["Website"] = st.column_config.LinkColumn("Website", help="Open in new tab", width="medium")
+        col_cfg["Website"] = st.column_config.LinkColumn("Website", help="Open in new tab", width="small")
 
     st.dataframe(
         show,
