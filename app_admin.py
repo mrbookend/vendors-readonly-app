@@ -1,13 +1,14 @@
-# app_admin.py — Vendors Admin (Python-normalized; DataFrame-derived Service options)
+# app_admin.py — Vendors Admin (DB-derived Service options; Python normalization; safe SQL)
 # - Single vendors table
-# - Safe SQL debug
-# - Category/Service reads via simple COALESCE (snake_case preferred, legacy supported)
-# - Category→Service options derived from DataFrame with robust Python normalization
+# - Distinct (Category, Service) pairs loaded with simple SQL
+# - Category→Service map built in Python with robust normalization
 # - Writes to snake_case (category/service) when present
+# - Safe SQL debug everywhere
+# - One-click coalesce legacy TitleCase → snake_case
 
 import os
 from typing import Any, Dict, List, Optional, Sequence, Tuple
-from collections import defaultdict
+from collections import defaultdict, Counter
 
 import pandas as pd
 import streamlit as st
@@ -106,7 +107,7 @@ def detect_key_col(table: str) -> Optional[str]:
     return None
 
 # -------------------------------
-# Mapping candidates & resolver
+# Mapping candidates & resolver (non category/service fields)
 # -------------------------------
 
 EXPECTED = [
@@ -160,11 +161,50 @@ for friendly, canonical in [("Category", "category"), ("Service", "service")]:
         MAPPING[friendly] = canonical
 
 # -------------------------------
-# Streamlit UI
+# Simple expressions for reading Category/Service
+# -------------------------------
+
+def cat_expr() -> str:
+    if "category" in COLS_SET and "Category" in COLS_SET:
+        return 'COALESCE(NULLIF(TRIM("category"), \'\'), NULLIF(TRIM("Category"), \'\'))'
+    if "category" in COLS_SET:
+        return 'NULLIF(TRIM("category"), \'\')'
+    if "Category" in COLS_SET:
+        return 'NULLIF(TRIM("Category"), \'\')'
+    return "''"
+
+def srv_expr() -> str:
+    if "service" in COLS_SET and "Service" in COLS_SET:
+        return 'COALESCE(NULLIF(TRIM("service"), \'\'), NULLIF(TRIM("Service"), \'\'))'
+    if "service" in COLS_SET:
+        return 'NULLIF(TRIM("service"), \'\')'
+    if "Service" in COLS_SET:
+        return 'NULLIF(TRIM("Service"), \'\')'
+    return "''"
+
+CAT_SQL = cat_expr()
+SRV_SQL = srv_expr()
+
+# -------------------------------
+# Normalization in Python (robust)
+# -------------------------------
+
+def norm_strict_py(s: Any) -> str:
+    if s is None:
+        return ""
+    s = str(s)
+    s = s.replace("\u00A0", " ").replace("\t", " ").replace("\r", "").replace("\n", "")
+    return s.strip().upper()
+
+def norm_loose_py(s: Any) -> str:
+    return norm_strict_py(s).replace(" ", "")
+
+# -------------------------------
+# Streamlit UI Header
 # -------------------------------
 
 st.set_page_config(page_title="Vendors - Admin", layout="wide")
-st.title("Vendors - Admin (Python-normalized)")
+st.title("Vendors - Admin (DB-derived services; Python-normalized)")
 
 with st.expander("Diagnostics / Tools (toggle)", expanded=False):
     st.write("Driver:", DRIVER)
@@ -173,6 +213,7 @@ with st.expander("Diagnostics / Tools (toggle)", expanded=False):
     st.write("Detected key column:", KEY_COL or "(none; using rowid if possible)")
     st.write("Table WITHOUT ROWID:", WITHOUT_ROWID)
 
+    # One-click coalesce legacy → snake_case when snake_case blank
     def coalesce_legacy_to_snake() -> Tuple[int, int, Optional[str]]:
         sql1 = f'''
             UPDATE "{VENDORS_TABLE}"
@@ -210,29 +251,8 @@ if not KEY_COL and WITHOUT_ROWID:
     st.stop()
 
 # -------------------------------
-# Load rows for grid — keep SQL simple
+# Load grid rows (LIMIT prevents giant tables; independent from options map)
 # -------------------------------
-
-def cat_expr() -> str:
-    if "category" in COLS_SET and "Category" in COLS_SET:
-        return 'COALESCE(NULLIF(TRIM("category"), \'\'), NULLIF(TRIM("Category"), \'\'))'
-    if "category" in COLS_SET:
-        return 'NULLIF(TRIM("category"), \'\')'
-    if "Category" in COLS_SET:
-        return 'NULLIF(TRIM("Category"), \'\')'
-    return "''"
-
-def srv_expr() -> str:
-    if "service" in COLS_SET and "Service" in COLS_SET:
-        return 'COALESCE(NULLIF(TRIM("service"), \'\'), NULLIF(TRIM("Service"), \'\'))'
-    if "service" in COLS_SET:
-        return 'NULLIF(TRIM("service"), \'\')'
-    if "Service" in COLS_SET:
-        return 'NULLIF(TRIM("Service"), \'\')'
-    return "''"
-
-CAT_SQL = cat_expr()
-SRV_SQL = srv_expr()
 
 select_parts: List[str] = []
 if KEY_COL:
@@ -288,59 +308,69 @@ st.dataframe(df.drop(columns=["key"], errors="ignore"),
              use_container_width=True, hide_index=True)
 
 # -------------------------------
-# Python normalization (robust & simple)
+# Build Category→Service options DIRECTLY from DB (not from grid / not filtered)
 # -------------------------------
 
-def norm_strict_py(s: Any) -> str:
-    if s is None:
-        return ""
-    s = str(s)
-    s = s.replace("\u00A0", " ").replace("\t", " ").replace("\r", "").replace("\n", "")
-    return s.strip().upper()
+def load_category_service_pairs() -> Tuple[Dict[str, List[str]], List[str]]:
+    """
+    Returns:
+      - services_by_key: dict of normalized category key -> sorted service list
+      - category_display_options: canonical display list for categories (sorted)
+    """
+    sql_pairs = f'''
+        SELECT DISTINCT c, s FROM (
+            SELECT {CAT_SQL} AS c, {SRV_SQL} AS s
+            FROM "{VENDORS_TABLE}"
+        )
+        WHERE c IS NOT NULL AND TRIM(c) <> ''
+          AND s IS NOT NULL AND TRIM(s) <> '';
+    '''
+    rows, _ = safe_query(sql_pairs)
+    # Build normalization + display preference
+    disp_counts: Dict[str, Counter] = defaultdict(Counter)  # key -> Counter(display->count)
+    svc_map: Dict[str, set] = defaultdict(set)             # key -> set(services)
+    for c, s in rows:
+        cd = (str(c) if c is not None else "").strip()
+        sd = (str(s) if s is not None else "").strip()
+        if not cd or not sd:
+            continue
+        key = norm_loose_py(cd)
+        disp_counts[key][cd] += 1
+        svc_map[key].add(sd)
 
-def norm_loose_py(s: Any) -> str:
-    return norm_strict_py(s).replace(" ", "")
+    # pick canonical category display per key: highest count, then shortest, then alpha
+    def pick_display(cnt: Counter) -> str:
+        if not cnt:
+            return ""
+        maxn = max(cnt.values())
+        cands = [name for name, n in cnt.items() if n == maxn]
+        cands.sort(key=lambda x: (len(x), x.upper()))
+        return cands[0]
 
-# Build helper columns
-df["Category_raw"] = df["Category"].fillna("").astype(str).str.strip()
-df["Service_raw"]  = df["Service"].fillna("").astype(str).str.strip()
-df["Category_key"] = df["Category_raw"].map(norm_loose_py)
+    services_by_key: Dict[str, List[str]] = {
+        k: sorted(list(v), key=lambda s: s.upper())
+        for k, v in svc_map.items()
+        if k  # non-empty key
+    }
+    category_display = [pick_display(cnt) for k, cnt in disp_counts.items() if k]
+    category_display = sorted([c for c in category_display if c], key=lambda s: s.upper())
+    return services_by_key, category_display
 
-# ---- FIX: compute a helper length column, then sort by label names ONLY (no Series in `by=...`) ----
-if not df.empty:
-    counts = (
-        df[["Category_key", "Category_raw"]]
-        .groupby(["Category_key", "Category_raw"], dropna=False)
-        .size()
-        .reset_index(name="n")
-    )
-    counts["disp_len"] = counts["Category_raw"].str.len()
-    counts = counts.sort_values(
-        by=["Category_key", "n", "disp_len", "Category_raw"],
-        ascending=[True, False, True, True],
-        kind="mergesort",  # stable
-    )
-    best_display = counts.drop_duplicates("Category_key", keep="first") \
-                         .set_index("Category_key")["Category_raw"].to_dict()
-else:
-    best_display = {}
+SERVICES_BY_KEY, CATEGORY_OPTIONS = load_category_service_pairs()
 
-# Build services map from df
-svc_map: Dict[str, set] = defaultdict(set)
-for _, r in df.iterrows():
-    ck = r["Category_key"]
-    srv = r["Service_raw"]
-    if ck and srv:
-        svc_map[ck].add(srv)
-
-SERVICES_BY_KEY: Dict[str, List[str]] = {k: sorted(v, key=lambda s: s.upper()) for k, v in svc_map.items()}
-CATEGORY_OPTIONS: List[str] = sorted(best_display.values(), key=lambda s: s.upper())
+with st.expander("Category/Service diagnostics", expanded=False):
+    st.write(f"Categories found: {len(CATEGORY_OPTIONS)}")
+    sample = ", ".join(CATEGORY_OPTIONS[:12]) + (" …" if len(CATEGORY_OPTIONS) > 12 else "")
+    st.caption(f"Sample categories: {sample}")
+    # count total pairs
+    total_pairs = sum(len(v) for v in SERVICES_BY_KEY.values())
+    st.write(f"Distinct (Category, Service) pairs: {total_pairs}")
 
 # -------------------------------
-# UI helpers (category/service from df)
+# UI helpers (category/service from DB-derived map)
 # -------------------------------
 
-def select_or_text_category_from_df(current: str = "") -> str:
+def select_or_text_category(current: str = "") -> str:
     base = ["(blank)"] + CATEGORY_OPTIONS + ["(custom…)"]
     cur = (current or "").strip()
     default = "(blank)" if not cur else (cur if cur in CATEGORY_OPTIONS else "(custom…)")
@@ -356,15 +386,15 @@ def select_or_text_category_from_df(current: str = "") -> str:
     else:
         return choice
 
-def services_for_category_from_df(category_value: str) -> List[str]:
+def services_for_category(category_value: str) -> List[str]:
     key = norm_loose_py(category_value)
     return SERVICES_BY_KEY.get(key, [])
 
-def select_or_text_service_from_df(current: str, category_value: str) -> str:
+def select_or_text_service(current: str, category_value: str) -> str:
     cur = (current or "").strip()
     opts = []
     if category_value and category_value not in ("(blank)", "(custom…)"):
-        opts = services_for_category_from_df(category_value)
+        opts = services_for_category(category_value)
     base = ["(blank)"] + opts + ["(custom…)"]
     default = "(blank)" if not cur else (cur if cur in opts else "(custom…)")
     try:
@@ -380,7 +410,7 @@ def select_or_text_service_from_df(current: str, category_value: str) -> str:
         return choice
 
 # -------------------------------
-# Selection label
+# Selection label (grid)
 # -------------------------------
 
 def make_label(row: pd.Series) -> str:
@@ -455,7 +485,7 @@ def delete_vendor(key: Any) -> str:
     return f"Deleted ({n})" if not e else "Delete error (see above)"
 
 # -------------------------------
-# Forms (Category→Service from df)
+# Forms (Category→Service from DB-derived map)
 # -------------------------------
 
 st.markdown("---")
@@ -463,8 +493,8 @@ st.markdown("---")
 def render_inputs(init: Dict[str, Any]) -> Dict[str, Any]:
     c1, c2 = st.columns(2)
     with c1:
-        v_category = select_or_text_category_from_df(init.get("Category", ""))
-        v_service  = select_or_text_service_from_df(init.get("Service", ""), v_category)
+        v_category = select_or_text_category(init.get("Category", ""))
+        v_service  = select_or_text_service(init.get("Service", ""), v_category)
         v_biz      = st.text_input("Business Name", value=init.get("Business Name", ""))
         v_contact  = st.text_input("Contact Name",  value=init.get("Contact Name", ""))
         v_phone    = st.text_input("Phone",         value=init.get("Phone", ""))
@@ -477,8 +507,8 @@ def render_inputs(init: Dict[str, Any]) -> Dict[str, Any]:
 
     # Inline diagnostics for your selection
     if v_category:
-        found = services_for_category_from_df(v_category)
-        st.caption(f"Services for '{v_category}': {len(found)} — {', '.join(found[:8])}{' …' if len(found) > 8 else ''}")
+        found = services_for_category(v_category)
+        st.caption(f"Services for '{v_category}': {len(found)} — {', '.join(found[:12])}{' …' if len(found) > 12 else ''}")
 
     return {
         "Category": v_category,
