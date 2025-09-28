@@ -194,15 +194,14 @@ def upsert_service(conn: sqlite3.Connection, category_id: int, name: str) -> int
 # ----------------------------- Fetch / List ---------------------------------
 
 def fetch_vendors_sorted(conn: sqlite3.Connection, include_inactive: bool = False) -> pd.DataFrame:
-    """Return vendors sorted by Category asc, Service asc, Business asc.
-    Chooses normalized path only if vendors.category_id & vendors.service_id exist.
-    Tolerates older normalized variants missing is_active/created_at/updated_at.
-    Also tolerates `business` vs `business_name` column naming.
+    """Return vendors sorted by a single composite key (CatSvc) then Business.
+    - CatSvc := Category + ' → ' + Service (handles NULL/blank safely)
+    - Works in normalized mode (joins) and legacy flat mode.
+    - Probes for optional columns and adapts SELECT accordingly.
     """
     normalized = has_normalized(conn)
 
     if normalized:
-        # Probe vendor columns
         has_is_active = column_exists(conn, "vendors", "is_active")
         has_created = column_exists(conn, "vendors", "created_at")
         has_updated = column_exists(conn, "vendors", "updated_at")
@@ -212,10 +211,14 @@ def fetch_vendors_sorted(conn: sqlite3.Connection, include_inactive: bool = Fals
         if has_is_active and not include_inactive:
             where = "WHERE COALESCE(v.is_active,1)=1"
 
+        # Composite sort key
+        catsvc_expr = "(COALESCE(c.name,'') || ' → ' || COALESCE(s.name,'')) AS CatSvc"
+
         select_bits = [
             "v.id as ID",
             "c.name AS Category",
             "s.name AS Service",
+            catsvc_expr,
         ]
         if vb_col:
             select_bits.append(f"v.{vb_col} AS 'Business Name'")
@@ -240,21 +243,30 @@ def fetch_vendors_sorted(conn: sqlite3.Connection, include_inactive: bool = Fals
             LEFT JOIN categories c ON c.id = v.category_id
             LEFT JOIN services   s ON s.id = v.service_id
             {where}
-            ORDER BY c.name ASC, s.name ASC{order_business}
+            ORDER BY CatSvc ASC{order_business}
         """
     else:
         # Legacy flat vendors table path
-        # Try to discover likely column names for business/contact/etc
         vb_col = "business_name" if column_exists(conn, "vendors", "business_name") else ("business" if column_exists(conn, "vendors", "business") else None)
         cat_txt = "category" if column_exists(conn, "vendors", "category") else None
         svc_txt = "service" if column_exists(conn, "vendors", "service") else None
+
+        catsvc_expr = None
+        if cat_txt or svc_txt:
+            left = f"COALESCE({cat_txt},'')" if cat_txt else "''"
+            right = f"COALESCE({svc_txt},'')" if svc_txt else "''"
+            catsvc_expr = f"({left} || ' → ' || {right}) AS CatSvc"
 
         select_bits = [
             "rowid as ID",
             f"COALESCE({cat_txt},'') AS Category" if cat_txt else "'' AS Category",
             f"COALESCE({svc_txt},'') AS Service" if svc_txt else "'' AS Service",
-            f"COALESCE({vb_col},'') AS 'Business Name'" if vb_col else "'' AS 'Business Name'",
         ]
+        if catsvc_expr:
+            select_bits.append(catsvc_expr)
+        else:
+            select_bits.append("'' AS CatSvc")
+        select_bits.append(f"COALESCE({vb_col},'') AS 'Business Name'" if vb_col else "'' AS 'Business Name'")
         for name, alias in [
             ("contact_name", "Contact Name"),
             ("phone", "Phone"),
@@ -264,18 +276,16 @@ def fetch_vendors_sorted(conn: sqlite3.Connection, include_inactive: bool = Fals
         ]:
             select_bits.append(f"COALESCE({name},'') AS '{alias}'" if column_exists(conn, "vendors", name) else f"'' AS '{alias}'")
 
-        order_bits = []
-        if cat_txt: order_bits.append("Category ASC")
-        if svc_txt: order_bits.append("Service ASC")
+        order_bits = ["CatSvc ASC"]
         if vb_col: order_bits.append("'Business Name' ASC")
-        order_clause = (" ORDER BY " + ", ".join(order_bits)) if order_bits else ""
+        order_clause = " ORDER BY " + ", ".join(order_bits)
 
         sql = f"SELECT {', '.join(select_bits)} FROM vendors{order_clause}"
 
     df = pd.read_sql_query(sql, conn)
 
-    # Defensive post-sort in Python (stable mergesort)
-    sort_cols = [c for c in ["Category", "Service", "Business Name"] if c in df.columns]
+    # Defensive post-sort using the composite key
+    sort_cols = [c for c in ["CatSvc", "Business Name"] if c in df.columns]
     if sort_cols:
         df = df.sort_values(sort_cols, kind="mergesort", ignore_index=True)
     return df
@@ -506,7 +516,9 @@ def page_list(conn: sqlite3.Connection):
         # re-enforce sort
         df = df.sort_values([c for c in ["Category", "Service", "Business Name"] if c in df.columns], kind="mergesort", ignore_index=True)
 
-    st.dataframe(df, use_container_width=True, hide_index=True)
+    # Hide CatSvc from display but keep for sorting/export
+    display_df = df.drop(columns=["CatSvc"], errors="ignore")
+    st.dataframe(display_df, use_container_width=True, hide_index=True)
     st.download_button(
         "Download CSV (sorted view)",
         df.to_csv(index=False).encode("utf-8"),
