@@ -229,7 +229,7 @@ with st.expander("Diagnostics / Tools (toggle)", expanded=False):
             st.error(f"Coalesce failed: {type(e).__name__}: {e}")
 
 if not table_exists(VENDORS_TABLE):
-    st.error(f'Table \"{VENDORS_TABLE}\" not found.")
+    st.error(f'Table "{VENDORS_TABLE}" not found.')
     st.stop()
 
 if not KEY_COL and WITHOUT_ROWID:
