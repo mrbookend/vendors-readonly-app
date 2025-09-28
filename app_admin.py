@@ -1,9 +1,6 @@
 # app_admin.py — Vendors Admin (single-table; coalesced+normalized reads; strict Category→Service; safe SQL debug)
 # Table: vendors
 # UI fields: Category, Service, Business Name, Contact Name, Phone, Address, URL, Notes, Keywords, Website
-# - Reads Category/Service via COALESCE(category,"Category"), COALESCE(service,"Service") with normalization.
-# - Writes always target snake_case (category/service) when present.
-# - All critical queries go through safe_query() which shows the RAW sqlite3 error, full SQL, and params.
 
 import os
 from typing import Any, Dict, List, Optional, Sequence, Tuple
@@ -29,7 +26,6 @@ def _connect():
     path = os.environ.get("SQLITE_PATH", "vendors.db")
     conn = sqlite3.connect(path, check_same_thread=False)
     conn.row_factory = sqlite3.Row
-    # optional: be explicit
     conn.execute("PRAGMA foreign_keys = ON;")
     return conn, "sqlite"
 
@@ -168,10 +164,17 @@ for friendly, canonical in [("Category", "category"), ("Service", "service")]:
 # -------------------------------
 
 def coalesce_expr(primary: str, alts: List[str]) -> str:
-    """COALESCE(NULLIF(TRIM(primary),''), NULLIF(TRIM(alt1),''), ...) for existing columns."""
+    """
+    Build an expression that returns first non-blank among the provided columns.
+    If only one column exists, DO NOT wrap with COALESCE (SQLite requires >=2 args).
+    """
     cols = [primary] + [a for a in alts if a in COLS_SET]
-    parts = [f'NULLIF(TRIM("{c}"), \'\')' for c in cols]
-    return "COALESCE(" + ", ".join(parts) + ")" if parts else "''"
+    parts = [f'NULLIF(TRIM("{c}"), \'\')' for c in cols if c in COLS_SET]
+    if not parts:
+        return "''"
+    if len(parts) == 1:
+        return parts[0]  # <- key fix: avoid COALESCE(one_arg)
+    return "COALESCE(" + ", ".join(parts) + ")"
 
 def norm_sql(expr: str) -> str:
     """
@@ -224,7 +227,7 @@ with st.expander("Diagnostics / Tools (toggle)", expanded=False):
     st.code(f"Service  norm expr: {SRV_NORM_EXPR}")
 
     # One-click coalesce legacy → snake_case when snake_case blank
-    def coalesce_legacy_to_snake() -> Tuple[int, int]:
+    def coalesce_legacy_to_snake() -> Tuple[int, int, Optional[str]]:
         sql1 = f'''
             UPDATE "{VENDORS_TABLE}"
             SET category = TRIM(COALESCE(NULLIF(category,''), NULLIF("Category",'')))
@@ -247,7 +250,7 @@ with st.expander("Diagnostics / Tools (toggle)", expanded=False):
     if st.button("Coalesce legacy Category/Service → snake_case"):
         c_cat, c_srv, err = coalesce_legacy_to_snake()
         if err:
-            st.error(f"Coalesce encountered an error (details above).")
+            st.error("Coalesce encountered an error (details above).")
         else:
             st.success(f"Coalesced rows — category: {c_cat}, service: {c_srv}.")
             st.rerun()
@@ -311,7 +314,6 @@ cols_out = ["key"] + EXPECTED
 df = pd.DataFrame(rows, columns=cols_out) if rows else pd.DataFrame(columns=cols_out)
 
 if df.empty and err:
-    # We already showed exact error above; let the page continue without crashing.
     st.stop()
 
 if df.empty:
@@ -470,7 +472,7 @@ def insert_vendor(values: Dict[str, Any]) -> str:
     placeholders = ", ".join(["?"] * len(vals_db))
     sql = f'INSERT INTO "{VENDORS_TABLE}" ({", ".join(cols_db)}) VALUES ({placeholders})'
     n, e = safe_write(sql, vals_db)
-    return f"Inserted ({n})" if not e else f"Insert error (see above)"
+    return f"Inserted ({n})" if not e else "Insert error (see above)"
 
 def update_vendor(key: Any, values: Dict[str, Any]) -> str:
     cols_db, vals_db = values_to_db_params(values)
@@ -482,7 +484,7 @@ def update_vendor(key: Any, values: Dict[str, Any]) -> str:
     else:
         sql = f'UPDATE "{VENDORS_TABLE}" SET {sets} WHERE rowid=?'
     n, e = safe_write(sql, vals_db + [key])
-    return f"Updated ({n})" if not e else f"Update error (see above)"
+    return f"Updated ({n})" if not e else "Update error (see above)"
 
 def delete_vendor(key: Any) -> str:
     if KEY_COL:
@@ -490,7 +492,7 @@ def delete_vendor(key: Any) -> str:
     else:
         sql = f'DELETE FROM "{VENDORS_TABLE}" WHERE rowid=?'
     n, e = safe_write(sql, (key,))
-    return f"Deleted ({n})" if not e else f"Delete error (see above)"
+    return f"Deleted ({n})" if not e else "Delete error (see above)"
 
 # -------------------------------
 # Forms (STRICT Category→Service)
