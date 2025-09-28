@@ -418,4 +418,6 @@ else:
             if not delete_confirmed:
                 st.warning("Check the confirmation box above, then click Delete.")
             else:
-                msg =
+                msg = delete_vendor(key_val)
+                st.warning(msg)
+                st.rerun()
