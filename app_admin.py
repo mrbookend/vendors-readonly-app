@@ -1,12 +1,13 @@
-# app_admin.py — Vendors Admin (normalize in Python, not SQL)
+# app_admin.py — Vendors Admin (Python-normalized; DataFrame-derived Service options)
 # - Single vendors table
 # - Safe SQL debug
-# - Category/Service reads via simple COALESCE
+# - Category/Service reads via simple COALESCE (snake_case preferred, legacy supported)
 # - Category→Service options derived from DataFrame with robust Python normalization
 # - Writes to snake_case (category/service) when present
 
 import os
 from typing import Any, Dict, List, Optional, Sequence, Tuple
+from collections import defaultdict
 
 import pandas as pd
 import streamlit as st
@@ -170,9 +171,8 @@ with st.expander("Diagnostics / Tools (toggle)", expanded=False):
     st.write("Using table:", VENDORS_TABLE)
     st.write("Mapping (friendly → actual):", MAPPING)
     st.write("Detected key column:", KEY_COL or "(none; using rowid if possible)")
-    st.write("Table WITHOUT ROWID:", has_without_rowid(VENDORS_TABLE))
+    st.write("Table WITHOUT ROWID:", WITHOUT_ROWID)
 
-    # One-click coalesce legacy → snake_case when snake_case blank
     def coalesce_legacy_to_snake() -> Tuple[int, int, Optional[str]]:
         sql1 = f'''
             UPDATE "{VENDORS_TABLE}"
@@ -205,7 +205,7 @@ if not table_exists(VENDORS_TABLE):
     st.error(f'Table "{VENDORS_TABLE}" not found.')
     st.stop()
 
-if not KEY_COL and has_without_rowid(VENDORS_TABLE):
+if not KEY_COL and WITHOUT_ROWID:
     st.error("vendors is WITHOUT ROWID and has no single-column PRIMARY KEY. Add 'id INTEGER PRIMARY KEY' or a single PK.")
     st.stop()
 
@@ -214,7 +214,6 @@ if not KEY_COL and has_without_rowid(VENDORS_TABLE):
 # -------------------------------
 
 def cat_expr() -> str:
-    # simple coalesce; no nested replacements here
     if "category" in COLS_SET and "Category" in COLS_SET:
         return 'COALESCE(NULLIF(TRIM("category"), \'\'), NULLIF(TRIM("Category"), \'\'))'
     if "category" in COLS_SET:
@@ -254,8 +253,10 @@ for friendly in ["Business Name","Contact Name","Phone","Address","URL","Notes",
 select_sql = ", ".join(select_parts)
 
 st.subheader("Find / pick a vendor to edit")
-qtext = st.text_input("Search (business / service / phone / address / notes / keywords)",
-                      placeholder="Type to filter...").strip()
+qtext = st.text_input(
+    "Search (business / service / phone / address / notes / keywords)",
+    placeholder="Type to filter..."
+).strip()
 
 sql = f' SELECT {select_sql} FROM "{VENDORS_TABLE}" v WHERE 1=1 '
 params: List[Any] = []
@@ -283,7 +284,8 @@ if df.empty:
     st.info("No vendors match your filter. Clear the search to see all.")
     st.stop()
 
-st.dataframe(df.drop(columns=["key"], errors="ignore"), use_container_width=True, hide_index=True)
+st.dataframe(df.drop(columns=["key"], errors="ignore"),
+             use_container_width=True, hide_index=True)
 
 # -------------------------------
 # Python normalization (robust & simple)
@@ -297,32 +299,33 @@ def norm_strict_py(s: Any) -> str:
     return s.strip().upper()
 
 def norm_loose_py(s: Any) -> str:
-    # ignore all spaces after strict cleanup
     return norm_strict_py(s).replace(" ", "")
 
-# Build normalized helper columns in df
-df["Category_raw"] = df["Category"].fillna("").astype(str).map(lambda x: x.strip())
-df["Service_raw"]  = df["Service"].fillna("").astype(str).map(lambda x: x.strip())
+# Build helper columns
+df["Category_raw"] = df["Category"].fillna("").astype(str).str.strip()
+df["Service_raw"]  = df["Service"].fillna("").astype(str).str.strip()
 df["Category_key"] = df["Category_raw"].map(norm_loose_py)
 
-# Preferred display name per Category_key: pick the most frequent display, tie-break by length, then alpha
+# ---- FIX: compute a helper length column, then sort by label names ONLY (no Series in `by=...`) ----
 if not df.empty:
-    counts = (df[["Category_key","Category_raw"]]
-              .groupby(["Category_key","Category_raw"], dropna=False)
-              .size()
-              .reset_index(name="n"))
-    counts.sort_values(["Category_key","n",
-                        counts["Category_raw"].str.len(),
-                        "Category_raw"],
-                       ascending=[True, False, True, True],
-                       inplace=True)
-    best_display = counts.drop_duplicates("Category_key") \
+    counts = (
+        df[["Category_key", "Category_raw"]]
+        .groupby(["Category_key", "Category_raw"], dropna=False)
+        .size()
+        .reset_index(name="n")
+    )
+    counts["disp_len"] = counts["Category_raw"].str.len()
+    counts = counts.sort_values(
+        by=["Category_key", "n", "disp_len", "Category_raw"],
+        ascending=[True, False, True, True],
+        kind="mergesort",  # stable
+    )
+    best_display = counts.drop_duplicates("Category_key", keep="first") \
                          .set_index("Category_key")["Category_raw"].to_dict()
 else:
     best_display = {}
 
 # Build services map from df
-from collections import defaultdict
 svc_map: Dict[str, set] = defaultdict(set)
 for _, r in df.iterrows():
     ck = r["Category_key"]
