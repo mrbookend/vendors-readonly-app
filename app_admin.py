@@ -1,458 +1,495 @@
 # app_admin.py
-# Streamlit Admin for Vendors DB with intuitive Add/Edit and live-populated Category/Service dropdowns.
-# Compatible with:
-#   (A) Normalized schema: vendors(category_id, service_id) + categories(id,name), services(id,name)
-#   (B) Denormalized schema: vendors(category TEXT, service TEXT)
-#
-# Safe SQL, no fragile globals, no syntax errors. Inline "Add new ..." for Category/Service.
+# Vendors Admin — Turso (libSQL) first, SQLite fallback.
+# Robust dropdowns, login form, debug panel, and safe SQLAlchemy bindings.
+
+from __future__ import annotations
 
 import os
-import sqlite3
-from contextlib import closing
 from typing import List, Tuple, Dict, Optional
 
 import pandas as pd
 import streamlit as st
-
-# ---------- Configuration ----------
-DB_PATH = os.environ.get("VENDORS_DB_PATH", "vendors.db")  # override via env if needed
+from sqlalchemy import create_engine
+from sqlalchemy.sql import text as sql_text  # alias to avoid name collisions (e.g., st.text)
+from sqlalchemy.engine import Engine
 
 st.set_page_config(page_title="Vendors Admin", layout="wide")
 
-# ---------- Utility: DB connection ----------
-def get_conn():
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    return conn
+# ========= Secrets / Config =========
+LIBSQL_URL = st.secrets.get("LIBSQL_URL") or os.getenv("LIBSQL_URL")
+LIBSQL_AUTH_TOKEN = st.secrets.get("LIBSQL_AUTH_TOKEN") or os.getenv("LIBSQL_AUTH_TOKEN")
+VENDORS_DB_PATH = st.secrets.get("VENDORS_DB_PATH") or os.getenv("VENDORS_DB_PATH") or "vendors.db"
+ADMIN_PASSWORD = st.secrets.get("ADMIN_PASSWORD") or os.getenv("ADMIN_PASSWORD") or "ADMIN"
 
-def table_exists(conn, name: str) -> bool:
-    with closing(conn.cursor()) as c:
-        c.execute(
-            "SELECT 1 FROM sqlite_master WHERE type='table' AND name=? LIMIT 1;", (name,)
+USE_TURSO = bool(LIBSQL_URL and LIBSQL_AUTH_TOKEN)
+
+def make_engine() -> Engine:
+    if USE_TURSO:
+        return create_engine(
+            LIBSQL_URL,
+            connect_args={"auth_token": LIBSQL_AUTH_TOKEN},
+            pool_pre_ping=True,
+            pool_recycle=300,
         )
-        return c.fetchone() is not None
+    else:
+        return create_engine(f"sqlite:///{VENDORS_DB_PATH}")
 
-def get_table_columns(conn, table: str) -> List[str]:
-    with closing(conn.cursor()) as c:
-        c.execute(f"PRAGMA table_info({table});")
-        rows = c.fetchall()
-    return [row["name"] for row in rows]
+engine: Engine = make_engine()
+DB_SOURCE = f"(Turso) {LIBSQL_URL}" if USE_TURSO else f"(SQLite) {VENDORS_DB_PATH}"
 
-# ---------- Schema detection ----------
-@st.cache_data(show_spinner=False)
+# ========= Small DB helpers (safe param handling) =========
+def run_df(sql: str, params: Dict | None = None) -> pd.DataFrame:
+    with engine.begin() as conn:
+        return pd.read_sql_query(sql_text(sql), conn, params=dict(params or {}))
+
+def run_exec(sql: str, params: Dict | None = None) -> None:
+    with engine.begin() as conn:
+        conn.execute(sql_text(sql), dict(params or {}))
+
+def query_scalar(sql: str, params: Dict | None = None):
+    with engine.begin() as conn:
+        res = conn.execute(sql_text(sql), dict(params or {}))
+        row = res.fetchone()
+        return row[0] if row else None
+
+def table_columns(table: str) -> List[str]:
+    with engine.begin() as conn:
+        rows = conn.execute(sql_text(f"PRAGMA table_info({table});")).fetchall()
+        # PRAGMA returns: cid, name, type, notnull, dflt_value, pk
+        return [r[1] for r in rows]
+
+def table_exists(name: str) -> bool:
+    return query_scalar(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name=:n LIMIT 1;", {"n": name}
+    ) is not None
+
+# ========= Schema detection =========
 def detect_schema():
-    with get_conn() as conn:
-        if not table_exists(conn, "vendors"):
-            raise RuntimeError("Table 'vendors' not found. Verify your database.")
-
-        vcols = get_table_columns(conn, "vendors")
-        has_cat_tbl = table_exists(conn, "categories")
-        has_svc_tbl = table_exists(conn, "services")
-
-        schema = {
-            "vendors_columns": vcols,
-            "has_categories_table": has_cat_tbl,
-            "has_services_table": has_svc_tbl,
-            "uses_cat_id": "category_id" in vcols,
-            "uses_svc_id": "service_id" in vcols,
-            "uses_cat_text": "category" in vcols,
-            "uses_svc_text": "service" in vcols,
-        }
-
-        # Basic sanity checks
-        if not (schema["uses_cat_id"] or schema["uses_cat_text"]):
-            st.warning(
-                "No 'category_id' or 'category' column found on vendors. Category will be unavailable."
-            )
-        if not (schema["uses_svc_id"] or schema["uses_svc_text"]):
-            st.warning(
-                "No 'service_id' or 'service' column found on vendors. Service will be unavailable."
-            )
-
-        return schema
+    if not table_exists("vendors"):
+        st.error("Table 'vendors' not found. Check DB connection/path.")
+        st.stop()
+    vcols = table_columns("vendors")
+    has_categories = table_exists("categories")
+    has_services = table_exists("services")
+    schema = {
+        "vendors_columns": vcols,
+        "has_categories_table": has_categories,
+        "has_services_table": has_services,
+        "uses_cat_id": "category_id" in vcols and has_categories,
+        "uses_svc_id": "service_id" in vcols and has_services,
+        "uses_cat_text": "category" in vcols,
+        "uses_svc_text": "service" in vcols,
+    }
+    return schema
 
 SCHEMA = detect_schema()
 
-# ---------- Catalog loaders ----------
-def _fetchall(conn, sql: str, params: Tuple = ()) -> List[sqlite3.Row]:
-    with closing(conn.cursor()) as c:
-        c.execute(sql, params)
-        return c.fetchall()
-
-@st.cache_data(show_spinner=False)
+# ========= Catalog loaders (with robust fallbacks) =========
 def get_categories() -> List[str]:
-    with get_conn() as conn:
-        if SCHEMA["has_categories_table"]:
-            rows = _fetchall(conn, "SELECT name FROM categories ORDER BY name;")
-            return [r["name"] for r in rows]
-        # Fallback to distinct from vendors (denormalized)
-        if SCHEMA["uses_cat_text"]:
-            rows = _fetchall(
-                conn,
-                "SELECT DISTINCT category AS name FROM vendors WHERE category IS NOT NULL AND TRIM(category) <> '' ORDER BY 1;"
+    cats: List[str] = []
+    if SCHEMA["has_categories_table"]:
+        df = run_df("SELECT name FROM categories ORDER BY name;")
+        cats = df["name"].tolist()
+        if not cats and SCHEMA["uses_cat_text"]:
+            df = run_df(
+                "SELECT DISTINCT TRIM(category) AS name FROM vendors "
+                "WHERE category IS NOT NULL AND TRIM(category) <> '' ORDER BY 1;"
             )
-            return [r["name"] for r in rows]
-        # If normalized columns exist but table missing (edge), return empty list
-        return []
+            cats = df["name"].tolist()
+    elif SCHEMA["uses_cat_text"]:
+        df = run_df(
+            "SELECT DISTINCT TRIM(category) AS name FROM vendors "
+            "WHERE category IS NOT NULL AND TRIM(category) <> '' ORDER BY 1;"
+        )
+        cats = df["name"].tolist()
+    return cats
 
-@st.cache_data(show_spinner=False)
 def get_services() -> List[str]:
-    with get_conn() as conn:
-        if SCHEMA["has_services_table"]:
-            rows = _fetchall(conn, "SELECT name FROM services ORDER BY name;")
-            return [r["name"] for r in rows]
-        # Fallback to distinct from vendors (denormalized)
-        if SCHEMA["uses_svc_text"]:
-            rows = _fetchall(
-                conn,
-                "SELECT DISTINCT service AS name FROM vendors WHERE service IS NOT NULL AND TRIM(service) <> '' ORDER BY 1;"
+    svcs: List[str] = []
+    if SCHEMA["has_services_table"]:
+        df = run_df("SELECT name FROM services ORDER BY name;")
+        svcs = df["name"].tolist()
+        if not svcs and SCHEMA["uses_svc_text"]:
+            df = run_df(
+                "SELECT DISTINCT TRIM(service) AS name FROM vendors "
+                "WHERE service IS NOT NULL AND TRIM(service) <> '' ORDER BY 1;"
             )
-            return [r["name"] for r in rows]
-        return []
+            svcs = df["name"].tolist()
+    elif SCHEMA["uses_svc_text"]:
+        df = run_df(
+            "SELECT DISTINCT TRIM(service) AS name FROM vendors "
+            "WHERE service IS NOT NULL AND TRIM(service) <> '' ORDER BY 1;"
+        )
+        svcs = df["name"].tolist()
+    return svcs
 
-def get_category_id(conn, name: str) -> Optional[int]:
-    if not SCHEMA["has_categories_table"]:
+def get_or_create_category(name: str) -> Optional[int]:
+    if not name or not SCHEMA["has_categories_table"]:
         return None
-    with closing(conn.cursor()) as c:
-        c.execute("SELECT id FROM categories WHERE name = ?;", (name.strip(),))
-        row = c.fetchone()
-        return row["id"] if row else None
-
-def get_service_id(conn, name: str) -> Optional[int]:
-    if not SCHEMA["has_services_table"]:
-        return None
-    with closing(conn.cursor()) as c:
-        c.execute("SELECT id FROM services WHERE name = ?;", (name.strip(),))
-        row = c.fetchone()
-        return row["id"] if row else None
-
-def get_or_create_category(conn, name: str) -> Optional[int]:
-    if name is None or not name.strip():
-        return None
-    if not SCHEMA["has_categories_table"]:
-        return None  # denormalized path uses text directly
-    cid = get_category_id(conn, name)
+    name = name.strip()
+    cid = query_scalar("SELECT id FROM categories WHERE name=:n;", {"n": name})
     if cid is not None:
         return cid
-    with closing(conn.cursor()) as c:
-        c.execute("INSERT INTO categories(name) VALUES(?);", (name.strip(),))
-        conn.commit()
-        return c.lastrowid
+    run_exec("INSERT INTO categories(name) VALUES(:n);", {"n": name})
+    return query_scalar("SELECT id FROM categories WHERE name=:n;", {"n": name})
 
-def get_or_create_service(conn, name: str) -> Optional[int]:
-    if name is None or not name.strip():
+def get_or_create_service(name: str) -> Optional[int]:
+    if not name or not SCHEMA["has_services_table"]:
         return None
-    if not SCHEMA["has_services_table"]:
-        return None
-    sid = get_service_id(conn, name)
+    name = name.strip()
+    sid = query_scalar("SELECT id FROM services WHERE name=:n;", {"n": name})
     if sid is not None:
         return sid
-    with closing(conn.cursor()) as c:
-        c.execute("INSERT INTO services(name) VALUES(?);", (name.strip(),))
-        conn.commit()
-        return c.lastrowid
+    run_exec("INSERT INTO services(name) VALUES(:n);", {"n": name})
+    return query_scalar("SELECT id FROM services WHERE name=:n;", {"n": name})
 
-# ---------- Vendor data helpers ----------
+# ========= Vendors data (list/detail) =========
 def load_vendors_df() -> pd.DataFrame:
-    with get_conn() as conn:
-        vcols = SCHEMA["vendors_columns"]
-        # Decide select expression to get Category and Service as NAMES for display
-        if SCHEMA["uses_cat_id"] and SCHEMA["has_categories_table"]:
-            cat_expr = "categories.name AS Category"
-            cat_join = "LEFT JOIN categories ON categories.id = vendors.category_id"
-        elif SCHEMA["uses_cat_text"]:
-            cat_expr = "vendors.category AS Category"
-            cat_join = ""
-        else:
-            cat_expr = "NULL AS Category"
-            cat_join = ""
+    if SCHEMA["uses_cat_id"]:
+        cat_expr = "c.name AS Category"
+        cat_join = "LEFT JOIN categories c ON c.id = v.category_id"
+    elif SCHEMA["uses_cat_text"]:
+        cat_expr, cat_join = "v.category AS Category", ""
+    else:
+        cat_expr, cat_join = "NULL AS Category", ""
 
-        if SCHEMA["uses_svc_id"] and SCHEMA["has_services_table"]:
-            svc_expr = "services.name AS Service"
-            svc_join = "LEFT JOIN services ON services.id = vendors.service_id"
-        elif SCHEMA["uses_svc_text"]:
-            svc_expr = "vendors.service AS Service"
-            svc_join = ""
-        else:
-            svc_expr = "NULL AS Service"
-            svc_join = ""
+    if SCHEMA["uses_svc_id"]:
+        svc_expr = "s.name AS Service"
+        svc_join = "LEFT JOIN services s ON s.id = v.service_id"
+    elif SCHEMA["uses_svc_text"]:
+        svc_expr, svc_join = "v.service AS Service", ""
+    else:
+        svc_expr, svc_join = "NULL AS Service", ""
 
-        select_cols = [
-            "vendors.id AS id",
-            cat_expr,
-            svc_expr,
-            "vendors.business_name AS Business_Name",
-            "vendors.contact_name AS Contact_Name",
-            "vendors.phone AS Phone",
-            "vendors.address AS Address",
-            "vendors.notes AS Notes",
-            "vendors.website AS Website",
-        ]
-        sql = f"""
-            SELECT {", ".join(select_cols)}
-            FROM vendors
-            {cat_join}
-            {svc_join}
-            ORDER BY Business_Name COLLATE NOCASE ASC;
-        """
-        df = pd.read_sql_query(sql, conn)
-        # For display, harmonize column names with spaces
-        df = df.rename(
-            columns={
-                "Business_Name": "Business Name",
-                "Contact_Name": "Contact Name",
-            }
-        )
-        return df
+    sql = f"""
+        SELECT
+          v.id AS id,
+          {cat_expr},
+          {svc_expr},
+          v.business_name AS "Business Name",
+          v.contact_name  AS "Contact Name",
+          v.phone         AS Phone,
+          v.address       AS Address,
+          v.notes         AS Notes,
+          v.website       AS Website
+        FROM vendors v
+        {cat_join}
+        {svc_join}
+        ORDER BY "Business Name" COLLATE NOCASE ASC;
+    """
+    return run_df(sql)
 
 def vendor_display_label(row: pd.Series) -> str:
-    parts = [
-        f"{row.get('Business Name') or '(no name)'}",
-        f"— {row.get('Category') or 'Uncategorized'}",
-        f"/ {row.get('Service') or 'Unspecified'}",
-        f"(id={row.get('id')})",
-    ]
-    return " ".join(parts)
+    bn = row.get("Business Name") or "(no name)"
+    cat = row.get("Category") or "Uncategorized"
+    svc = row.get("Service") or "Unspecified"
+    vid = row.get("id")
+    return f"{bn} — {cat} / {svc} (id={vid})"
 
-# ---------- UI components for category/service with inline add ----------
+# ========= UI helpers =========
 ADD_NEW_CAT = "➕ Add new category…"
 ADD_NEW_SVC = "➕ Add new service…"
 
 def category_selector(key_prefix: str, default_name: Optional[str]) -> str:
-    cats = get_categories()
-    options = cats.copy()
-    options.insert(0, "")  # allow blank
-    options.append(ADD_NEW_CAT)
-    sel = st.selectbox(
-        "Category",
-        options=options,
-        index=(options.index(default_name) if default_name in options else 0),
-        key=f"{key_prefix}_cat_select",
-    )
+    options = [""] + get_categories() + [ADD_NEW_CAT]
+    try:
+        idx = options.index(default_name) if default_name in options else 0
+    except Exception:
+        idx = 0
+    sel = st.selectbox("Category", options=options, index=idx, key=f"{key_prefix}_cat_select")
     if sel == ADD_NEW_CAT:
-        new_val = st.text_input(
-            "New category name", value="", key=f"{key_prefix}_cat_new"
-        ).strip()
+        new_val = st.text_input("New category name", key=f"{key_prefix}_cat_new").strip()
         return new_val
     return sel.strip() if sel else ""
 
 def service_selector(key_prefix: str, default_name: Optional[str]) -> str:
-    svcs = get_services()
-    options = svcs.copy()
-    options.insert(0, "")  # allow blank
-    options.append(ADD_NEW_SVC)
-    sel = st.selectbox(
-        "Service",
-        options=options,
-        index=(options.index(default_name) if default_name in options else 0),
-        key=f"{key_prefix}_svc_select",
-    )
+    options = [""] + get_services() + [ADD_NEW_SVC]
+    try:
+        idx = options.index(default_name) if default_name in options else 0
+    except Exception:
+        idx = 0
+    sel = st.selectbox("Service", options=options, index=idx, key=f"{key_prefix}_svc_select")
     if sel == ADD_NEW_SVC:
-        new_val = st.text_input(
-            "New service name", value="", key=f"{key_prefix}_svc_new"
-        ).strip()
+        new_val = st.text_input("New service name", key=f"{key_prefix}_svc_new").strip()
         return new_val
     return sel.strip() if sel else ""
 
-# ---------- CRUD operations ----------
-def insert_vendor(payload: Dict):
-    with get_conn() as conn, closing(conn.cursor()) as c:
-        # Resolve category/service per schema
-        cat_name = (payload.get("Category") or "").strip()
-        svc_name = (payload.get("Service") or "").strip()
-
-        if SCHEMA["uses_cat_id"] and SCHEMA["has_categories_table"]:
-            cat_id = get_or_create_category(conn, cat_name) if cat_name else None
-        else:
-            cat_id = None
-
-        if SCHEMA["uses_svc_id"] and SCHEMA["has_services_table"]:
-            svc_id = get_or_create_service(conn, svc_name) if svc_name else None
-        else:
-            svc_id = None
-
-        cols = []
-        vals = []
-        params = []
-
-        # category/service mapping
-        if SCHEMA["uses_cat_id"] and SCHEMA["has_categories_table"]:
-            cols.append("category_id"); vals.append("?"); params.append(cat_id)
-        elif SCHEMA["uses_cat_text"]:
-            cols.append("category"); vals.append("?"); params.append(cat_name or None)
-        # else: no-op if neither exists
-
-        if SCHEMA["uses_svc_id"] and SCHEMA["has_services_table"]:
-            cols.append("service_id"); vals.append("?"); params.append(svc_id)
-        elif SCHEMA["uses_svc_text"]:
-            cols.append("service"); vals.append("?"); params.append(svc_name or None)
-
-        # other fields
-        for k_src, k_db in [
-            ("Business Name", "business_name"),
-            ("Contact Name", "contact_name"),
-            ("Phone", "phone"),
-            ("Address", "address"),
-            ("Notes", "notes"),
-            ("Website", "website"),
-        ]:
-            cols.append(k_db); vals.append("?"); params.append(payload.get(k_src) or None)
-
-        sql = f"INSERT INTO vendors ({', '.join(cols)}) VALUES ({', '.join(vals)});"
-        c.execute(sql, tuple(params))
-        conn.commit()
-        return c.lastrowid
-
-def update_vendor(vendor_id: int, payload: Dict):
-    with get_conn() as conn, closing(conn.cursor()) as c:
-        sets = []
-        params = []
+# ========= CRUD =========
+def insert_vendor(payload: Dict) -> int:
+    # Do the whole insert in a single connection to get last_insert_rowid() reliably.
+    with engine.begin() as conn:
+        vals: Dict = {}
+        sets: List[str] = []
 
         cat_name = (payload.get("Category") or "").strip()
         svc_name = (payload.get("Service") or "").strip()
 
-        if SCHEMA["uses_cat_id"] and SCHEMA["has_categories_table"]:
-            cat_id = get_or_create_category(conn, cat_name) if cat_name else None
-            sets.append("category_id = ?"); params.append(cat_id)
+        if SCHEMA["uses_cat_id"]:
+            cid = None
+            if cat_name:
+                # Ensure category exists; do inline using same connection
+                row = conn.execute(sql_text("SELECT id FROM categories WHERE name=:n;"), {"n": cat_name}).fetchone()
+                cid = row[0] if row else None
+                if cid is None:
+                    conn.execute(sql_text("INSERT INTO categories(name) VALUES(:n);"), {"n": cat_name})
+                    row = conn.execute(sql_text("SELECT id FROM categories WHERE name=:n;"), {"n": cat_name}).fetchone()
+                    cid = row[0] if row else None
+            sets.append("category_id = :category_id"); vals["category_id"] = cid
         elif SCHEMA["uses_cat_text"]:
-            sets.append("category = ?"); params.append(cat_name or None)
+            sets.append("category = :category"); vals["category"] = cat_name or None
 
-        if SCHEMA["uses_svc_id"] and SCHEMA["has_services_table"]:
-            svc_id = get_or_create_service(conn, svc_name) if svc_name else None
-            sets.append("service_id = ?"); params.append(svc_id)
+        if SCHEMA["uses_svc_id"]:
+            sid = None
+            if svc_name:
+                row = conn.execute(sql_text("SELECT id FROM services WHERE name=:n;"), {"n": svc_name}).fetchone()
+                sid = row[0] if row else None
+                if sid is None:
+                    conn.execute(sql_text("INSERT INTO services(name) VALUES(:n);"), {"n": svc_name})
+                    row = conn.execute(sql_text("SELECT id FROM services WHERE name=:n;"), {"n": svc_name}).fetchone()
+                    sid = row[0] if row else None
+            sets.append("service_id = :service_id"); vals["service_id"] = sid
         elif SCHEMA["uses_svc_text"]:
-            sets.append("service = ?"); params.append(svc_name or None)
+            sets.append("service = :service"); vals["service"] = svc_name or None
 
-        for k_src, k_db in [
-            ("Business Name", "business_name"),
-            ("Contact Name", "contact_name"),
-            ("Phone", "phone"),
-            ("Address", "address"),
-            ("Notes", "notes"),
-            ("Website", "website"),
-        ]:
-            sets.append(f"{k_db} = ?")
-            params.append(payload.get(k_src) or None)
+        mapping = {
+            "Business Name": "business_name",
+            "Contact Name": "contact_name",
+            "Phone": "phone",
+            "Address": "address",
+            "Notes": "notes",
+            "Website": "website",
+        }
+        for k_src, k_db in mapping.items():
+            sets.append(f"{k_db} = :{k_db}")
+            vals[k_db] = payload.get(k_src) or None
 
-        params.append(vendor_id)
-        sql = f"UPDATE vendors SET {', '.join(sets)} WHERE id = ?;"
-        c.execute(sql, tuple(params))
-        conn.commit()
+        cols = ", ".join([s.split("=")[0].strip() for s in sets])
+        marks = ", ".join([f":{s.split(':')[-1]}" for s in sets])
+        conn.execute(sql_text(f"INSERT INTO vendors ({cols}) VALUES ({marks});"), vals)
+        new_id = conn.execute(sql_text("SELECT last_insert_rowid();")).fetchone()[0]
+        return int(new_id)
 
-def delete_vendor(vendor_id: int) -> int:
-    with get_conn() as conn, closing(conn.cursor()) as c:
-        c.execute("DELETE FROM vendors WHERE id = ?;", (vendor_id,))
-        conn.commit()
-        return c.rowcount
+def update_vendor(vendor_id: int, payload: Dict) -> None:
+    with engine.begin() as conn:
+        vals: Dict = {"id": vendor_id}
+        sets: List[str] = []
 
-# ---------- Admin functions for categories/services ----------
+        cat_name = (payload.get("Category") or "").strip()
+        svc_name = (payload.get("Service") or "").strip()
+
+        if SCHEMA["uses_cat_id"]:
+            cid = None
+            if cat_name:
+                row = conn.execute(sql_text("SELECT id FROM categories WHERE name=:n;"), {"n": cat_name}).fetchone()
+                cid = row[0] if row else None
+                if cid is None:
+                    conn.execute(sql_text("INSERT INTO categories(name) VALUES(:n);"), {"n": cat_name})
+                    row = conn.execute(sql_text("SELECT id FROM categories WHERE name=:n;"), {"n": cat_name}).fetchone()
+                    cid = row[0] if row else None
+            sets.append("category_id = :category_id"); vals["category_id"] = cid
+        elif SCHEMA["uses_cat_text"]:
+            sets.append("category = :category"); vals["category"] = cat_name or None
+
+        if SCHEMA["uses_svc_id"]:
+            sid = None
+            if svc_name:
+                row = conn.execute(sql_text("SELECT id FROM services WHERE name=:n;"), {"n": svc_name}).fetchone()
+                sid = row[0] if row else None
+                if sid is None:
+                    conn.execute(sql_text("INSERT INTO services(name) VALUES(:n);"), {"n": svc_name})
+                    row = conn.execute(sql_text("SELECT id FROM services WHERE name=:n;"), {"n": svc_name}).fetchone()
+                    sid = row[0] if row else None
+            sets.append("service_id = :service_id"); vals["service_id"] = sid
+        elif SCHEMA["uses_svc_text"]:
+            sets.append("service = :service"); vals["service"] = svc_name or None
+
+        mapping = {
+            "Business Name": "business_name",
+            "Contact Name": "contact_name",
+            "Phone": "phone",
+            "Address": "address",
+            "Notes": "notes",
+            "Website": "website",
+        }
+        for k_src, k_db in mapping.items():
+            sets.append(f"{k_db} = :{k_db}")
+            vals[k_db] = payload.get(k_src) or None
+
+        conn.execute(sql_text(f"UPDATE vendors SET {', '.join(sets)} WHERE id = :id;"), vals)
+
+def delete_vendor(vendor_id: int) -> None:
+    run_exec("DELETE FROM vendors WHERE id = :id;", {"id": vendor_id})
+
+# ========= Categories/Services admin =========
 def rename_category(old_name: str, new_name: str) -> None:
     new_name = new_name.strip()
-    with get_conn() as conn, closing(conn.cursor()) as c:
-        if SCHEMA["has_categories_table"] and SCHEMA["uses_cat_id"]:
-            # Update lookup; unique constraint may exist
-            c.execute("UPDATE OR IGNORE categories SET name = ? WHERE name = ?;", (new_name, old_name))
-            conn.commit()
-        elif SCHEMA["uses_cat_text"]:
-            c.execute("UPDATE vendors SET category = ? WHERE category = ?;", (new_name, old_name))
-            conn.commit()
+    if SCHEMA["has_categories_table"] and SCHEMA["uses_cat_id"]:
+        run_exec("UPDATE OR IGNORE categories SET name = :n WHERE name = :o;", {"n": new_name, "o": old_name})
+    elif SCHEMA["uses_cat_text"]:
+        run_exec("UPDATE vendors SET category = :n WHERE category = :o;", {"n": new_name, "o": old_name})
 
 def rename_service(old_name: str, new_name: str) -> None:
     new_name = new_name.strip()
-    with get_conn() as conn, closing(conn.cursor()) as c:
-        if SCHEMA["has_services_table"] and SCHEMA["uses_svc_id"]:
-            c.execute("UPDATE OR IGNORE services SET name = ? WHERE name = ?;", (new_name, old_name))
-            conn.commit()
-        elif SCHEMA["uses_svc_text"]:
-            c.execute("UPDATE vendors SET service = ? WHERE service = ?;", (new_name, old_name))
-            conn.commit()
+    if SCHEMA["has_services_table"] and SCHEMA["uses_svc_id"]:
+        run_exec("UPDATE OR IGNORE services SET name = :n WHERE name = :o;", {"n": new_name, "o": old_name})
+    elif SCHEMA["uses_svc_text"]:
+        run_exec("UPDATE vendors SET service = :n WHERE service = :o;", {"n": new_name, "o": old_name})
 
-def delete_category(name: str) -> Tuple[bool, str]:
-    with get_conn() as conn, closing(conn.cursor()) as c:
-        if SCHEMA["has_categories_table"] and SCHEMA["uses_cat_id"]:
-            # Check usage
-            c.execute(
-                "SELECT COUNT(*) AS n FROM vendors v JOIN categories c ON v.category_id=c.id WHERE c.name = ?;",
-                (name,),
-            )
-            in_use = c.fetchone()["n"]
-            if in_use:
-                return False, f"Cannot delete '{name}': it is in use by {in_use} vendor(s)."
-            c.execute("DELETE FROM categories WHERE name = ?;", (name,))
-            conn.commit()
-            return True, f"Deleted category '{name}'."
-        elif SCHEMA["uses_cat_text"]:
-            # If denormalized, check in use
-            c.execute("SELECT COUNT(*) AS n FROM vendors WHERE category = ?;", (name,))
-            in_use = c.fetchone()["n"]
-            if in_use:
-                return False, f"Cannot delete '{name}': it is in use by {in_use} vendor(s)."
-            # No separate table to delete from
-            return True, f"'{name}' removed from catalog view (it may still appear if vendors reference it)."
-        return False, "Category storage not found."
+def delete_category_val(name: str) -> Tuple[bool, str]:
+    if SCHEMA["has_categories_table"] and SCHEMA["uses_cat_id"]:
+        n = query_scalar(
+            "SELECT COUNT(*) FROM vendors v JOIN categories c ON v.category_id=c.id WHERE c.name=:n;", {"n": name}
+        )
+        if n:
+            return False, f"Cannot delete '{name}': it is in use by {n} vendor(s)."
+        run_exec("DELETE FROM categories WHERE name=:n;", {"n": name})
+        return True, f"Deleted category '{name}'."
+    elif SCHEMA["uses_cat_text"]:
+        n = query_scalar("SELECT COUNT(*) FROM vendors WHERE category=:n;", {"n": name})
+        if n:
+            return False, f"Cannot delete '{name}': it is in use by {n} vendor(s)."
+        return True, f"'{name}' removed from catalog view."
+    return False, "Category storage not found."
 
-def delete_service(name: str) -> Tuple[bool, str]:
-    with get_conn() as conn, closing(conn.cursor()) as c:
-        if SCHEMA["has_services_table"] and SCHEMA["uses_svc_id"]:
-            c.execute(
-                "SELECT COUNT(*) AS n FROM vendors v JOIN services s ON v.service_id=s.id WHERE s.name = ?;",
-                (name,),
-            )
-            in_use = c.fetchone()["n"]
-            if in_use:
-                return False, f"Cannot delete '{name}': it is in use by {in_use} vendor(s)."
-            c.execute("DELETE FROM services WHERE name = ?;", (name,))
-            conn.commit()
-            return True, f"Deleted service '{name}'."
-        elif SCHEMA["uses_svc_text"]:
-            c.execute("SELECT COUNT(*) AS n FROM vendors WHERE service = ?;", (name,))
-            in_use = c.fetchone()["n"]
-            if in_use:
-                return False, f"Cannot delete '{name}': it is in use by {in_use} vendor(s)."
-            return True, f"'{name}' removed from catalog view (it may still appear if vendors reference it)."
-        return False, "Service storage not found."
+def delete_service_val(name: str) -> Tuple[bool, str]:
+    if SCHEMA["has_services_table"] and SCHEMA["uses_svc_id"]:
+        n = query_scalar(
+            "SELECT COUNT(*) FROM vendors v JOIN services s ON v.service_id=s.id WHERE s.name=:n;", {"n": name}
+        )
+        if n:
+            return False, f"Cannot delete '{name}': it is in use by {n} vendor(s)."
+        run_exec("DELETE FROM services WHERE name=:n;", {"n": name})
+        return True, f"Deleted service '{name}'."
+    elif SCHEMA["uses_svc_text"]:
+        n = query_scalar("SELECT COUNT(*) FROM vendors WHERE service=:n;", {"n": name})
+        if n:
+            return False, f"Cannot delete '{name}': it is in use by {n} vendor(s)."
+        return True, f"'{name}' removed from catalog view."
+    return False, "Service storage not found."
 
-# ---------- UI ----------
+# ========= Auth gate (Enter submits) =========
+if "auth_ok" not in st.session_state:
+    st.session_state.auth_ok = False
+
+if not st.session_state.auth_ok:
+    st.title("Vendors Admin – Sign in")
+    with st.form("login_form", clear_on_submit=False):
+        pwd = st.text_input("Admin password", type="password")
+        submitted = st.form_submit_button("Sign in")
+    if submitted:
+        if (pwd or "").strip() == ADMIN_PASSWORD:
+            st.session_state.auth_ok = True
+            st.rerun()
+        else:
+            st.error("Wrong password.")
+    st.stop()
+
+# ========= App UI =========
 st.title("Vendors Admin")
 
 with st.sidebar:
     st.subheader("Navigation")
-    page = st.radio(
-        "Go to",
-        ["View", "Add", "Edit", "Delete", "Categories & Services Admin"],
-        index=0,
-    )
+    page = st.radio("Go to", ["View", "Add", "Edit", "Delete", "Categories & Services Admin"], index=0)
+    if st.button("Sign out"):
+        st.session_state.auth_ok = False
+        st.rerun()
 
-# Cache invalidation helper
-def invalidate_catalog_caches():
-    get_categories.clear()
-    get_services.clear()
-    load_vendors_df.clear()
+# Debug/status expander
+with st.expander("Database Status & Schema (debug)"):
+    counts = {
+        "vendors": query_scalar("SELECT COUNT(*) FROM vendors;") or 0,
+        "categories": query_scalar("SELECT COUNT(*) FROM categories;") if SCHEMA["has_categories_table"] else None,
+        "services": query_scalar("SELECT COUNT(*) FROM services;") if SCHEMA["has_services_table"] else None,
+    }
+    st.write({
+        "db_source": DB_SOURCE,
+        "vendors_columns": SCHEMA["vendors_columns"],
+        "has_categories_table": SCHEMA["has_categories_table"],
+        "has_services_table": SCHEMA["has_services_table"],
+        "uses_cat_id": SCHEMA["uses_cat_id"],
+        "uses_svc_id": SCHEMA["uses_svc_id"],
+        "uses_cat_text": SCHEMA["uses_cat_text"],
+        "uses_svc_text": SCHEMA["uses_svc_text"],
+        "counts": counts,
+        "sample_categories": get_categories()[:15],
+        "sample_services": get_services()[:15],
+    })
 
-# ---------- Pages ----------
+# Pages
+def refresh_notice():
+    st.caption("Lists refresh automatically. If values look stale, use **Rerun** from the menu.")
+
 if page == "View":
     st.header("All Vendors")
     df = load_vendors_df()
-    st.dataframe(df.drop(columns=["id"]), use_container_width=True, hide_index=True)
+    if df.empty:
+        st.info("No vendors found.")
+    else:
+        st.dataframe(df.drop(columns=["id"]), use_container_width=True, hide_index=True)
+    refresh_notice()
 
 elif page == "Add":
     st.header("Add Vendor")
-
     with st.form("add_vendor_form", clear_on_submit=True):
         col1, col2 = st.columns(2)
         with col1:
-            business_name = st.text_input("Business Name", key="add_bname").strip()
-            contact_name = st.text_input("Contact Name", key="add_cname").strip()
-            phone = st.text_input("Phone", key="add_phone").strip()
+            business_name = st.text_input("Business Name").strip()
+            contact_name = st.text_input("Contact Name").strip()
+            phone = st.text_input("Phone").strip()
             category_name = category_selector("add", default_name=None)
         with col2:
-            address = st.text_area("Address", key="add_addr").strip()
-            notes = st.text_area("Notes", key="add_notes").strip()
-            website = st.text_input("Website (URL)", key="add_site").strip()
+            address = st.text_area("Address").strip()
+            notes = st.text_area("Notes").strip()
+            website = st.text_input("Website (URL)").strip()
             service_name = service_selector("add", default_name=None)
-
         submitted = st.form_submit_button("Add Vendor")
-        if submitted:
+    if submitted:
+        if not business_name:
+            st.error("Business Name is required.")
+        else:
+            payload = {
+                "Business Name": business_name or None,
+                "Contact Name": contact_name or None,
+                "Phone": phone or None,
+                "Address": address or None,
+                "Notes": notes or None,
+                "Website": website or None,
+                "Category": category_name or None,
+                "Service": service_name or None,
+            }
+            try:
+                new_id = insert_vendor(payload)
+                st.success(f"Vendor added (id={new_id}).")
+            except Exception as e:
+                st.error(f"Failed to add vendor: {e}")
+    refresh_notice()
+
+elif page == "Edit":
+    st.header("Edit Vendor")
+    df = load_vendors_df()
+    if df.empty:
+        st.info("No vendors found.")
+    else:
+        labels = df.apply(vendor_display_label, axis=1).tolist()
+        id_by_label = {labels[i]: int(df.iloc[i]["id"]) for i in range(len(labels))}
+        chosen_label = st.selectbox("Select Vendor", options=labels, key="edit_vendor_select")
+        vid = id_by_label[chosen_label]
+        row = df.loc[df["id"] == vid].iloc[0]
+
+        with st.form("edit_vendor_form"):
+            col1, col2 = st.columns(2)
+            with col1:
+                business_name = st.text_input("Business Name", value=row["Business Name"] or "").strip()
+                contact_name = st.text_input("Contact Name", value=row["Contact Name"] or "").strip()
+                phone = st.text_input("Phone", value=row["Phone"] or "").strip()
+                category_name = category_selector("edit", default_name=row["Category"])
+            with col2:
+                address = st.text_area("Address", value=row["Address"] or "").strip()
+                notes = st.text_area("Notes", value=row["Notes"] or "").strip()
+                website = st.text_input("Website (URL)", value=row["Website"] or "").strip()
+                service_name = service_selector("edit", default_name=row["Service"])
+            save = st.form_submit_button("Save Changes")
+        if save:
             if not business_name:
                 st.error("Business Name is required.")
             else:
@@ -467,66 +504,14 @@ elif page == "Add":
                     "Service": service_name or None,
                 }
                 try:
-                    new_id = insert_vendor(payload)
-                    invalidate_catalog_caches()
-                    st.success(f"Vendor added (id={new_id}).")
+                    update_vendor(int(vid), payload)
+                    st.success("Vendor updated.")
                 except Exception as e:
-                    st.error(f"Failed to add vendor: {e}")
-
-elif page == "Edit":
-    st.header("Edit Vendor")
-
-    df = load_vendors_df()
-    if df.empty:
-        st.info("No vendors found.")
-    else:
-        # Build selection labels
-        labels = df.apply(vendor_display_label, axis=1).tolist()
-        id_by_label = {labels[i]: int(df.iloc[i]["id"]) for i in range(len(labels))}
-
-        chosen_label = st.selectbox("Select Vendor", options=labels, key="edit_vendor_select")
-        vid = id_by_label[chosen_label]
-
-        row = df.loc[df["id"] == vid].iloc[0]
-
-        with st.form("edit_vendor_form"):
-            col1, col2 = st.columns(2)
-            with col1:
-                business_name = st.text_input("Business Name", value=row["Business Name"] or "", key="edit_bname").strip()
-                contact_name = st.text_input("Contact Name", value=row["Contact Name"] or "", key="edit_cname").strip()
-                phone = st.text_input("Phone", value=row["Phone"] or "", key="edit_phone").strip()
-                category_name = category_selector("edit", default_name=row["Category"])
-            with col2:
-                address = st.text_area("Address", value=row["Address"] or "", key="edit_addr").strip()
-                notes = st.text_area("Notes", value=row["Notes"] or "", key="edit_notes").strip()
-                website = st.text_input("Website (URL)", value=row["Website"] or "", key="edit_site").strip()
-                service_name = service_selector("edit", default_name=row["Service"])
-
-            save = st.form_submit_button("Save Changes")
-            if save:
-                if not business_name:
-                    st.error("Business Name is required.")
-                else:
-                    payload = {
-                        "Business Name": business_name or None,
-                        "Contact Name": contact_name or None,
-                        "Phone": phone or None,
-                        "Address": address or None,
-                        "Notes": notes or None,
-                        "Website": website or None,
-                        "Category": category_name or None,
-                        "Service": service_name or None,
-                    }
-                    try:
-                        update_vendor(int(vid), payload)
-                        invalidate_catalog_caches()
-                        st.success("Vendor updated.")
-                    except Exception as e:
-                        st.error(f"Failed to update vendor: {e}")
+                    st.error(f"Failed to update vendor: {e}")
+    refresh_notice()
 
 elif page == "Delete":
     st.header("Delete Vendor")
-
     df = load_vendors_df()
     if df.empty:
         st.info("No vendors found.")
@@ -538,24 +523,20 @@ elif page == "Delete":
         st.warning(f"This will permanently delete vendor id={vid}.")
         if st.button("Confirm Delete", type="primary"):
             try:
-                n = delete_vendor(int(vid))
-                invalidate_catalog_caches()
-                if n:
-                    st.success("Vendor deleted.")
-                else:
-                    st.info("Nothing deleted (vendor may not exist).")
+                delete_vendor(int(vid))
+                st.success("Vendor deleted.")
             except Exception as e:
                 st.error(f"Failed to delete vendor: {e}")
+    refresh_notice()
 
 elif page == "Categories & Services Admin":
     st.header("Categories & Services Admin")
-
     tab_cat, tab_svc = st.tabs(["Categories", "Services"])
 
     with tab_cat:
         st.subheader("Manage Categories")
         cats = get_categories()
-        st.write("Existing categories:", cats)
+        st.write("Existing categories:", cats or "(none)")
 
         with st.expander("Add Category"):
             new_cat = st.text_input("New category name", key="admin_cat_new").strip()
@@ -564,12 +545,10 @@ elif page == "Categories & Services Admin":
                     st.error("Enter a category name.")
                 else:
                     try:
-                        with get_conn() as conn:
-                            if SCHEMA["has_categories_table"]:
-                                get_or_create_category(conn, new_cat)
-                            else:
-                                st.info("No categories table; add via vendor form using denormalized path.")
-                        invalidate_catalog_caches()
+                        if SCHEMA["has_categories_table"]:
+                            get_or_create_category(new_cat)
+                        else:
+                            st.info("No categories table; using vendors.category (denormalized).")
                         st.success(f"Category '{new_cat}' added (or already existed).")
                     except Exception as e:
                         st.error(f"Failed to add category: {e}")
@@ -584,7 +563,6 @@ elif page == "Categories & Services Admin":
                     else:
                         try:
                             rename_category(old, new)
-                            invalidate_catalog_caches()
                             st.success(f"Renamed '{old}' to '{new}'.")
                         except Exception as e:
                             st.error(f"Failed to rename category: {e}")
@@ -595,9 +573,8 @@ elif page == "Categories & Services Admin":
             if cats:
                 victim = st.selectbox("Select category to delete", options=cats, key="admin_cat_del_sel")
                 if st.button("Delete Category", key="admin_cat_del_btn"):
-                    ok, msg = delete_category(victim)
+                    ok, msg = delete_category_val(victim)
                     if ok:
-                        invalidate_catalog_caches()
                         st.success(msg)
                     else:
                         st.error(msg)
@@ -607,7 +584,7 @@ elif page == "Categories & Services Admin":
     with tab_svc:
         st.subheader("Manage Services")
         svcs = get_services()
-        st.write("Existing services:", svcs)
+        st.write("Existing services:", svcs or "(none)")
 
         with st.expander("Add Service"):
             new_svc = st.text_input("New service name", key="admin_svc_new").strip()
@@ -616,12 +593,10 @@ elif page == "Categories & Services Admin":
                     st.error("Enter a service name.")
                 else:
                     try:
-                        with get_conn() as conn:
-                            if SCHEMA["has_services_table"]:
-                                get_or_create_service(conn, new_svc)
-                            else:
-                                st.info("No services table; add via vendor form using denormalized path.")
-                        invalidate_catalog_caches()
+                        if SCHEMA["has_services_table"]:
+                            get_or_create_service(new_svc)
+                        else:
+                            st.info("No services table; using vendors.service (denormalized).")
                         st.success(f"Service '{new_svc}' added (or already existed).")
                     except Exception as e:
                         st.error(f"Failed to add service: {e}")
@@ -636,7 +611,6 @@ elif page == "Categories & Services Admin":
                     else:
                         try:
                             rename_service(old, new)
-                            invalidate_catalog_caches()
                             st.success(f"Renamed '{old}' to '{new}'.")
                         except Exception as e:
                             st.error(f"Failed to rename service: {e}")
@@ -647,11 +621,12 @@ elif page == "Categories & Services Admin":
             if svcs:
                 victim = st.selectbox("Select service to delete", options=svcs, key="admin_svc_del_sel")
                 if st.button("Delete Service", key="admin_svc_del_btn"):
-                    ok, msg = delete_service(victim)
+                    ok, msg = delete_service_val(victim)
                     if ok:
-                        invalidate_catalog_caches()
                         st.success(msg)
                     else:
                         st.error(msg)
             else:
                 st.info("No services found.")
+
+# EOF
