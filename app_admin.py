@@ -1,7 +1,9 @@
-# app_admin.py — Vendors Admin (auto-map columns; reliable Update/Delete)
+# app_admin.py — Vendors Admin (auto-map columns; reliable Update/Delete; category/service dropdowns)
 # - Works if your DB uses different column names (snake_case, etc.)
 # - Uses SQLite rowid as the key (precise updates/deletes)
-# - Fixes delete: confirmation checkbox + form_submit_button (no stray st.button)
+# - Delete uses checkbox + form_submit_button
+# - Category & Service use dropdowns sourced from distinct table values
+#   * Service list is filtered by currently selected Category (if both mapped)
 # - Supports Turso/libSQL or local SQLite
 
 import os
@@ -65,16 +67,15 @@ def list_tables() -> List[str]:
 
 def get_table_columns(table: str) -> List[str]:
     rows = exec_query(f"PRAGMA table_info('{table}')")
-    return [r[1] for r in rows]  # row = (cid, name, type, notnull, dflt_value, pk)
+    return [r[1] for r in rows]  # (cid, name, type, notnull, dflt_value, pk)
 
 def table_has_rowid(table: str) -> bool:
-    # WITHOUT ROWID tables do not support rowid; for typical SQLite tables this is True
     rows = exec_query("SELECT sql FROM sqlite_schema WHERE type IN ('table','view') AND name=? LIMIT 1", (table,))
     if not rows:
         return False
     sql = (rows[0][0] or "").upper()
     if " VIEW " in sql:
-        # Views are not updatable unless INSTEAD OF triggers exist; treat as no-rowid for safety
+        # Views are not updatable unless INSTEAD OF triggers exist; treat as not rowid-updateable
         return False
     return " WITHOUT ROWID" not in sql
 
@@ -100,11 +101,11 @@ EXPECTED = [
 
 # Candidate DB names we’ll probe for each friendly field
 CANDIDATES: Dict[str, List[str]] = {
-    "Category":      ["Category", "category"],
-    "Service":       ["Service", "service"],
+    "Category":      ["Category", "category", "cat"],
+    "Service":       ["Service", "service", "svc"],
     "Business Name": ["Business Name", "business_name", "name", "vendor", "vendor_name", "business"],
     "Contact Name":  ["Contact Name", "contact_name", "contact"],
-    "Phone":         ["Phone", "phone", "phone_number"],
+    "Phone":         ["Phone", "phone", "phone_number", "tel"],
     "Address":       ["Address", "address", "street_address"],
     "URL":           ["URL", "url"],
     "Notes":         ["Notes", "notes", "note"],
@@ -146,7 +147,7 @@ with st.expander("Diagnostics (toggle)", expanded=False):
     with contextlib.suppress(Exception):
         st.write("Tables:", list_tables())
     st.write("Using table:", VENDORS_TABLE)
-    st.write("Has rowid:", HAS_ROWID)
+    st.write("Has rowid (required for precise updates/deletes):", HAS_ROWID)
     st.write("Detected mapping (friendly → actual):", MAPPING)
     if MISSING:
         st.write("Missing (shown blank; skipped on write):", MISSING)
@@ -156,12 +157,15 @@ if not table_exists(VENDORS_TABLE):
     st.stop()
 
 if not HAS_ROWID:
-    st.error('This table is a VIEW or WITHOUT ROWID table — cannot target exact rows for update/delete.\n'
-             'Create a regular table (or add INTEGER PRIMARY KEY id) and migrate the data.')
+    st.error('This table is a VIEW or WITHOUT ROWID — cannot target exact rows for update/delete.\n'
+             'Convert to a normal table or add an INTEGER PRIMARY KEY id.')
     st.stop()
 
 st.subheader("Find / pick a vendor to edit")
-qtext = st.text_input("Search (name / service / phone / address / notes / keywords)", placeholder="Type to filter...").strip()
+qtext = st.text_input(
+    "Search (name / service / phone / address / notes / keywords)",
+    placeholder="Type to filter..."
+).strip()
 
 # -------------------------------
 # Build SELECT / WHERE dynamically
@@ -223,8 +227,11 @@ if df.empty:
     st.info("No vendors match your filter. Clear the search to see all.")
     st.stop()
 
-st.dataframe(df.drop(columns=["key"], errors="ignore"),
-             use_container_width=True, hide_index=True)
+st.dataframe(
+    df.drop(columns=["key"], errors="ignore"),
+    use_container_width=True,
+    hide_index=True
+)
 
 # -------------------------------
 # Selection
@@ -253,6 +260,84 @@ if choice != "New vendor...":
         m = df[df["key"] == key_val]
         if not m.empty:
             selected_row = m.iloc[0]
+
+# -------------------------------
+# Dropdown helpers (Category/Service)
+# -------------------------------
+
+def distinct_options_for(
+    friendly: str,
+    limit: int = 500,
+    filter_by: Optional[Dict[str, str]] = None
+) -> List[str]:
+    """Return sorted distinct non-empty values for a mapped column, optionally filtered by another mapped column."""
+    if friendly not in MAPPING:
+        return []
+    actual = MAPPING[friendly]
+
+    where = ['TRIM("{col}") IS NOT NULL AND TRIM("{col}") <> \'\' '.format(col=actual)]
+    params: List[Any] = []
+
+    # Optional dependency filter (e.g., Service filtered by Category)
+    if filter_by:
+        for fkey, fval in filter_by.items():
+            if fkey in MAPPING and (fval or "").strip():
+                fac = MAPPING[fkey]
+                where.append(f'TRIM("{fac}") = ?')
+                params.append((fval or "").strip())
+
+    sql = f'''
+        SELECT DISTINCT TRIM("{actual}") AS v
+        FROM "{VENDORS_TABLE}"
+        WHERE {' AND '.join(where)}
+        ORDER BY v COLLATE NOCASE ASC
+        LIMIT {int(limit)}
+    '''
+    rows = exec_query(sql, params)
+    opts = [r[0] for r in rows if isinstance(r[0], str) and r[0].strip()]
+    # Ensure uniqueness and deterministic ordering
+    uniq = sorted({o.strip() for o in opts})
+    return uniq
+
+def select_or_text(
+    label: str,
+    friendly: str,
+    current: str = "",
+    filter_by: Optional[Dict[str, str]] = None
+) -> str:
+    """
+    If the column is mapped, show a dropdown with distinct options (+ blank/custom).
+    If '(custom…)' is chosen, show a text_input. Otherwise return the selected option.
+    If not mapped, show a text_input.
+    """
+    current = (current or "").strip()
+    if friendly not in MAPPING:
+        return st.text_input(label, value=current)
+
+    opts = distinct_options_for(friendly, filter_by=filter_by)
+    base_items = ["(blank)"] + opts + ["(custom…)"]
+
+    # Default selection logic
+    if not current:
+        default_item = "(blank)"
+    elif current in opts:
+        default_item = current
+    else:
+        default_item = "(custom…)"
+
+    try:
+        default_index = base_items.index(default_item)
+    except ValueError:
+        default_index = 0
+
+    choice = st.selectbox(label, options=base_items, index=default_index, key=f"{label}_select")
+
+    if choice == "(custom…)":
+        return st.text_input(f"{label} (custom)", value=(current if default_item == "(custom…)" else ""))
+    elif choice == "(blank)":
+        return ""
+    else:
+        return choice
 
 # -------------------------------
 # CRUD helpers (write only mapped cols)
@@ -292,20 +377,22 @@ def delete_vendor(rowid_key: int) -> str:
     return f"Deleted ({n})"
 
 # -------------------------------
-# Forms (Delete fixed: checkbox + submit)
+# Forms (dropdowns + dependent service)
 # -------------------------------
 
 st.markdown("---")
 
 def render_inputs(init: Dict[str, Any]) -> Dict[str, Any]:
-    # Show all friendly fields; unmapped fields display but won't be written.
+    # Category first (so Service can depend on it)
     c1, c2 = st.columns(2)
     with c1:
-        v_category = st.text_input("Category",     value=init.get("Category", ""))
-        v_service  = st.text_input("Service",      value=init.get("Service", ""))
-        v_biz      = st.text_input("Business Name",value=init.get("Business Name", ""))
-        v_contact  = st.text_input("Contact Name", value=init.get("Contact Name", ""))
-        v_phone    = st.text_input("Phone",        value=init.get("Phone", ""))
+        v_category = select_or_text("Category", "Category", init.get("Category", ""))
+        # Service options filtered by chosen Category (when both columns exist)
+        svc_filter = {"Category": v_category} if ("Category" in MAPPING) else None
+        v_service  = select_or_text("Service",  "Service",  init.get("Service", ""), filter_by=svc_filter)
+        v_biz      = st.text_input("Business Name", value=init.get("Business Name", ""))
+        v_contact  = st.text_input("Contact Name",  value=init.get("Contact Name", ""))
+        v_phone    = st.text_input("Phone",         value=init.get("Phone", ""))
     with c2:
         v_address  = st.text_area ("Address",  value=init.get("Address", ""),  height=80)
         v_url      = st.text_input("URL",      value=init.get("URL", ""))
