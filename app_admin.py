@@ -1,4 +1,4 @@
-# app_admin.py — Vendors Admin (single-table; coalesced+normalized reads; strict Category→Service; safe SQL debug)
+# app_admin.py — Vendors Admin (single-table; strict + fallback Service options; coalesced+normalized reads; safe SQL debug)
 # Table: vendors
 # UI fields: Category, Service, Business Name, Contact Name, Phone, Address, URL, Notes, Keywords, Website
 
@@ -50,7 +50,7 @@ def exec_write(sql: str, params: Sequence[Any] = ()) -> int:
         return cur.rowcount
 
 def safe_query(sql: str, params: Sequence[Any] = ()) -> Tuple[List[Tuple], Optional[str]]:
-    """Run a query and surface the REAL sqlite error (unredacted) in the UI."""
+    """Run a query and surface REAL sqlite error + SQL + params in the UI."""
     try:
         return exec_query(sql, params), None
     except Exception as e:
@@ -58,7 +58,7 @@ def safe_query(sql: str, params: Sequence[Any] = ()) -> Tuple[List[Tuple], Optio
         st.code(sql)
         st.write("params:", list(params))
         st.write("driver:", DRIVER)
-        st.exception(e)  # shows exact sqlite3 error
+        st.exception(e)
         return [], f"{type(e).__name__}: {e}"
 
 def safe_write(sql: str, params: Sequence[Any] = ()) -> Tuple[int, Optional[str]]:
@@ -165,7 +165,7 @@ for friendly, canonical in [("Category", "category"), ("Service", "service")]:
 
 def coalesce_expr(primary: str, alts: List[str]) -> str:
     """
-    Build an expression that returns first non-blank among the provided columns.
+    Return first non-blank among the provided columns.
     If only one column exists, DO NOT wrap with COALESCE (SQLite requires >=2 args).
     """
     cols = [primary] + [a for a in alts if a in COLS_SET]
@@ -173,7 +173,7 @@ def coalesce_expr(primary: str, alts: List[str]) -> str:
     if not parts:
         return "''"
     if len(parts) == 1:
-        return parts[0]  # <- key fix: avoid COALESCE(one_arg)
+        return parts[0]
     return "COALESCE(" + ", ".join(parts) + ")"
 
 def norm_sql(expr: str) -> str:
@@ -213,7 +213,7 @@ def norm_py(s: str) -> str:
 # -------------------------------
 
 st.set_page_config(page_title="Vendors - Admin", layout="wide")
-st.title("Vendors - Admin (coalesced & normalized + safe SQL)")
+st.title("Vendors - Admin (strict + fallback service options)")
 
 with st.expander("Diagnostics / Tools (toggle)", expanded=False):
     st.write("Driver:", DRIVER)
@@ -305,7 +305,6 @@ if qtext:
             params.append(like)
     sql += "\n  AND (" + "\n       OR ".join(where_bits) + ")"
 
-# Order by business name if available
 order_by = f'v."{MAPPING["Business Name"]}" COLLATE NOCASE' if "Business Name" in MAPPING else "key"
 sql += f"\nORDER BY {order_by} ASC\nLIMIT 500"
 
@@ -324,7 +323,7 @@ st.dataframe(df.drop(columns=["key"], errors="ignore"),
              use_container_width=True, hide_index=True)
 
 # -------------------------------
-# Distinct options with normalized compare (safe)
+# Distinct options with normalized compare (strict) + fallback
 # -------------------------------
 
 def distinct_options_category(limit: int = 500) -> List[str]:
@@ -350,7 +349,7 @@ def distinct_options_category(limit: int = 500) -> List[str]:
         opts.append(raw.strip())
     return opts
 
-def distinct_options_service_for(category_value: str, limit: int = 500) -> List[str]:
+def distinct_options_service_for_strict(category_value: str, limit: int = 500) -> List[str]:
     norm_param = norm_py(category_value)
     sql = f'''
         SELECT raw, norm FROM (
@@ -377,6 +376,42 @@ def distinct_options_service_for(category_value: str, limit: int = 500) -> List[
         opts.append(raw.strip())
     return opts
 
+def distinct_options_service_fallback(category_value: str, limit: int = 500) -> List[str]:
+    """If strict returns nothing, try exact-trim and then LIKE (case-insensitive)."""
+    val = (category_value or "").strip()
+    if not val:
+        return []
+    # Exact TRIM equality on coalesced Category
+    sql1 = f'''
+        SELECT DISTINCT TRIM({SRV_READ_EXPR}) AS v
+        FROM "{VENDORS_TABLE}"
+        WHERE {CAT_READ_EXPR} IS NOT NULL
+          AND TRIM({CAT_READ_EXPR}) = TRIM(?)
+          AND {SRV_READ_EXPR} IS NOT NULL
+          AND TRIM({SRV_READ_EXPR}) <> ''
+        ORDER BY v COLLATE NOCASE ASC
+        LIMIT {int(limit)}
+    '''
+    rows1, _ = safe_query(sql1, (val,))
+    opts1 = [r[0] for r in rows1 if isinstance(r[0], str) and r[0].strip()]
+
+    if opts1:
+        return opts1
+
+    # LIKE (case-insensitive) on Category as a last resort
+    sql2 = f'''
+        SELECT DISTINCT TRIM({SRV_READ_EXPR}) AS v
+        FROM "{VENDORS_TABLE}"
+        WHERE {CAT_READ_EXPR} IS NOT NULL
+          AND UPPER(TRIM({CAT_READ_EXPR})) LIKE UPPER(?)
+          AND {SRV_READ_EXPR} IS NOT NULL
+          AND TRIM({SRV_READ_EXPR}) <> ''
+        ORDER BY v COLLATE NOCASE ASC
+        LIMIT {int(limit)}
+    '''
+    rows2, _ = safe_query(sql2, (f"%{val}%",))
+    return [r[0] for r in rows2 if isinstance(r[0], str) and r[0].strip()]
+
 def select_or_text_category(current: str = "") -> str:
     opts = distinct_options_category()
     base = ["(blank)"] + opts + ["(custom…)"]
@@ -396,10 +431,14 @@ def select_or_text_category(current: str = "") -> str:
 
 def select_or_text_service(current: str, category_value: str) -> str:
     cur = (current or "").strip()
-    if not category_value or category_value in ("(blank)", "(custom…)"):
-        opts = []  # strict: nothing until a real category chosen/typed
-    else:
-        opts = distinct_options_service_for(category_value)
+    opts = []
+    if category_value and category_value not in ("(blank)", "(custom…)"):
+        # Strict first
+        opts = distinct_options_service_for_strict(category_value)
+        # Fallbacks only if strict found nothing
+        if not opts:
+            opts = distinct_options_service_fallback(category_value)
+
     base = ["(blank)"] + opts + ["(custom…)"]
     default = "(blank)" if not cur else (cur if cur in opts else "(custom…)")
     try:
@@ -415,7 +454,7 @@ def select_or_text_service(current: str, category_value: str) -> str:
         return choice
 
 # -------------------------------
-# Selection label
+# Selection label helpers
 # -------------------------------
 
 def make_label(row: pd.Series) -> str:
@@ -426,6 +465,10 @@ def make_label(row: pd.Series) -> str:
     bits = [b for b in [name, svc, ph, adr] if b]
     core = " — ".join(bits) if bits else "(unnamed vendor)"
     return f"{core}  [#{row['key']}]"
+
+# -------------------------------
+# Dataframe + picker
+# -------------------------------
 
 labels = ["New vendor..."] + [make_label(r) for _, r in df.iterrows()]
 choice = st.selectbox("Pick vendor", options=labels, index=0 if labels else 0)
@@ -495,7 +538,7 @@ def delete_vendor(key: Any) -> str:
     return f"Deleted ({n})" if not e else "Delete error (see above)"
 
 # -------------------------------
-# Forms (STRICT Category→Service)
+# Forms (STRICT first, fallback if empty)
 # -------------------------------
 
 st.markdown("---")
