@@ -1,26 +1,16 @@
-# app_admin.py — Vendors Admin (single-table; strict Category→Service filtering)
-# Works with ONE table: vendors
-#   Logical fields (any physical names; app auto-maps):
-#     Category, Service, Business Name, Contact Name, Phone, Address, URL, Notes, Keywords, Website
-#
-# Keying:
-#   - Prefer "id" if present
-#   - Else use single-column PRIMARY KEY if table has one
-#   - Else fall back to rowid (only if table is NOT WITHOUT ROWID)
-#
-# Strict filtering:
-#   - Service dropdown is LIMITED to services that exist with the chosen Category
-#   - If no Category selected (or Category column unmapped), Service list shows only (blank) and (custom…)
+# app_admin.py — Vendors Admin (single-table; robust mapping; strict Category→Service filtering)
+# One table: vendors
+# Logical fields the UI expects (physical names can vary; auto-mapped by data density):
+#   Category, Service, Business Name, Contact Name, Phone, Address, URL, Notes, Keywords, Website
 
 import os
-import contextlib
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import pandas as pd
 import streamlit as st
 
 # -------------------------------
-# Connect (Turso/libSQL or SQLite)
+# DB connect (libSQL → fallback SQLite)
 # -------------------------------
 
 def _connect():
@@ -34,8 +24,8 @@ def _connect():
         except Exception as e:
             st.warning(f"libsql unavailable ({e}); falling back to SQLite.")
     import sqlite3
-    db_path = os.environ.get("SQLITE_PATH", "vendors.db")
-    conn = sqlite3.connect(db_path, check_same_thread=False)
+    path = os.environ.get("SQLITE_PATH", "vendors.db")
+    conn = sqlite3.connect(path, check_same_thread=False)
     conn.row_factory = sqlite3.Row
     return conn, "sqlite"
 
@@ -59,6 +49,12 @@ def exec_write(sql: str, params: Sequence[Any] = ()) -> int:
         CONN.commit()
         return cur.rowcount
 
+# -------------------------------
+# Schema helpers
+# -------------------------------
+
+VENDORS_TABLE = "vendors"
+
 def table_exists(name: str) -> bool:
     rows = exec_query("SELECT 1 FROM sqlite_schema WHERE type='table' AND name=? LIMIT 1", (name,))
     return bool(rows)
@@ -71,8 +67,7 @@ def has_without_rowid(table: str) -> bool:
     rows = exec_query("SELECT sql FROM sqlite_schema WHERE type='table' AND name=? LIMIT 1", (table,))
     if not rows:
         return False
-    sql = (rows[0][0] or "").upper()
-    return "WITHOUT ROWID" in sql
+    return "WITHOUT ROWID" in (rows[0][0] or "").upper()
 
 def detect_key_col(table: str) -> Optional[str]:
     cols = get_table_columns(table)
@@ -85,16 +80,15 @@ def detect_key_col(table: str) -> Optional[str]:
     return None
 
 # -------------------------------
-# App config / schema mapping
+# Mapping config (candidates) — include common variants
 # -------------------------------
 
-VENDORS_TABLE = "vendors"
 EXPECTED = [
     "Category", "Service", "Business Name", "Contact Name", "Phone",
     "Address", "URL", "Notes", "Keywords", "Website",
 ]
 
-# Put the MOST likely actual column names FIRST so mapping prefers them.
+# Order here is only a hint; robust resolver will choose the candidate with the most non-empty rows.
 CANDIDATES: Dict[str, List[str]] = {
     "Category":      ["category", "Category", "cat"],
     "Service":       ["service", "Service", "svc"],
@@ -109,16 +103,33 @@ CANDIDATES: Dict[str, List[str]] = {
 }
 
 def resolve_mapping(table: str) -> Dict[str, str]:
+    """
+    Data-aware resolver:
+      For each friendly field, consider all candidate columns that exist.
+      Choose the one with the most non-empty values (TRIM(col)<>''), so we map to where the data actually is.
+      Falls back to the first present candidate if counts tie or all are empty.
+    """
     if not table_exists(table):
         return {}
-    actual = get_table_columns(table)
-    by_lower = {c.lower(): c for c in actual}
+    actual = set(get_table_columns(table))
     mapping: Dict[str, str] = {}
     for friendly, options in CANDIDATES.items():
-        for opt in options:
-            if opt.lower() in by_lower:
-                mapping[friendly] = by_lower[opt.lower()]
-                break
+        present = [opt for opt in options if opt in actual]
+        if not present:
+            continue
+        best_col = present[0]
+        best_cnt = -1
+        for col in present:
+            try:
+                cnt = exec_query(
+                    f'SELECT COUNT(*) FROM "{table}" WHERE "{col}" IS NOT NULL AND TRIM("{col}") <> \'\''
+                )[0][0]
+            except Exception:
+                cnt = -1
+            if cnt is not None and int(cnt) > best_cnt:
+                best_cnt = int(cnt)
+                best_col = col
+        mapping[friendly] = best_col
     return mapping
 
 MAPPING = resolve_mapping(VENDORS_TABLE)
@@ -130,37 +141,37 @@ WITHOUT_ROWID = has_without_rowid(VENDORS_TABLE)
 # -------------------------------
 
 st.set_page_config(page_title="Vendors - Admin", layout="wide")
-st.title("Vendors - Admin (single-table, strict service filtering)")
+st.title("Vendors - Admin (single-table, robust mapping)")
 
 with st.expander("Diagnostics (toggle)", expanded=False):
     st.write("Driver:", DRIVER)
     st.write("Using table:", VENDORS_TABLE)
     st.write("Mapping (friendly → actual):", MAPPING)
-    st.write("Detected key column:", KEY_COL or "(none; will try rowid)")
+    st.write("Detected key column:", KEY_COL or "(none; using rowid if possible)")
     st.write("Table WITHOUT ROWID:", WITHOUT_ROWID)
     if not MAPPING.get("Category"):
-        st.warning("Category column not mapped — Service list will remain empty (by design).")
+        st.warning("Category not mapped — Service list will remain empty (by design).")
     if not MAPPING.get("Service"):
-        st.warning("Service column not mapped — Service list cannot populate.")
+        st.warning("Service not mapped — Service list cannot populate.")
 
 if not table_exists(VENDORS_TABLE):
     st.error(f'Table "{VENDORS_TABLE}" not found.')
     st.stop()
 
 if not KEY_COL and WITHOUT_ROWID:
-    st.error("vendors is WITHOUT ROWID and lacks a single-column PRIMARY KEY. Add an 'id INTEGER PRIMARY KEY'.")
+    st.error("vendors is WITHOUT ROWID and has no single-column PRIMARY KEY. Add 'id INTEGER PRIMARY KEY' or a single PK.")
     st.stop()
 
 # -------------------------------
-# Query + grid
+# Search & grid
 # -------------------------------
 
-# Build SELECT: key + all friendly columns (aliasing actual names)
-select_parts = []
+# SELECT list: key + all mapped columns (alias to friendly names)
+select_parts: List[str] = []
 if KEY_COL:
     select_parts.append(f'v."{KEY_COL}" AS key')
 else:
-    select_parts.append('rowid AS key')
+    select_parts.append("rowid AS key")
 
 for friendly in EXPECTED:
     if friendly in MAPPING:
@@ -181,7 +192,7 @@ sql = f' SELECT {select_sql} FROM "{VENDORS_TABLE}" v WHERE 1=1 '
 params: List[Any] = []
 if qtext:
     like = f"%{qtext}%"
-    where_bits = []
+    where_bits: List[str] = []
     for friendly in ["Business Name","Service","Contact Name","Category","Phone","Address","URL","Website","Notes","Keywords"]:
         if friendly in MAPPING:
             where_bits.append(f'COALESCE(v."{MAPPING[friendly]}", \'\') LIKE ?')
@@ -204,7 +215,7 @@ st.dataframe(df.drop(columns=["key"], errors="ignore"),
              use_container_width=True, hide_index=True)
 
 # -------------------------------
-# STRICT options helpers
+# Strict options (Category→Service)
 # -------------------------------
 
 def distinct_options_for(
@@ -213,15 +224,13 @@ def distinct_options_for(
     filter_by: Optional[Dict[str, str]] = None,
 ) -> List[str]:
     """
-    Returns DISTINCT non-empty options for `friendly` column.
-    STRICT behavior:
-      * If a filter was requested but is not usable (unmapped/blank/custom), return [].
-      * Compare filters case-insensitively with TRIM.
+    DISTINCT non-empty options for `friendly`.
+    STRICT: if a filter was requested but not usable (unmapped/blank/custom), return [].
+    Case-insensitive, trimmed equality on filters.
     """
     if friendly not in MAPPING:
         return []
     actual = MAPPING[friendly]
-
     where_clauses = [f'TRIM("{actual}") <> \'\'']
     qparams: List[Any] = []
 
@@ -232,13 +241,11 @@ def distinct_options_for(
                 val = (fval or "").strip()
                 if val and val not in ("(blank)", "(custom…)", "(add new…)"):
                     fac = MAPPING[fkey]
-                    # Case-insensitive, trimmed equality on the filter
                     where_clauses.append(f'UPPER(TRIM("{fac}")) = UPPER(?)')
                     qparams.append(val)
                     had_filter = True
 
     if filter_by and not had_filter:
-        # A filter was requested but we couldn't apply any -> no options
         return []
 
     sql = f'''
@@ -255,12 +262,12 @@ def select_or_text(
     label: str,
     friendly: str,
     current: str = "",
-    filter_by: Optional[Dict[str, str]] = None
+    filter_by: Optional[Dict[str, str]] = None,
 ) -> str:
     """
     Dropdown with distinct options plus (blank)/(custom…).
-    If "(custom…)" picked, show a text input.
-    If the friendly field isn't mapped, show a plain text input.
+    If "(custom…)" picked, shows a text_input.
+    If field isn't mapped, falls back to text_input.
     """
     current = (current or "").strip()
     if friendly not in MAPPING:
@@ -361,18 +368,17 @@ def delete_vendor(key: Any) -> str:
     return f"Deleted ({n})"
 
 # -------------------------------
-# Forms (STRICT Service filtering)
+# Forms (STRICT Category→Service)
 # -------------------------------
 
 st.markdown("---")
 
 def render_inputs(init: Dict[str, Any]) -> Dict[str, Any]:
-    # Category first, so Service can depend on it
     c1, c2 = st.columns(2)
     with c1:
         v_category = select_or_text("Category", "Category", init.get("Category", ""))
-        # STRICT: ALWAYS pass Category as a filter. Helper returns [] if filter unusable.
-        v_service  = select_or_text("Service", "Service", init.get("Service", ""), filter_by={"Category": v_category})
+        # STRICT: always pass selected Category as the filter for Service
+        v_service  = select_or_text("Service",  "Service",  init.get("Service", ""), filter_by={"Category": v_category})
         v_biz      = st.text_input("Business Name", value=init.get("Business Name", ""))
         v_contact  = st.text_input("Contact Name",  value=init.get("Contact Name", ""))
         v_phone    = st.text_input("Phone",         value=init.get("Phone", ""))
@@ -402,7 +408,7 @@ if selected_row is None:
         submitted = st.form_submit_button("Add Vendor")
         if submitted:
             if "Business Name" in MAPPING and not (vals.get("Business Name") or "").strip():
-                st.error('Business Name is required (it maps to a DB column).')
+                st.error("Business Name is required.")
             else:
                 msg = insert_vendor(vals)
                 st.success(msg)
@@ -419,7 +425,7 @@ else:
         do_delete = c2.form_submit_button("Delete")
         if do_update:
             if "Business Name" in MAPPING and not (vals.get("Business Name") or "").strip():
-                st.error('Business Name is required (it maps to a DB column).')
+                st.error("Business Name is required.")
             else:
                 msg = update_vendor(key_val, vals)
                 st.success(msg)
