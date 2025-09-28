@@ -103,8 +103,11 @@ with st.expander("DEBUG (remove after)", expanded=True):
         st.write("Write test FAILED (likely read-only token):")
         st.exception(e)
     try:
-        names = [r[0] for r in conn.execute(
-            "SELECT name FROM sqlite_master WHERE type='table' ORDER BY 1")]
+       # listing tables (driver-safe)
+cur = conn.execute("select name from sqlite_schema where type='table' order by 1")
+rows_ = cur.fetchall()
+names = [r[0] for r in rows_]
+
         st.write("Tables:", names)
     except Exception as e:
         st.write("Listing tables failed:")
