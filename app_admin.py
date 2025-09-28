@@ -82,7 +82,11 @@ def column_exists(conn: sqlite3.Connection, table: str, col: str) -> bool:
 # ----------------------------- Schema / Migrations --------------------------
 
 def ensure_normalized_schema(conn: sqlite3.Connection) -> None:
-    """Create normalized tables if missing. Non-destructive (idempotent)."""
+    """Create normalized tables if missing. Non-destructive (idempotent).
+    Be *careful* if a legacy flat `vendors` table exists: skip creating
+    normalized indexes that reference non-existent columns.
+    """
+    # Always ensure taxonomy tables exist (safe)
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS categories (
@@ -104,29 +108,42 @@ def ensure_normalized_schema(conn: sqlite3.Connection) -> None:
         )
         """
     )
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS vendors (
-            id            INTEGER PRIMARY KEY,
-            category_id   INTEGER NOT NULL,
-            service_id    INTEGER NOT NULL,
-            business_name TEXT NOT NULL,
-            contact_name  TEXT,
-            phone         TEXT,
-            address       TEXT,
-            notes         TEXT,
-            website       TEXT,
-            is_active     INTEGER DEFAULT 1,
-            created_at    TEXT DEFAULT CURRENT_TIMESTAMP,
-            updated_at    TEXT,
-            FOREIGN KEY(category_id) REFERENCES categories(id),
-            FOREIGN KEY(service_id)  REFERENCES services(id)
+
+    # If a vendors table already exists but is *legacy* (no category_id/service_id),
+    # do NOT try to create normalized indexes that would fail.
+    vendors_exists = table_exists(conn, "vendors")
+    has_cat_id = column_exists(conn, "vendors", "category_id") if vendors_exists else False
+    has_svc_id = column_exists(conn, "vendors", "service_id") if vendors_exists else False
+
+    if not vendors_exists:
+        # Create normalized vendors table fresh
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS vendors (
+                id            INTEGER PRIMARY KEY,
+                category_id   INTEGER NOT NULL,
+                service_id    INTEGER NOT NULL,
+                business_name TEXT NOT NULL,
+                contact_name  TEXT,
+                phone         TEXT,
+                address       TEXT,
+                notes         TEXT,
+                website       TEXT,
+                is_active     INTEGER DEFAULT 1,
+                created_at    TEXT DEFAULT CURRENT_TIMESTAMP,
+                updated_at    TEXT,
+                FOREIGN KEY(category_id) REFERENCES categories(id),
+                FOREIGN KEY(service_id)  REFERENCES services(id)
+            )
+            """
         )
-        """
-    )
-    # helpful indexes
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_vendors_cat_svc ON vendors(category_id, service_id)")
+        has_cat_id = has_svc_id = True
+
+    # Create helpful indexes ONLY if normalized columns are present
+    if has_cat_id and has_svc_id:
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_vendors_cat_svc ON vendors(category_id, service_id)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_services_cat ON services(category_id)")
+
     conn.commit()
 
 
