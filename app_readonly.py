@@ -247,7 +247,7 @@ else:
     desired_order = [
         "Business Name",  "Phone",
         "Address", "Website",  # Website directly after Address
-        "Notes", "Category",
+        "Notes", "Contact Name",   # <- now just before Category "Category",
         # Service/Keywords intentionally left out
     ]
     cols = [c for c in desired_order if c in clipped.columns]
