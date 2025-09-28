@@ -236,9 +236,9 @@ def load_vendors_df(q: str = "", use_fts: bool = False,
 # We clip text to this character count and add an ellipsis when needed.
 CHAR_WIDTHS: Dict[str, int] = {
     "Business Name": 36,
-    "Category": 30,
-    "Service": 30,
-    "Phone": 24,
+    "Category": 36,
+    "Service": 36,
+    "Phone": 30,
     "Address": 40,
     "Notes": 36,
     "Keywords": 10,
