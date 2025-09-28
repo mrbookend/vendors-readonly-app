@@ -1,6 +1,6 @@
 # app.py  (or app_readonly.py)
-# Vendors Read-only — wide layout, collapsed sidebar, fixed character widths per column,
-# and Website hyperlink column immediately after Address.
+# Vendors Read-only — wide layout, collapsed sidebar, fixed character widths,
+# Website hyperlink immediately after Address, and NO Service/Keywords columns in the UI.
 
 from __future__ import annotations
 
@@ -114,19 +114,6 @@ def get_categories() -> List[str]:
         return df["name"].tolist()
     return []
 
-def get_services() -> List[str]:
-    if SCHEMA["has_services_table"]:
-        df = run_df("SELECT name FROM services ORDER BY name;")
-        if not df.empty:
-            return df["name"].tolist()
-    if SCHEMA["uses_svc_text"]:
-        df = run_df(
-            "SELECT DISTINCT TRIM(service) AS name FROM vendors "
-            "WHERE TRIM(service) <> '' ORDER BY 1;"
-        )
-        return df["name"].tolist()
-    return []
-
 # ---------- SEARCH ----------
 def _fts_query_string(q: str) -> str:
     toks = re.findall(r"[A-Za-z0-9]+", q or "")
@@ -135,7 +122,7 @@ def _fts_query_string(q: str) -> str:
     return " AND ".join(f"{t}*" for t in toks)
 
 def load_vendors_df(q: str = "", use_fts: bool = False,
-                    category_filter: str = "", service_filter: str = "") -> pd.DataFrame:
+                    category_filter: str = "") -> pd.DataFrame:
     # Category expr/join
     if SCHEMA["uses_cat_id"]:
         cat_expr = "c.name AS Category"
@@ -147,32 +134,18 @@ def load_vendors_df(q: str = "", use_fts: bool = False,
     else:
         cat_expr, cat_join, cat_filter_expr = "NULL AS Category", "", None
 
-    # Service expr/join
-    if SCHEMA["uses_svc_id"]:
-        svc_expr = "s.name AS Service"
-        svc_join = "LEFT JOIN services s ON s.id = v.service_id"
-        svc_filter_expr = "s.name = :svc"
-    elif SCHEMA["uses_svc_text"]:
-        svc_expr, svc_join = "v.service AS Service", ""
-        svc_filter_expr = "v.service = :svc"
-    else:
-        svc_expr, svc_join, svc_filter_expr = "NULL AS Service", "", None
-
     base_select = f"""
         SELECT
           v.id AS id,
           {cat_expr},
-          {svc_expr},
           v.business_name AS "Business Name",
           v.contact_name  AS "Contact Name",
           v.phone         AS Phone,
           v.address       AS Address,
           v.notes         AS Notes,
-          v.website       AS Website,
-          {'v.keywords AS Keywords' if SCHEMA['has_keywords_col'] else 'NULL AS Keywords'}
+          v.website       AS Website
         FROM vendors v
         {cat_join}
-        {svc_join}
     """
 
     params: Dict[str, object] = {}
@@ -180,8 +153,6 @@ def load_vendors_df(q: str = "", use_fts: bool = False,
 
     if category_filter and cat_filter_expr:
         wheres.append(cat_filter_expr); params["cat"] = category_filter
-    if service_filter and svc_filter_expr:
-        wheres.append(svc_filter_expr); params["svc"] = service_filter
 
     if q:
         if use_fts and SCHEMA["has_fts"]:
@@ -198,12 +169,8 @@ def load_vendors_df(q: str = "", use_fts: bool = False,
                 "v.address LIKE :like",
                 "v.phone LIKE :like",
             ]
-            if SCHEMA["has_keywords_col"]:
-                lconds.append("v.keywords LIKE :like")
             if SCHEMA["uses_cat_text"]:
                 lconds.append("v.category LIKE :like")
-            if SCHEMA["uses_svc_text"]:
-                lconds.append("v.service LIKE :like")
             wheres.append("(" + " OR ".join(lconds) + ")")
             params["like"] = like
 
@@ -232,17 +199,15 @@ def load_vendors_df(q: str = "", use_fts: bool = False,
     return df
 
 # ---------- CONFIGURABLE DISPLAY WIDTHS (characters) ----------
-# Edit these numbers to control how many characters are shown per column.
-# We clip text to this character count and add an ellipsis when needed.
+# Edit these numbers; we clip text to this length and add an ellipsis when needed.
 CHAR_WIDTHS: Dict[str, int] = {
     "Business Name": 36,
     "Category": 36,
-    "Service": 36,
     "Phone": 30,
     "Address": 40,
     "Notes": 36,
-    "Keywords": 10,
-    # Note: "Website" is a hyperlink column; character clipping is not applied to it.
+    # NOTE: Service and Keywords are intentionally omitted (not shown).
+    # Website is a hyperlink; we don't clip its display text here.
 }
 
 def _clip(s: Optional[str], n: int) -> str:
@@ -258,36 +223,32 @@ def _clip(s: Optional[str], n: int) -> str:
 # ---------- UI ----------
 st.title("Vendors")
 
-# Top row: search + filters + FTS toggle
-col_q, col_cat, col_svc, col_fts = st.columns([4, 3, 3, 2])
-q = col_q.text_input("Search", value="", placeholder="Search name, notes, address, keywords…").strip()
+# Top row: search + Category filter + FTS toggle (no Service filter)
+col_q, col_cat, col_fts = st.columns([5, 3, 2])
+q = col_q.text_input("Search", value="", placeholder="Search name, notes, address…").strip()
 cats = get_categories()
-svcs = get_services()
 category_filter = col_cat.selectbox("Category", options=["(All)"] + cats, index=0)
 category_filter = "" if category_filter == "(All)" else category_filter
-service_filter = col_svc.selectbox("Service", options=["(All)"] + svcs, index=0)
-service_filter = "" if service_filter == "(All)" else service_filter
 use_fts = col_fts.checkbox("Use FTS", value=False)
 
 # Data
-df = load_vendors_df(q=q, use_fts=use_fts,
-                     category_filter=category_filter, service_filter=service_filter)
+df = load_vendors_df(q=q, use_fts=use_fts, category_filter=category_filter)
 
 if df.empty:
     st.info("No vendors found.")
 else:
-    # Apply character clipping to text columns that exist (not applied to hyperlink column)
+    # Apply character clipping to configured columns (others pass through)
     clipped = df.copy()
     for col, n in CHAR_WIDTHS.items():
         if col in clipped.columns:
             clipped[col] = clipped[col].map(lambda x: _clip(x, n))
 
-    # Column order: put Website immediately AFTER Address
-    # Only include columns that exist; always drop internal id.
+    # Column order: Website immediately AFTER Address
     desired_order = [
-        "Business Name", "Category", "Service", "Phone",
+        "Business Name", "Category", "Phone",
         "Address", "Website",  # Website directly after Address
-        "Notes", "Keywords",
+        "Notes",
+        # Service/Keywords intentionally left out
     ]
     cols = [c for c in desired_order if c in clipped.columns]
     others = [c for c in clipped.columns if c not in cols and c != "id"]
@@ -296,15 +257,12 @@ else:
     # Render with Website as a clickable link column
     col_cfg: Dict[str, st.column_config.Column] = {
         "Business Name": st.column_config.TextColumn("Business Name", width="medium"),
-        "Category":      st.column_config.TextColumn("Category",      width="small"),
-        "Service":       st.column_config.TextColumn("Service",       width="small"),
-        "Phone":         st.column_config.TextColumn("Phone",         width="small"),
-        "Address":       st.column_config.TextColumn("Address",       width="medium"),
+        "Category":      st.column_config.TextColumn("Category",      width="medium"),
+        "Phone":         st.column_config.TextColumn("Phone",         width="medium"),
+        "Address":       st.column_config.TextColumn("Address",       width="large"),
         "Notes":         st.column_config.TextColumn("Notes",         width="medium"),
-        "Keywords":      st.column_config.TextColumn("Keywords",      width="small"),
     }
     if "Website" in show.columns:
-        # Note: LinkColumn's display_text is global, not per-row; we leave the URL visible or use a fixed label.
         col_cfg["Website"] = st.column_config.LinkColumn("Website", help="Open in new tab", width="medium")
 
     st.dataframe(
