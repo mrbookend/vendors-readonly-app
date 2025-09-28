@@ -173,7 +173,17 @@ with st.expander("Find / pick a vendor to edit", expanded=True):
     )
 
     df = pd.DataFrame(rows, columns=["id", "Business", "Category", "Phone", "Address", "Website", "Active"])
-    st.dataframe(df.drop(columns=["id"]), use_container_width=True, hide_index=True)
+    # Stop early if no rows after filtering
+if df is None or df.empty:
+    st.info("No vendors match your filter. Clear the search to see all.")
+    st.stop()
+
+# Hide key columns only in the display copy; keep df intact for edits/deletes
+_cols_to_hide = [c for c in ("id", "vendor_id") if c in df.columns]
+display_df = df.drop(columns=_cols_to_hide, errors="ignore") if _cols_to_hide else df
+
+st.dataframe(display_df, use_container_width=True, hide_index=True)
+
 
     options = ["New vendor..."] + [f"{r[1]} - {r[2]}" for r in rows]
     pick_ix = st.selectbox("Select to edit", range(len(options)), index=0, format_func=lambda i: options[i])
