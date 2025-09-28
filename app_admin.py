@@ -577,40 +577,60 @@ def page_edit(conn: sqlite3.Connection):
         st.info("No vendors to edit.")
         return
 
-    # Pick vendor by ID + label
-    df["Label"] = df.apply(lambda r: f"#{r['ID']} — {r.get('Business Name','')} ({r.get('Category','')} → {r.get('Service','')})", axis=1)
-    choices = df[["ID","Label"]].values.tolist()
-    id_to_label = {int(i): lbl for i,lbl in choices}
+    # Build label map
+    df["Label"] = df.apply(
+        lambda r: f"#{r['ID']} — {r.get('Business Name','')} ({r.get('Category','')} → {r.get('Service','')})",
+        axis=1,
+    )
+    id_to_label = {int(r.ID): r.Label for _, r in df[["ID", "Label"]].iterrows()}
+
     chosen_id = st.selectbox(
         "Select Vendor",
         options=sorted(id_to_label.keys()),
         format_func=lambda i: id_to_label[i],
         key="edit_vendor_select",
-    )), format_func=lambda i: id_to_label[i])
+    )
 
     row = df.loc[df["ID"] == chosen_id].iloc[0]
 
     ensure_normalized_schema(conn)
     # category/service pickers prefilled
-    cat_id, cat_name = select_category(conn, "Category", key=f"edit_cat_{chosen_id}", default=str(row.get("Category","")))
-    svc_id, svc_name = select_service(conn, cat_id, "Service", key=f"edit_svc_{chosen_id}", default=str(row.get("Service","")))
+    cat_id, cat_name = select_category(
+        conn, "Category", key=f"edit_cat_{chosen_id}", default=str(row.get("Category", ""))
+    )
+    svc_id, svc_name = select_service(
+        conn, cat_id, "Service", key=f"edit_svc_{chosen_id}", default=str(row.get("Service", ""))
+    )
 
     with st.form(f"edit_vendor_form_{chosen_id}"):
-        business = st.text_input("Business Name", value=str(row.get("Business Name","")), max_chars=200)
-        contact  = st.text_input("Contact Name", value=str(row.get("Contact Name","")))
-        phone    = st.text_input("Phone", value=str(row.get("Phone","")))
-        address  = st.text_area("Address", value=str(row.get("Address","")), height=80)
-        website  = st.text_input("Website", value=str(row.get("Website","")))
-        notes    = st.text_area("Notes", value=str(row.get("Notes","")), height=120)
-        active   = st.checkbox("Active", value=bool(int(row.get("Active",1))) if "Active" in row else True)
+        business = st.text_input("Business Name", value=str(row.get("Business Name", "")), max_chars=200)
+        contact  = st.text_input("Contact Name",  value=str(row.get("Contact Name", "")))
+        phone    = st.text_input("Phone",         value=str(row.get("Phone", "")))
+        address  = st.text_area("Address",        value=str(row.get("Address", "")), height=80)
+        website  = st.text_input("Website",       value=str(row.get("Website", "")))
+        notes    = st.text_area("Notes",          value=str(row.get("Notes", "")), height=120)
+        active   = st.checkbox("Active", value=bool(int(row.get("Active", 1))) if "Active" in row else True)
         submitted = st.form_submit_button("Save Changes")
 
     if submitted:
         if not business.strip():
             st.error("Business Name is required.")
             return
-        update_vendor(conn, int(chosen_id), cat_name, svc_name, business.strip(), contact.strip(), phone.strip(), address.strip(), notes.strip(), website.strip(), 1 if active else 0)
+        update_vendor(
+            conn,
+            int(chosen_id),
+            cat_name,
+            svc_name,
+            business.strip(),
+            contact.strip(),
+            phone.strip(),
+            address.strip(),
+            notes.strip(),
+            website.strip(),
+            1 if active else 0,
+        )
         st.success(f"Updated vendor #{chosen_id}")
+
 
 
 def page_delete(conn: sqlite3.Connection):
@@ -620,14 +640,18 @@ def page_delete(conn: sqlite3.Connection):
         st.info("No vendors to delete.")
         return
 
-    df["Label"] = df.apply(lambda r: f"#{r['ID']} — {r.get('Business Name','')} ({r.get('Category','')} → {r.get('Service','')})", axis=1)
-    id_to_label = {int(r.ID): r.Label for _, r in df[['ID','Label']].iterrows()}
+    df["Label"] = df.apply(
+        lambda r: f"#{r['ID']} — {r.get('Business Name','')} ({r.get('Category','')} → {r.get('Service','')})",
+        axis=1,
+    )
+    id_to_label = {int(r.ID): r.Label for _, r in df[["ID", "Label"]].iterrows()}
+
     chosen_id = st.selectbox(
         "Select Vendor",
         options=sorted(id_to_label.keys()),
         format_func=lambda i: id_to_label[i],
         key="delete_vendor_select",
-    )), format_func=lambda i: id_to_label[i])
+    )
 
     col1, col2 = st.columns(2)
     with col1:
@@ -638,6 +662,7 @@ def page_delete(conn: sqlite3.Connection):
         if st.button("Hard Delete (remove row)", type="secondary"):
             hard_delete_vendor(conn, int(chosen_id))
             st.warning(f"Vendor #{chosen_id} permanently deleted")
+
 
 
 def page_manage_taxonomy(conn: sqlite3.Connection):
