@@ -1,23 +1,15 @@
-# app_admin.py — Vendors Admin (normalized, strict category→service filtering)
-# Requirements (SQLite or Turso/libSQL):
-# - Table categories(id INTEGER PK, name TEXT UNIQUE NOT NULL)
-# - Table services(id INTEGER PK, category_id INTEGER NOT NULL, name TEXT NOT NULL, UNIQUE(category_id,name))
-# - Table vendors(
-#       id INTEGER PRIMARY KEY,
-#       category_id INTEGER, service_id INTEGER,
-#       business_name TEXT, contact_name TEXT, phone TEXT, address TEXT,
-#       url TEXT, website TEXT, notes TEXT, keywords TEXT
-#   )
-#   (foreign keys recommended but not required for this app to run)
+# app_admin.py — Vendors Admin (single-table; strict Category→Service filtering)
+# Works with ONE table: vendors
+#   Expected logical fields (any physical names; app auto-maps):
+#     Category, Service, Business Name, Contact Name, Phone, Address, URL, Notes, Keywords, Website
+# Keying:
+#   - Prefer "id" if present
+#   - Else use single-column PRIMARY KEY if table has one
+#   - Else fall back to rowid (normal tables only)
 #
-# What this does:
-# - Lists vendors with Category/Service names
-# - Search across category, service, and vendor text fields
-# - Add / Update / Delete vendors
-# - Category dropdown drives Service dropdown (STRICT: only services for selected category)
-# - "(add new…)" flow for both, created just-in-time on save
-#
-# If your vendors table uses different column names, add them to VENDOR_FIELDS below.
+# Strict filtering:
+#   - Service dropdown is LIMITED to services that exist with the chosen Category
+#   - If no Category selected (or Category column unmapped), Service list is empty (only blank/custom)
 
 import os
 import contextlib
@@ -27,7 +19,7 @@ import pandas as pd
 import streamlit as st
 
 # -------------------------------
-# Connection (libSQL -> fallback SQLite)
+# Connect (Turso/libSQL or SQLite)
 # -------------------------------
 
 def _connect():
@@ -74,410 +66,356 @@ def get_table_columns(table: str) -> List[str]:
     rows = exec_query(f"PRAGMA table_info('{table}')")
     return [r[1] for r in rows]  # (cid, name, type, notnull, dflt, pk)
 
+def has_without_rowid(table: str) -> bool:
+    rows = exec_query("SELECT sql FROM sqlite_schema WHERE type='table' AND name=? LIMIT 1", (table,))
+    if not rows:
+        return False
+    sql = (rows[0][0] or "").upper()
+    return "WITHOUT ROWID" in sql
+
+def detect_key_col(table: str) -> Optional[str]:
+    cols = get_table_columns(table)
+    if "id" in cols:
+        return "id"
+    info = exec_query(f"PRAGMA table_info('{table}')")
+    pk_cols = [r[1] for r in info if int(r[5] or 0) > 0]
+    if len(pk_cols) == 1:
+        return pk_cols[0]
+    # no single PK; caller may fall back to rowid (if supported)
+    return None
+
 # -------------------------------
-# Schema & field setup
+# App config / schema mapping
 # -------------------------------
 
 VENDORS_TABLE = "vendors"
-CATS_TABLE    = "categories"
-SRVS_TABLE    = "services"
-
-REQUIRED_TABLES = [VENDORS_TABLE, CATS_TABLE, SRVS_TABLE]
-MISSING = [t for t in REQUIRED_TABLES if not table_exists(t)]
-
-VENDOR_FIELDS = [
-    # (column_name_in_db, friendly_label_for_UI)
-    ("business_name", "Business Name"),
-    ("contact_name",  "Contact Name"),
-    ("phone",         "Phone"),
-    ("address",       "Address"),
-    ("url",           "URL"),
-    ("website",       "Website"),
-    ("notes",         "Notes"),
-    ("keywords",      "Keywords"),
+EXPECTED = [
+    "Category", "Service", "Business Name", "Contact Name", "Phone",
+    "Address", "URL", "Notes", "Keywords", "Website",
 ]
+CANDIDATES: Dict[str, List[str]] = {
+    "Category":      ["category", "Category", "cat"],
+    "Service":       ["service", "Service", "svc"],
+    "Business Name": ["business_name", "Business Name", "name", "vendor_name", "vendor", "business"],
+    "Contact Name":  ["contact_name", "Contact Name", "contact"],
+    "Phone":         ["phone", "Phone", "phone_number", "tel"],
+    "Address":       ["address", "Address", "street_address"],
+    "URL":           ["url", "URL"],
+    "Notes":         ["notes", "Notes", "note"],
+    "Keywords":      ["keywords", "Keywords", "tags"],
+    "Website":       ["website", "Website", "web", "site"],
+}
 
-# Only keep fields that actually exist
-if table_exists(VENDORS_TABLE):
-    existing = set(get_table_columns(VENDORS_TABLE))
-    VENDOR_FIELDS = [f for f in VENDOR_FIELDS if f[0] in existing]
+def resolve_mapping(table: str) -> Dict[str, str]:
+    if not table_exists(table):
+        return {}
+    actual = get_table_columns(table)
+    by_lower = {c.lower(): c for c in actual}
+    mapping: Dict[str, str] = {}
+    for friendly, options in CANDIDATES.items():
+        for opt in options:
+            if opt.lower() in by_lower:
+                mapping[friendly] = by_lower[opt.lower()]
+                break
+    return mapping
 
-HAS_VENDOR_ID = ("id" in get_table_columns(VENDORS_TABLE)) if table_exists(VENDORS_TABLE) else False
-HAS_CAT_ID    = ("category_id" in get_table_columns(VENDORS_TABLE)) if table_exists(VENDORS_TABLE) else False
-HAS_SRV_ID    = ("service_id"  in get_table_columns(VENDORS_TABLE)) if table_exists(VENDORS_TABLE) else False
+MAPPING = resolve_mapping(VENDORS_TABLE)
+KEY_COL = detect_key_col(VENDORS_TABLE)
+WITHOUT_ROWID = has_without_rowid(VENDORS_TABLE)
 
 # -------------------------------
-# UI header & guards
+# Streamlit UI
 # -------------------------------
 
 st.set_page_config(page_title="Vendors - Admin", layout="wide")
-st.title("Vendors - Admin (normalized, strict service filtering)")
+st.title("Vendors - Admin (single-table, strict service filtering)")
 
 with st.expander("Diagnostics (toggle)", expanded=False):
     st.write("Driver:", DRIVER)
-    st.write("Missing tables:", MISSING)
-    st.write("vendors has id:", HAS_VENDOR_ID, "| has category_id:", HAS_CAT_ID, "| has service_id:", HAS_SRV_ID)
-    st.write("Vendor text fields (present):", [lbl for _, lbl in VENDOR_FIELDS])
+    st.write("Using table:", VENDORS_TABLE)
+    st.write("Mapping (friendly → actual):", MAPPING)
+    st.write("Detected key column:", KEY_COL or "(none; will try rowid)" )
+    st.write("Table WITHOUT ROWID:", WITHOUT_ROWID)
+    if not MAPPING.get("Category"): st.warning("Category column not mapped — Service list will remain empty (by design).")
+    if not MAPPING.get("Service"):  st.warning("Service column not mapped — Service list cannot populate.")
 
-if MISSING:
-    st.error(f"Missing required table(s): {', '.join(MISSING)}. Run the normalization migration first.")
+if not table_exists(VENDORS_TABLE):
+    st.error(f'Table "{VENDORS_TABLE}" not found.')
     st.stop()
 
-if not (HAS_VENDOR_ID and HAS_CAT_ID and HAS_SRV_ID):
-    st.error("vendors must have id, category_id, service_id columns. Add/backfill them and retry.")
+if not KEY_COL and WITHOUT_ROWID:
+    st.error("vendors is WITHOUT ROWID and lacks a single-column PRIMARY KEY. Add an 'id INTEGER PRIMARY KEY'.")
     st.stop()
 
 # -------------------------------
-# Catalog helpers
+# Query + grid
 # -------------------------------
 
-def get_categories() -> List[Tuple[int, str]]:
-    rows = exec_query(f'SELECT id, name FROM "{CATS_TABLE}" ORDER BY name COLLATE NOCASE')
-    return [(int(r[0]), str(r[1])) for r in rows]
+# Build SELECT: key + all friendly columns (aliasing actual names)
+select_parts = []
+if KEY_COL:
+    select_parts.append(f'v."{KEY_COL}" AS key')
+else:
+    select_parts.append('rowid AS key')
 
-def get_services(category_id: Optional[int] = None) -> List[Tuple[int, str]]:
-    if category_id is None:
-        return []
-    rows = exec_query(f'SELECT id, name FROM "{SRVS_TABLE}" WHERE category_id=? ORDER BY name COLLATE NOCASE', (int(category_id),))
-    return [(int(r[0]), str(r[1])) for r in rows]
+for friendly in EXPECTED:
+    if friendly in MAPPING:
+        actual = MAPPING[friendly]
+        select_parts.append(f'v."{actual}" AS "{friendly}"')
+    else:
+        select_parts.append(f"'' AS \"{friendly}\"")
 
-def ensure_category(name: str) -> int:
-    name = (name or "").strip()
-    if not name:
-        raise ValueError("Category name is empty")
-    row = exec_query(f'SELECT id FROM "{CATS_TABLE}" WHERE name=?', (name,))
-    if row:
-        return int(row[0][0])
-    exec_write(f'INSERT INTO "{CATS_TABLE}"(name) VALUES(?)', (name,))
-    # reselect by name (portable across drivers)
-    row = exec_query(f'SELECT id FROM "{CATS_TABLE}" WHERE name=?', (name,))
-    return int(row[0][0])
-
-def ensure_service(category_id: int, name: str) -> int:
-    name = (name or "").strip()
-    if not name:
-        raise ValueError("Service name is empty")
-    row = exec_query(f'SELECT id FROM "{SRVS_TABLE}" WHERE category_id=? AND name=?', (int(category_id), name))
-    if row:
-        return int(row[0][0])
-    exec_write(f'INSERT INTO "{SRVS_TABLE}"(category_id, name) VALUES(?, ?)', (int(category_id), name))
-    row = exec_query(f'SELECT id FROM "{SRVS_TABLE}" WHERE category_id=? AND name=?', (int(category_id), name))
-    return int(row[0][0])
-
-# -------------------------------
-# Search / list vendors
-# -------------------------------
-
-st.subheader("Find / pick a vendor to edit")
-qtext = st.text_input("Search (business / service / phone / address / notes / keywords)", placeholder="Type to filter...").strip()
-
-select_parts = ['v."id" AS key', 'c.name AS Category', 's.name AS Service', 'v.category_id', 'v.service_id']
-for col, lbl in VENDOR_FIELDS:
-    select_parts.append(f'v."{col}" AS "{lbl}"')
 select_sql = ", ".join(select_parts)
 
-sql = f'''
-SELECT {select_sql}
-FROM "{VENDORS_TABLE}" v
-LEFT JOIN "{CATS_TABLE}" c ON c.id = v.category_id
-LEFT JOIN "{SRVS_TABLE}" s ON s.id = v.service_id
-WHERE 1=1
-'''
-params: List[Any] = []
+st.subheader("Find / pick a vendor to edit")
+qtext = st.text_input("Search (business / service / phone / address / notes / keywords)",
+                      placeholder="Type to filter...").strip()
 
+sql = f' SELECT {select_sql} FROM "{VENDORS_TABLE}" v WHERE 1=1 '
+params: List[Any] = []
 if qtext:
     like = f"%{qtext}%"
-    where_bits = ['COALESCE(c.name, \'\') LIKE ?', 'COALESCE(s.name, \'\') LIKE ?']
-    params.extend([like, like])
-    for col, _lbl in VENDOR_FIELDS:
-        where_bits.append(f'COALESCE(v."{col}", \'\') LIKE ?')
-        params.append(like)
-    sql += "\n  AND (" + "\n       OR ".join(where_bits) + ")"
+    where_bits = []
+    for friendly in ["Business Name","Service","Contact Name","Category","Phone","Address","URL","Website","Notes","Keywords"]:
+        if friendly in MAPPING:
+            where_bits.append(f'COALESCE(v."{MAPPING[friendly]}", \'\') LIKE ?')
+            params.append(like)
+    if where_bits:
+        sql += "\n  AND (" + "\n       OR ".join(where_bits) + ")"
 
-order_by = 'v."business_name" COLLATE NOCASE' if any(c == "business_name" for c, _ in VENDOR_FIELDS) else "c.name, s.name, v.id"
-sql += f"\nORDER BY {order_by}\nLIMIT 500"
+order_by = f'v."{MAPPING["Business Name"]}" COLLATE NOCASE' if "Business Name" in MAPPING else ("key" if KEY_COL else "rowid")
+sql += f"\nORDER BY {order_by} ASC\nLIMIT 500"
 
 rows = exec_query(sql, params)
-
-cols = ["key", "Category", "Service", "category_id", "service_id"] + [lbl for _, lbl in VENDOR_FIELDS]
-df = pd.DataFrame(rows, columns=cols)
+cols_out = ["key"] + EXPECTED
+df = pd.DataFrame(rows, columns=cols_out)
 
 if df.empty:
     st.info("No vendors match your filter. Clear the search to see all.")
     st.stop()
 
-st.dataframe(
-    df.drop(columns=["key", "category_id", "service_id"], errors="ignore"),
-    use_container_width=True, hide_index=True
-)
+st.dataframe(df.drop(columns=["key"], errors="ignore"), use_container_width=True, hide_index=True)
 
 # -------------------------------
-# Pick vendor
+# STRICT options helpers
 # -------------------------------
 
-def label_row(r: pd.Series) -> str:
-    name = str(r.get("Business Name") or "").strip()
-    svc  = str(r.get("Service") or "").strip()
-    ph   = str(r.get("Phone") or "").strip()
-    adr  = str(r.get("Address") or "").strip()
+def distinct_options_for(
+    friendly: str,
+    limit: int = 500,
+    filter_by: Optional[Dict[str, str]] = None,
+) -> List[str]:
+    """
+    Returns DISTINCT non-empty options for `friendly` column.
+    If `filter_by` is provided, we add equality filters for those mapped columns.
+    STRICT rule: If a filter was requested but nothing usable applied (unmapped/blank), return [].
+    """
+    if friendly not in MAPPING:
+        return []
+    actual = MAPPING[friendly]
+
+    where_clauses = [f'TRIM("{actual}") IS NOT NULL AND TRIM("{actual}") <> \'\'']
+    qparams: List[Any] = []
+
+    had_filter = False
+    if filter_by:
+        for fkey, fval in filter_by.items():
+            if fkey in MAPPING:
+                val = (fval or "").strip()
+                if val:
+                    where_clauses.append(f'TRIM("{MAPPING[fkey]}") = ?')
+                    qparams.append(val)
+                    had_filter = True
+
+    if filter_by and not had_filter:
+        # Strict: a filter was requested but not usable (e.g., missing Category or unmapped) -> no options
+        return []
+
+    sql = f'''
+        SELECT DISTINCT TRIM("{actual}") AS v
+        FROM "{VENDORS_TABLE}"
+        WHERE {' AND '.join(where_clauses)}
+        ORDER BY v COLLATE NOCASE ASC
+        LIMIT {int(limit)}
+    '''
+    rows = exec_query(sql, qparams)
+    return [r[0] for r in rows if isinstance(r[0], str) and r[0].strip()]
+
+def select_or_text(
+    label: str,
+    friendly: str,
+    current: str = "",
+    filter_by: Optional[Dict[str, str]] = None
+) -> str:
+    """
+    Dropdown with distinct options (and (blank)/(custom…)). If "(custom…)" picked, show text input.
+    If friendly not mapped, just a text input.
+    """
+    current = (current or "").strip()
+    if friendly not in MAPPING:
+        return st.text_input(label, value=current)
+
+    opts = distinct_options_for(friendly, filter_by=filter_by)
+    base_items = ["(blank)"] + opts + ["(custom…)"]
+
+    if not current:
+        default_item = "(blank)"
+    elif current in opts:
+        default_item = current
+    else:
+        default_item = "(custom…)"
+
+    try:
+        default_index = base_items.index(default_item)
+    except ValueError:
+        default_index = 0
+
+    choice = st.selectbox(label, options=base_items, index=default_index, key=f"{label}_select")
+
+    if choice == "(custom…)":
+        return st.text_input(f"{label} (custom)", value=(current if default_item == "(custom…)" else ""))
+    elif choice == "(blank)":
+        return ""
+    else:
+        return choice
+
+# -------------------------------
+# Selection
+# -------------------------------
+
+def make_label(row: pd.Series) -> str:
+    name = (row.get("Business Name") or "").strip()
+    svc  = (row.get("Service") or "").strip()
+    ph   = (row.get("Phone") or "").strip()
+    adr  = (row.get("Address") or "").strip()
     bits = [b for b in [name, svc, ph, adr] if b]
     core = " — ".join(bits) if bits else "(unnamed vendor)"
-    return f"{core}  [#{int(r['key'])}]"
+    return f"{core}  [#{row['key']}]"
 
-labels = ["New vendor..."] + [label_row(r) for _, r in df.iterrows()]
+labels = ["New vendor..."] + [make_label(r) for _, r in df.iterrows()]
 choice = st.selectbox("Pick vendor", options=labels, index=0 if labels else 0)
 
-selected: Optional[pd.Series] = None
+selected_row: Optional[pd.Series] = None
 if choice != "New vendor...":
-    key = int(choice.rsplit("[#", 1)[1].rstrip("]"))
-    sel = df[df["key"] == key]
-    if not sel.empty:
-        selected = sel.iloc[0]
+    try:
+        key_val = int(choice.rsplit("[#", 1)[1].rstrip("]"))
+    except Exception:
+        key_val = None
+    if key_val is not None:
+        m = df[df["key"] == key_val]
+        if not m.empty:
+            selected_row = m.iloc[0]
 
 # -------------------------------
-# Write helpers
+# CRUD helpers
 # -------------------------------
 
-def build_write_fields(values: Dict[str, Any]) -> Dict[str, Any]:
-    write_fields: Dict[str, Any] = {}
-    existing_cols = set(get_table_columns(VENDORS_TABLE))
-    for col, lbl in VENDOR_FIELDS:
-        if col in existing_cols:
-            write_fields[col] = values.get(lbl, "") or ""
-    return write_fields
+def values_to_db_params(values: Dict[str, Any]) -> Tuple[List[str], List[Any]]:
+    cols_db: List[str] = []
+    vals_db: List[Any] = []
+    for friendly in EXPECTED:
+        if friendly in MAPPING:  # only write mapped columns
+            actual = MAPPING[friendly]
+            cols_db.append(f'"{actual}"')
+            vals_db.append(values.get(friendly, "") or "")
+    return cols_db, vals_db
 
-def insert_vendor(cat_id: Optional[int], srv_id: Optional[int], write_fields: Dict[str, Any]) -> str:
-    cols = []
-    vals = []
-    params: List[Any] = []
-    # Always include category/service columns (even if NULL)
-    cols.append("category_id"); vals.append("?"); params.append(cat_id)
-    cols.append("service_id");  vals.append("?"); params.append(srv_id)
-    for col, val in write_fields.items():
-        cols.append(col); vals.append("?"); params.append(val)
-    sql = f'INSERT INTO "{VENDORS_TABLE}" ({", ".join(f\'"{c}"\' for c in cols)}) VALUES ({", ".join(vals)})'
-    n = exec_write(sql, params)
+def insert_vendor(values: Dict[str, Any]) -> str:
+    cols_db, vals_db = values_to_db_params(values)
+    if not cols_db:
+        return "Nothing to insert: no mapped columns."
+    placeholders = ", ".join(["?"] * len(vals_db))
+    sql = f'INSERT INTO "{VENDORS_TABLE}" ({", ".join(cols_db)}) VALUES ({placeholders})'
+    n = exec_write(sql, vals_db)
     return f"Inserted ({n})"
 
-def update_vendor(key_id: int, cat_id: Optional[int], srv_id: Optional[int], write_fields: Dict[str, Any]) -> str:
-    sets = ['"category_id" = ?', '"service_id" = ?']
-    params: List[Any] = [cat_id, srv_id]
-    for col, val in write_fields.items():
-        sets.append(f'"{col}" = ?'); params.append(val)
-    sql = f'UPDATE "{VENDORS_TABLE}" SET {", ".join(sets)} WHERE "id"=?'
-    params.append(int(key_id))
-    n = exec_write(sql, params)
+def update_vendor(key: Any, values: Dict[str, Any]) -> str:
+    cols_db, vals_db = values_to_db_params(values)
+    if not cols_db:
+        return "Nothing to update: no mapped columns."
+    sets = ", ".join([f"{c}=?" for c in cols_db])
+    if KEY_COL:
+        sql = f'UPDATE "{VENDORS_TABLE}" SET {sets} WHERE "{KEY_COL}"=?'
+    else:
+        sql = f'UPDATE "{VENDORS_TABLE}" SET {sets} WHERE rowid=?'
+    n = exec_write(sql, vals_db + [key])
     return f"Updated ({n})"
 
-def delete_vendor(key_id: int) -> str:
-    n = exec_write(f'DELETE FROM "{VENDORS_TABLE}" WHERE "id"=?', (int(key_id),))
+def delete_vendor(key: Any) -> str:
+    if KEY_COL:
+        sql = f'DELETE FROM "{VENDORS_TABLE}" WHERE "{KEY_COL}"=?'
+    else:
+        sql = f'DELETE FROM "{VENDORS_TABLE}" WHERE rowid=?'
+    n = exec_write(sql, (key,))
     return f"Deleted ({n})"
 
 # -------------------------------
-# Forms (STRICT: service options depend on selected category)
+# Forms (STRICT Service filtering)
 # -------------------------------
 
 st.markdown("---")
 
 def render_inputs(init: Dict[str, Any]) -> Dict[str, Any]:
-    cats = get_categories()
-    cat_names = [n for _, n in cats]
-    cat_id_by_name = {n: i for i, n in cats}
-    cat_id_by_name_norm = {n.strip().lower(): i for i, n in cats}
-
-    current_cat_name = (init.get("Category") or "").strip()
-    current_srv_name = (init.get("Service") or "").strip()
-
-    cat_options = ["(blank)"] + cat_names + ["(add new…)"]
-    cat_default = current_cat_name if current_cat_name in cat_names else ("(blank)" if not current_cat_name else "(add new…)")
-    try:
-        cat_index = cat_options.index(cat_default)
-    except ValueError:
-        cat_index = 0
-
+    # Category first, so Service can depend on it
     c1, c2 = st.columns(2)
     with c1:
-        cat_choice = st.selectbox("Category", options=cat_options, index=cat_index, key="category_select")
-        new_cat = ""
-        if cat_choice == "(add new…)":
-            new_cat = st.text_input("New Category", value=(current_cat_name if cat_default == "(add new…)" else ""))
-
-        # Resolve selected category_id
-        if cat_choice == "(add new…)" and new_cat.strip():
-            category_id = None         # will be created on save
-            category_name = new_cat.strip()
-        elif cat_choice == "(blank)":
-            category_id = None
-            category_name = ""
-        else:
-            category_name = cat_choice.strip()
-            category_id = (
-                cat_id_by_name.get(category_name)
-                or cat_id_by_name_norm.get(category_name.lower())
-            )
-
-        # STRICT: if we do not have a concrete category_id yet, do NOT load all services
-        if category_id is not None:
-            srvs = get_services(category_id)
-        else:
-            srvs = []
-
-        srv_names = [n for _, n in srvs]
-        srv_id_by_name = {n: i for i, n in srvs}
-
-        srv_options = ["(blank)"] + srv_names + ["(add new…)"]
-        srv_default = (current_srv_name if current_srv_name in srv_names
-                       else ("(blank)" if not current_srv_name else "(add new…)"))
-        try:
-            srv_index = srv_options.index(srv_default)
-        except ValueError:
-            srv_index = 0
-
-        srv_choice = st.selectbox("Service", options=srv_options, index=srv_index, key="service_select")
-        new_srv = ""
-        if srv_choice == "(add new…)":
-            new_srv = st.text_input("New Service", value=(current_srv_name if srv_default == "(add new…)" else ""))
-
+        v_category = select_or_text("Category", "Category", init.get("Category", ""))
+        # STRICT: ALWAYS pass Category as a filter. Helper will return [] if filter unusable.
+        v_service  = select_or_text("Service", "Service", init.get("Service", ""), filter_by={"Category": v_category})
+        v_biz      = st.text_input("Business Name", value=init.get("Business Name", ""))
+        v_contact  = st.text_input("Contact Name",  value=init.get("Contact Name", ""))
+        v_phone    = st.text_input("Phone",         value=init.get("Phone", ""))
     with c2:
-        text_vals: Dict[str, Any] = {}
-        for col, lbl in VENDOR_FIELDS:
-            default = str(init.get(lbl) or "")
-            if lbl in ("Address", "Notes"):
-                text_vals[lbl] = st.text_area(lbl, value=default, height=80)
-            else:
-                text_vals[lbl] = st.text_input(lbl, value=default)
-
+        v_address  = st.text_area ("Address",  value=init.get("Address", ""),  height=80)
+        v_url      = st.text_input("URL",      value=init.get("URL", ""))
+        v_website  = st.text_input("Website",  value=init.get("Website", ""))
+        v_keywords = st.text_input("Keywords", value=init.get("Keywords", ""))
+        v_notes    = st.text_area ("Notes",    value=init.get("Notes", ""),    height=80)
     return {
-        "category_choice": cat_choice,
-        "category_name": category_name,
-        "new_category": new_cat.strip(),
-        "service_choice": srv_choice,
-        "service_name": current_srv_name if srv_choice != "(add new…)" else new_srv.strip(),
-        "new_service": new_srv.strip(),
-        **text_vals,
+        "Category": v_category,
+        "Service": v_service,
+        "Business Name": v_biz,
+        "Contact Name": v_contact,
+        "Phone": v_phone,
+        "Address": v_address,
+        "URL": v_url,
+        "Website": v_website,
+        "Keywords": v_keywords,
+        "Notes": v_notes,
     }
 
-def resolve_fk_ids(values: Dict[str, Any]) -> Tuple[Optional[int], Optional[int]]:
-    # Category
-    if values["category_choice"] == "(add new…)":
-        if not values["new_category"]:
-            raise ValueError("Enter a new Category name.")
-        cat_id = ensure_category(values["new_category"])
-    elif values["category_choice"] == "(blank)":
-        cat_id = None
-    else:
-        # existing by name
-        name = (values["category_name"] or "").strip()
-        if name:
-            row = exec_query(f'SELECT id FROM "{CATS_TABLE}" WHERE name=?', (name,))
-            cat_id = int(row[0][0]) if row else None
-        else:
-            cat_id = None
-
-    # Service (STRICT: requires a category if adding new)
-    if values["service_choice"] == "(add new…)":
-        if not cat_id:
-            raise ValueError("Pick or create a Category before adding a Service.")
-        if not values["new_service"]:
-            raise ValueError("Enter a new Service name.")
-        srv_id = ensure_service(cat_id, values["new_service"])
-    elif values["service_choice"] == "(blank)":
-        srv_id = None
-    else:
-        name = (values["service_name"] or "").strip()
-        if name and cat_id:
-            row = exec_query(f'SELECT id FROM "{SRVS_TABLE}" WHERE category_id=? AND name=?', (int(cat_id), name))
-            srv_id = int(row[0][0]) if row else None
-        else:
-            # If no category chosen, do not resolve service; leave NULL
-            srv_id = None
-
-    return cat_id, srv_id
-
-# -------------------------------
-# Add / Edit / Delete flows
-# -------------------------------
-
-if selected is None:
+if selected_row is None:
     st.subheader("Add a new vendor")
     with st.form("add_vendor"):
         vals = render_inputs({})
         submitted = st.form_submit_button("Add Vendor")
         if submitted:
-            try:
-                # Basic validation: Business Name encouraged if present in schema
-                if any(lbl == "Business Name" for _c, lbl in VENDOR_FIELDS):
-                    if not (vals.get("Business Name") or "").strip():
-                        st.error("Business Name is required.")
-                        st.stop()
-                cat_id, srv_id = resolve_fk_ids(vals)
-                write_fields = build_write_fields(vals)
-                msg = insert_vendor(cat_id, srv_id, write_fields)
+            # Require Business Name if mapped
+            if "Business Name" in MAPPING and not (vals.get("Business Name") or "").strip():
+                st.error('Business Name is required (it maps to a DB column).')
+            else:
+                msg = insert_vendor(vals)
                 st.success(msg)
                 st.rerun()
-            except Exception as e:
-                st.error(f"{type(e).__name__}: {e}")
 else:
     st.subheader("Edit vendor")
-    key_id = int(selected["key"])
-    init_vals = {k: selected.get(k, "") for k in ["Category", "Service"] + [lbl for _c, lbl in VENDOR_FIELDS]}
+    key_val = selected_row["key"]
+    init_vals = {k: selected_row.get(k, "") for k in EXPECTED}
     with st.form("edit_vendor"):
         vals = render_inputs(init_vals)
         delete_confirmed = st.checkbox("Yes, permanently delete this vendor.")
         c1, c2 = st.columns([1,1])
         do_update = c1.form_submit_button("Update")
         do_delete = c2.form_submit_button("Delete")
-
         if do_update:
-            try:
-                if any(lbl == "Business Name" for _c, lbl in VENDOR_FIELDS):
-                    if not (vals.get("Business Name") or "").strip():
-                        st.error("Business Name is required.")
-                        st.stop()
-                cat_id, srv_id = resolve_fk_ids(vals)
-                write_fields = build_write_fields(vals)
-                msg = update_vendor(key_id, cat_id, srv_id, write_fields)
+            if "Business Name" in MAPPING and not (vals.get("Business Name") or "").strip():
+                st.error('Business Name is required (it maps to a DB column).')
+            else:
+                msg = update_vendor(key_val, vals)
                 st.success(msg)
                 st.rerun()
-            except Exception as e:
-                st.error(f"{type(e).__name__}: {e}")
-
         if do_delete:
             if not delete_confirmed:
                 st.warning("Check the confirmation box above, then click Delete.")
             else:
-                try:
-                    msg = delete_vendor(key_id)
-                    st.warning(msg)
-                    st.rerun()
-                except Exception as e:
-                    st.error(f"{type(e).__name__}: {e}")
-
-# -------------------------------
-# Optional: quick catalog tools
-# -------------------------------
-
-with st.expander("Manage Categories & Services", expanded=False):
-    st.caption("Seed or correct catalog values (uses UNIQUE constraints to avoid dupes).")
-    new_cat = st.text_input("Add Category", "")
-    if st.button("Create Category"):
-        if not new_cat.strip():
-            st.error("Enter a category name.")
-        else:
-            cid = ensure_category(new_cat.strip())
-            st.success(f"Category created id={cid}")
-            st.rerun()
-
-    cats = get_categories()
-    if cats:
-        idx = st.selectbox("Select Category", options=range(len(cats)), format_func=lambda i: cats[i][1])
-        new_srv = st.text_input("Add Service to selected Category", "")
-        if st.button("Create Service"):
-            if not new_srv.strip():
-                st.error("Enter a service name.")
-            else:
-                sid = ensure_service(cats[int(idx)][0], new_srv.strip())
-                st.success(f"Service created id={sid}")
-                st.rerun()
-    else:
-        st.info("No categories yet.")
+                msg =
