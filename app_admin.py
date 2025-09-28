@@ -1,12 +1,12 @@
 """
 Admin UI for the Vendors directory (normalized schema preferred).
 
-Goal: Provide a *full* admin capable of:
-- Always listing vendors sorted ascending by Category → Service → Business Name.
-- Add / Edit / Delete Vendors.
+Goals:
+- Always list vendors sorted ascending by Category → Service → Business (via composite key CatSvc).
+- Add / Edit / Delete vendors.
 - Add new Categories and Services on the fly.
 - Toggle Active status (soft delete) and hard delete.
-- Works with normalized schema; falls back to legacy flat table if needed.
+- Work with normalized schema; fall back to legacy flat table if needed.
 - Defensive against missing columns and minor schema drift.
 
 Normalized schema (preferred):
@@ -28,19 +28,18 @@ Normalized schema (preferred):
 
 Legacy fallback: flat `vendors` table with text columns `category`, `service`, etc.
 
-Usage:
+Run locally:
   streamlit run app_admin.py
-
 """
+
 from __future__ import annotations
 
 import contextlib
 import re
 import sqlite3
-from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Optional, Tuple
 
 import pandas as pd
 import streamlit as st
@@ -48,12 +47,14 @@ import streamlit as st
 APP_TITLE = "Vendors Admin — Full (Sorted Category → Service)"
 DB_FILENAME = "vendors.db"  # expected at repo root
 
+
 # ----------------------------- Utilities ------------------------------------
 
 def _slugify(s: str) -> str:
     s = (s or "").strip().lower()
     s = re.sub(r"[^a-z0-9]+", "-", s).strip("-")
     return s
+
 
 @contextlib.contextmanager
 def connect(dbfile: Path):
@@ -82,8 +83,9 @@ def column_exists(conn: sqlite3.Connection, table: str, col: str) -> bool:
 # ----------------------------- Schema / Migrations --------------------------
 
 def ensure_normalized_schema(conn: sqlite3.Connection) -> None:
-    """Create normalized tables if missing. Non-destructive (idempotent).
-    Be *careful* if a legacy flat `vendors` table exists: skip creating
+    """
+    Create normalized tables if missing. Non-destructive (idempotent).
+    Be careful if a legacy flat `vendors` table exists: skip creating
     normalized indexes that reference non-existent columns.
     """
     # Always ensure taxonomy tables exist (safe)
@@ -109,7 +111,7 @@ def ensure_normalized_schema(conn: sqlite3.Connection) -> None:
         """
     )
 
-    # If a vendors table already exists but is *legacy* (no category_id/service_id),
+    # If a vendors table already exists but is legacy (no category_id/service_id),
     # do NOT try to create normalized indexes that would fail.
     vendors_exists = table_exists(conn, "vendors")
     has_cat_id = column_exists(conn, "vendors", "category_id") if vendors_exists else False
@@ -153,13 +155,13 @@ def has_normalized(conn: sqlite3.Connection) -> bool:
         return False
     return column_exists(conn, "vendors", "category_id") and column_exists(conn, "vendors", "service_id")
 
-    return table_exists(conn, "vendors") and table_exists(conn, "categories") and table_exists(conn, "services")
-
 
 # ----------------------------- Lookups --------------------------------------
 
 def get_categories(conn: sqlite3.Connection) -> pd.DataFrame:
-    return pd.read_sql_query("SELECT id, name, COALESCE(key, '') as key FROM categories ORDER BY name ASC", conn)
+    return pd.read_sql_query(
+        "SELECT id, name, COALESCE(key, '') as key FROM categories ORDER BY name ASC", conn
+    )
 
 
 def get_services_for_category(conn: sqlite3.Connection, category_id: int) -> pd.DataFrame:
@@ -194,7 +196,8 @@ def upsert_service(conn: sqlite3.Connection, category_id: int, name: str) -> int
 # ----------------------------- Fetch / List ---------------------------------
 
 def fetch_vendors_sorted(conn: sqlite3.Connection, include_inactive: bool = False) -> pd.DataFrame:
-    """Return vendors sorted by a single composite key (CatSvc) then Business.
+    """
+    Return vendors sorted by a single composite key (CatSvc) then Business.
     - CatSvc := Category + ' → ' + Service (handles NULL/blank safely)
     - Works in normalized mode (joins) and legacy flat mode.
     - Probes for optional columns and adapts SELECT accordingly.
@@ -205,7 +208,9 @@ def fetch_vendors_sorted(conn: sqlite3.Connection, include_inactive: bool = Fals
         has_is_active = column_exists(conn, "vendors", "is_active")
         has_created = column_exists(conn, "vendors", "created_at")
         has_updated = column_exists(conn, "vendors", "updated_at")
-        vb_col = "business_name" if column_exists(conn, "vendors", "business_name") else ("business" if column_exists(conn, "vendors", "business") else None)
+        vb_col = "business_name" if column_exists(conn, "vendors", "business_name") else (
+            "business" if column_exists(conn, "vendors", "business") else None
+        )
 
         where = ""
         if has_is_active and not include_inactive:
@@ -247,26 +252,26 @@ def fetch_vendors_sorted(conn: sqlite3.Connection, include_inactive: bool = Fals
         """
     else:
         # Legacy flat vendors table path
-        vb_col = "business_name" if column_exists(conn, "vendors", "business_name") else ("business" if column_exists(conn, "vendors", "business") else None)
+        vb_col = "business_name" if column_exists(conn, "vendors", "business_name") else (
+            "business" if column_exists(conn, "vendors", "business") else None
+        )
         cat_txt = "category" if column_exists(conn, "vendors", "category") else None
         svc_txt = "service" if column_exists(conn, "vendors", "service") else None
 
-        catsvc_expr = None
         if cat_txt or svc_txt:
             left = f"COALESCE({cat_txt},'')" if cat_txt else "''"
             right = f"COALESCE({svc_txt},'')" if svc_txt else "''"
             catsvc_expr = f"({left} || ' → ' || {right}) AS CatSvc"
+        else:
+            catsvc_expr = "'' AS CatSvc"
 
         select_bits = [
             "rowid as ID",
             f"COALESCE({cat_txt},'') AS Category" if cat_txt else "'' AS Category",
             f"COALESCE({svc_txt},'') AS Service" if svc_txt else "'' AS Service",
+            catsvc_expr,
+            f"COALESCE({vb_col},'') AS 'Business Name'" if vb_col else "'' AS 'Business Name'",
         ]
-        if catsvc_expr:
-            select_bits.append(catsvc_expr)
-        else:
-            select_bits.append("'' AS CatSvc")
-        select_bits.append(f"COALESCE({vb_col},'') AS 'Business Name'" if vb_col else "'' AS 'Business Name'")
         for name, alias in [
             ("contact_name", "Contact Name"),
             ("phone", "Phone"),
@@ -274,24 +279,20 @@ def fetch_vendors_sorted(conn: sqlite3.Connection, include_inactive: bool = Fals
             ("notes", "Notes"),
             ("website", "Website"),
         ]:
-            select_bits.append(f"COALESCE({name},'') AS '{alias}'" if column_exists(conn, "vendors", name) else f"'' AS '{alias}'")
+            select_bits.append(
+                f"COALESCE({name},'') AS '{alias}'" if column_exists(conn, "vendors", name) else f"'' AS '{alias}'"
+            )
 
         order_bits = ["CatSvc ASC"]
-        if vb_col: order_bits.append("'Business Name' ASC")
+        if vb_col:
+            order_bits.append("'Business Name' ASC")
         order_clause = " ORDER BY " + ", ".join(order_bits)
-
         sql = f"SELECT {', '.join(select_bits)} FROM vendors{order_clause}"
 
     df = pd.read_sql_query(sql, conn)
 
     # Defensive post-sort using the composite key
     sort_cols = [c for c in ["CatSvc", "Business Name"] if c in df.columns]
-    if sort_cols:
-        df = df.sort_values(sort_cols, kind="mergesort", ignore_index=True)
-    return df
-
-    # Defensive post-sort
-    sort_cols = [c for c in ["Category", "Service", "Business Name"] if c in df.columns]
     if sort_cols:
         df = df.sort_values(sort_cols, kind="mergesort", ignore_index=True)
     return df
@@ -316,9 +317,11 @@ def insert_vendor(
         cols = []
         if column_exists(conn, "vendors", "category"): cols.append("category")
         if column_exists(conn, "vendors", "service"): cols.append("service")
-        if column_exists(conn, "vendors", "business_name"): cols.append("business_name")
-        elif column_exists(conn, "vendors", "business"): cols.append("business")
-        for c in ["contact_name","phone","address","notes","website"]:
+        if column_exists(conn, "vendors", "business_name"):
+            cols.append("business_name")
+        elif column_exists(conn, "vendors", "business"):
+            cols.append("business")
+        for c in ["contact_name", "phone", "address", "notes", "website"]:
             if column_exists(conn, "vendors", c): cols.append(c)
         values = {
             "category": category_name,
@@ -349,8 +352,10 @@ def insert_vendor(
             notes, website, is_active, created_at, updated_at
         ) VALUES(?,?,?,?,?,?,?,?,?,?,?)
         """,
-        (cat_id, svc_id, business_name.strip(), contact_name.strip(), phone.strip(), address.strip(),
-         notes.strip(), website.strip(), int(bool(is_active)), now, now),
+        (
+            cat_id, svc_id, business_name.strip(), contact_name.strip(), phone.strip(), address.strip(),
+            notes.strip(), website.strip(), int(bool(is_active)), now, now
+        ),
     )
     conn.commit()
     return int(cur.lastrowid)
@@ -400,15 +405,20 @@ def update_vendor(
             address=?, notes=?, website=?, is_active=?, updated_at=?
         WHERE id=?
         """,
-        (cat_id, svc_id, business_name.strip(), contact_name.strip(), phone.strip(),
-         address.strip(), notes.strip(), website.strip(), int(bool(is_active)), now, vendor_id),
+        (
+            cat_id, svc_id, business_name.strip(), contact_name.strip(), phone.strip(),
+            address.strip(), notes.strip(), website.strip(), int(bool(is_active)), now, vendor_id
+        ),
     )
     conn.commit()
 
 
 def soft_delete_vendor(conn: sqlite3.Connection, vendor_id: int) -> None:
     if has_normalized(conn) and column_exists(conn, "vendors", "is_active"):
-        conn.execute("UPDATE vendors SET is_active=0, updated_at=? WHERE id=?", (datetime.utcnow().isoformat(timespec="seconds"), vendor_id))
+        conn.execute(
+            "UPDATE vendors SET is_active=0, updated_at=? WHERE id=?",
+            (datetime.utcnow().isoformat(timespec="seconds"), vendor_id),
+        )
     else:
         # legacy: best-effort hard delete
         conn.execute("DELETE FROM vendors WHERE rowid=?", (vendor_id,))
@@ -430,7 +440,10 @@ def select_category(conn: sqlite3.Connection, label: str, key: str, default: Opt
     names = cats["name"].tolist()
     if default and default not in names:
         names.append(default)
-    chosen = st.selectbox(label, options=sorted(set(names + ["(add new…)"])), index=(sorted(set(names + ["(add new…)"])).index(default) if default in names else 0), key=key)
+    choices = sorted(set(names + ["(add new…)"]))
+    chosen = st.selectbox(label, options=choices,
+                          index=(choices.index(default) if default in choices else 0),
+                          key=key)
     if chosen == "(add new…)":
         with st.popover("New Category"):
             new_name = st.text_input("Category name", key=f"new_cat_{key}")
@@ -438,13 +451,10 @@ def select_category(conn: sqlite3.Connection, label: str, key: str, default: Opt
                 cat_id = upsert_category(conn, new_name.strip())
                 st.success(f"Created: {new_name}")
                 return cat_id, new_name.strip()
-        # fallthrough to any default selection
-    # map to id
     if chosen and chosen != "(add new…)":
         row = cats.loc[cats["name"] == chosen]
         if not row.empty:
             return int(row.iloc[0]["id"]), chosen
-    # default: create if missing
     if chosen and chosen not in (None, "(add new…)"):
         return upsert_category(conn, chosen), chosen
     return upsert_category(conn, "Uncategorized"), "Uncategorized"
@@ -455,7 +465,10 @@ def select_service(conn: sqlite3.Connection, category_id: int, label: str, key: 
     names = svcs["name"].tolist()
     if default and default not in names:
         names.append(default)
-    chosen = st.selectbox(label, options=sorted(set(names + ["(add new…)"])), index=(sorted(set(names + ["(add new…)"])).index(default) if default in names else 0), key=key)
+    choices = sorted(set(names + ["(add new…)"]))
+    chosen = st.selectbox(label, options=choices,
+                          index=(choices.index(default) if default in choices else 0),
+                          key=key)
     if chosen == "(add new…)":
         with st.popover("New Service"):
             new_name = st.text_input("Service name", key=f"new_svc_{key}")
@@ -492,7 +505,9 @@ def page_list(conn: sqlite3.Connection):
         # Category options
         cat_options = ["(all)"]
         if "Category" in df.columns:
-            cat_options += sorted([x for x in df["Category"].dropna().unique().tolist() if x != ""])
+            cat_options += sorted(
+                [x for x in df["Category"].dropna().unique().tolist() if x != ""]
+            )
         cat = c1.selectbox(
             "Category",
             options=cat_options,
@@ -502,7 +517,9 @@ def page_list(conn: sqlite3.Connection):
         # Service options
         svc_options = ["(all)"]
         if "Service" in df.columns:
-            svc_options += sorted([x for x in df["Service"].dropna().unique().tolist() if x != ""])
+            svc_options += sorted(
+                [x for x in df["Service"].dropna().unique().tolist() if x != ""]
+            )
         svc = c2.selectbox(
             "Service",
             options=svc_options,
@@ -513,36 +530,22 @@ def page_list(conn: sqlite3.Connection):
             df = df[df["Category"] == cat]
         if svc != "(all)" and "Service" in df.columns:
             df = df[df["Service"] == svc]
-        # re-enforce sort
-        df = df.sort_values([c for c in ["Category", "Service", "Business Name"] if c in df.columns], kind="mergesort", ignore_index=True)
+        # re-enforce sort (stable)
+        df = df.sort_values(
+            [c for c in ["CatSvc", "Business Name"] if c in df.columns],
+            kind="mergesort",
+            ignore_index=True,
+        )
 
     # Hide CatSvc from display but keep for sorting/export
     display_df = df.drop(columns=["CatSvc"], errors="ignore")
     st.dataframe(display_df, use_container_width=True, hide_index=True)
     st.download_button(
         "Download CSV (sorted view)",
-        df.to_csv(index=False).encode("utf-8"),
+        display_df.to_csv(index=False).encode("utf-8"),
         file_name="vendors_sorted.csv",
         mime="text/csv",
     )
-
-    include_inactive = st.toggle("Show inactive", value=False, help="Includes vendors with is_active=0 (normalized mode only)")
-    df = fetch_vendors_sorted(conn, include_inactive=include_inactive)
-
-    # Optional filters that DO NOT change sort order
-    with st.expander("Filters (optional)"):
-        c1, c2 = st.columns(2)
-        cat = c1.selectbox("Category", ["(all, key="list_filter_category")"] + sorted([x for x in df.get("Category", pd.Series(dtype=str)).dropna().unique().tolist() if x != ""])) if "Category" in df.columns else "(all)"
-        svc = c2.selectbox("Service", ["(all, key="list_filter_service")"] + sorted([x for x in df.get("Service", pd.Series(dtype=str)).dropna().unique().tolist() if x != ""])) if "Service" in df.columns else "(all)"
-        if cat != "(all)":
-            df = df[df["Category"] == cat]
-        if svc != "(all)":
-            df = df[df["Service"] == svc]
-        # re-enforce sort
-        df = df.sort_values([c for c in ["Category","Service","Business Name"] if c in df.columns], kind="mergesort", ignore_index=True)
-
-    st.dataframe(df, use_container_width=True, hide_index=True)
-    st.download_button("Download CSV (sorted view)", df.to_csv(index=False).encode("utf-8"), file_name="vendors_sorted.csv", mime="text/csv")
 
 
 def page_add(conn: sqlite3.Connection):
@@ -566,7 +569,11 @@ def page_add(conn: sqlite3.Connection):
         if not business.strip():
             st.error("Business Name is required.")
             return
-        vid = insert_vendor(conn, cat_name, svc_name, business.strip(), contact.strip(), phone.strip(), address.strip(), notes.strip(), website.strip(), 1 if active else 0)
+        vid = insert_vendor(
+            conn, cat_name, svc_name, business.strip(), contact.strip(),
+            phone.strip(), address.strip(), notes.strip(), website.strip(),
+            1 if active else 0
+        )
         st.success(f"Added vendor #{vid}: {business.strip()}")
 
 
@@ -632,7 +639,6 @@ def page_edit(conn: sqlite3.Connection):
         st.success(f"Updated vendor #{chosen_id}")
 
 
-
 def page_delete(conn: sqlite3.Connection):
     st.subheader("Delete Vendor")
     df = fetch_vendors_sorted(conn, include_inactive=True)
@@ -664,7 +670,6 @@ def page_delete(conn: sqlite3.Connection):
             st.warning(f"Vendor #{chosen_id} permanently deleted")
 
 
-
 def page_manage_taxonomy(conn: sqlite3.Connection):
     st.subheader("Manage Categories & Services")
     ensure_normalized_schema(conn)
@@ -685,7 +690,7 @@ def page_manage_taxonomy(conn: sqlite3.Connection):
             st.info("No categories yet. Add a category first.")
         else:
             cat_name = st.selectbox("Category", options=cats["name"].tolist(), key="manage_svc_cat")
-            cat_id = int(cats.loc[cats["name"]==cat_name].iloc[0]["id"])
+            cat_id = int(cats.loc[cats["name"] == cat_name].iloc[0]["id"])
             with st.form("add_svc_form", clear_on_submit=True):
                 name = st.text_input("Service name")
                 submitted = st.form_submit_button("Add Service")
@@ -705,13 +710,17 @@ def page_manage_taxonomy(conn: sqlite3.Connection):
             cat_name = st.selectbox("Filter by Category", options=["(all)"] + cats["name"].tolist(), key="svc_filter")
             if cat_name == "(all)":
                 svc_df = pd.read_sql_query(
-                    "SELECT s.id, c.name as category, s.name, COALESCE(s.key,'') as key FROM services s JOIN categories c ON c.id=s.category_id ORDER BY c.name,s.name",
+                    "SELECT s.id, c.name as category, s.name, COALESCE(s.key,'') as key "
+                    "FROM services s JOIN categories c ON c.id=s.category_id "
+                    "ORDER BY c.name,s.name",
                     conn,
                 )
             else:
-                cat_id = int(cats.loc[cats["name"]==cat_name].iloc[0]["id"])
+                cat_id = int(cats.loc[cats["name"] == cat_name].iloc[0]["id"])
                 svc_df = pd.read_sql_query(
-                    "SELECT s.id, c.name as category, s.name, COALESCE(s.key,'') as key FROM services s JOIN categories c ON c.id=s.category_id WHERE c.id=? ORDER BY s.name",
+                    "SELECT s.id, c.name as category, s.name, COALESCE(s.key,'') as key "
+                    "FROM services s JOIN categories c ON c.id=s.category_id "
+                    "WHERE c.id=? ORDER BY s.name",
                     conn,
                     params=(cat_id,),
                 )
