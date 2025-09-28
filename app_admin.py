@@ -1,7 +1,8 @@
-# app_admin.py — Vendors Admin (auto-maps real DB columns to friendly headers)
-# - Works even if your DB uses snake_case/lowercase column names.
-# - Uses SQLite rowid as stable key for Update/Delete.
-# - Turso/libSQL or local SQLite supported.
+# app_admin.py — Vendors Admin (auto-map columns; reliable Update/Delete)
+# - Works if your DB uses different column names (snake_case, etc.)
+# - Uses SQLite rowid as the key (precise updates/deletes)
+# - Fixes delete: confirmation checkbox + form_submit_button (no stray st.button)
+# - Supports Turso/libSQL or local SQLite
 
 import os
 import contextlib
@@ -63,10 +64,19 @@ def list_tables() -> List[str]:
     return [r[0] for r in rows]
 
 def get_table_columns(table: str) -> List[str]:
-    # Cannot parametrize table name in PRAGMA; embed trusted table string
     rows = exec_query(f"PRAGMA table_info('{table}')")
-    # row = (cid, name, type, notnull, dflt_value, pk)
-    return [r[1] for r in rows]
+    return [r[1] for r in rows]  # row = (cid, name, type, notnull, dflt_value, pk)
+
+def table_has_rowid(table: str) -> bool:
+    # WITHOUT ROWID tables do not support rowid; for typical SQLite tables this is True
+    rows = exec_query("SELECT sql FROM sqlite_schema WHERE type IN ('table','view') AND name=? LIMIT 1", (table,))
+    if not rows:
+        return False
+    sql = (rows[0][0] or "").upper()
+    if " VIEW " in sql:
+        # Views are not updatable unless INSTEAD OF triggers exist; treat as no-rowid for safety
+        return False
+    return " WITHOUT ROWID" not in sql
 
 # -------------------------------
 # Schema mapping (auto detect)
@@ -74,7 +84,7 @@ def get_table_columns(table: str) -> List[str]:
 
 VENDORS_TABLE = "vendors"
 
-# Friendly headers we want to show in the UI
+# Friendly headers shown in UI
 EXPECTED = [
     "Category",
     "Service",
@@ -88,7 +98,7 @@ EXPECTED = [
     "Website",
 ]
 
-# For each friendly header, probe these candidate DB column names (in order)
+# Candidate DB names we’ll probe for each friendly field
 CANDIDATES: Dict[str, List[str]] = {
     "Category":      ["Category", "category"],
     "Service":       ["Service", "service"],
@@ -103,11 +113,10 @@ CANDIDATES: Dict[str, List[str]] = {
 }
 
 def resolve_mapping(table: str) -> Tuple[Dict[str, str], List[str]]:
-    """Return (mapping, missing) where mapping maps EXPECTED->actual DB column name."""
     if not table_exists(table):
-        return {}, EXPECTED[:]  # everything missing
-    actual_cols = get_table_columns(table)
-    by_lower = {c.lower(): c for c in actual_cols}
+        return {}, EXPECTED[:]
+    actual = get_table_columns(table)
+    by_lower = {c.lower(): c for c in actual}
     mapping: Dict[str, str] = {}
     missing: List[str] = []
     for friendly, options in CANDIDATES.items():
@@ -123,6 +132,7 @@ def resolve_mapping(table: str) -> Tuple[Dict[str, str], List[str]]:
     return mapping, missing
 
 MAPPING, MISSING = resolve_mapping(VENDORS_TABLE)
+HAS_ROWID = table_has_rowid(VENDORS_TABLE)
 
 # -------------------------------
 # Streamlit UI
@@ -136,12 +146,18 @@ with st.expander("Diagnostics (toggle)", expanded=False):
     with contextlib.suppress(Exception):
         st.write("Tables:", list_tables())
     st.write("Using table:", VENDORS_TABLE)
+    st.write("Has rowid:", HAS_ROWID)
     st.write("Detected mapping (friendly → actual):", MAPPING)
     if MISSING:
-        st.write("Missing (will show blank fields & be skipped on write):", MISSING)
+        st.write("Missing (shown blank; skipped on write):", MISSING)
 
 if not table_exists(VENDORS_TABLE):
     st.error(f'Database missing required table: "{VENDORS_TABLE}".')
+    st.stop()
+
+if not HAS_ROWID:
+    st.error('This table is a VIEW or WITHOUT ROWID table — cannot target exact rows for update/delete.\n'
+             'Create a regular table (or add INTEGER PRIMARY KEY id) and migrate the data.')
     st.stop()
 
 st.subheader("Find / pick a vendor to edit")
@@ -168,9 +184,8 @@ params: List[Any] = []
 if qtext:
     like = f"%{qtext}%"
     where_bits = []
-    search_fields = ["Business Name", "Service", "Contact Name", "Category",
-                     "Phone", "Address", "URL", "Website", "Notes", "Keywords"]
-    for friendly in search_fields:
+    for friendly in ["Business Name", "Service", "Contact Name", "Category",
+                     "Phone", "Address", "URL", "Website", "Notes", "Keywords"]:
         if friendly in MAPPING:
             actual = MAPPING[friendly]
             where_bits.append(f'COALESCE("{actual}", \'\') LIKE ?')
@@ -179,8 +194,7 @@ if qtext:
         sql += "\n  AND (" + "\n       OR ".join(where_bits) + ")"
 
 sql += '\nORDER BY ' + (
-    f'"{MAPPING["Business Name"]}" COLLATE NOCASE' if "Business Name" in MAPPING
-    else 'rowid'
+    f'"{MAPPING["Business Name"]}" COLLATE NOCASE' if "Business Name" in MAPPING else 'rowid'
 ) + '\nLIMIT 500'
 
 # Execute
@@ -248,7 +262,7 @@ def values_to_db_params(values: Dict[str, Any]) -> Tuple[List[str], List[Any]]:
     cols_db: List[str] = []
     vals_db: List[Any] = []
     for friendly in EXPECTED:
-        if friendly in MAPPING:
+        if friendly in MAPPING:  # only write to columns that actually exist
             actual = MAPPING[friendly]
             cols_db.append(f'"{actual}"')
             vals_db.append(values.get(friendly, "") or "")
@@ -278,13 +292,13 @@ def delete_vendor(rowid_key: int) -> str:
     return f"Deleted ({n})"
 
 # -------------------------------
-# Forms
+# Forms (Delete fixed: checkbox + submit)
 # -------------------------------
 
 st.markdown("---")
 
 def render_inputs(init: Dict[str, Any]) -> Dict[str, Any]:
-    # Show all friendly fields; if a field isn't mapped, we still present it but it won't be written.
+    # Show all friendly fields; unmapped fields display but won't be written.
     c1, c2 = st.columns(2)
     with c1:
         v_category = st.text_input("Category",     value=init.get("Category", ""))
@@ -317,9 +331,9 @@ if selected_row is None:
         vals = render_inputs({})
         submitted = st.form_submit_button("Add Vendor")
         if submitted:
-            # Basic validation: require Business Name if it's mapped
+            # Require Business Name if it maps to a real column
             if "Business Name" in MAPPING and not (vals.get("Business Name") or "").strip():
-                st.error('Business Name is required (because it maps to an existing DB column).')
+                st.error('Business Name is required (it maps to a DB column).')
             else:
                 msg = insert_vendor(vals)
                 st.success(msg)
@@ -330,24 +344,24 @@ else:
     init_vals = {k: selected_row.get(k, "") for k in EXPECTED}
     with st.form("edit_vendor"):
         vals = render_inputs(init_vals)
+        delete_confirmed = st.checkbox("Yes, permanently delete this vendor.")
         c1, c2 = st.columns([1,1])
         do_update = c1.form_submit_button("Update")
         do_delete = c2.form_submit_button("Delete")
         if do_update:
             if "Business Name" in MAPPING and not (vals.get("Business Name") or "").strip():
-                st.error('Business Name is required (because it maps to an existing DB column).')
+                st.error('Business Name is required (it maps to a DB column).')
             else:
                 msg = update_vendor(key_val, vals)
                 st.success(msg)
                 st.rerun()
         if do_delete:
-            with st.expander("Confirm delete", expanded=True):
-                st.warning(f"About to delete: {selected_row.get('Business Name','(unnamed)')}  [#{key_val}]")
-                really = st.checkbox("Yes, permanently delete this vendor.")
-                if really and st.button("Confirm delete"):
-                    msg = delete_vendor(key_val)
-                    st.warning(msg)
-                    st.rerun()
+            if not delete_confirmed:
+                st.warning("Check the confirmation box above, then click Delete.")
+            else:
+                msg = delete_vendor(key_val)
+                st.warning(msg)
+                st.rerun()
 
 # -------------------------------
 # End
