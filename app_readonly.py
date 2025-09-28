@@ -1,6 +1,6 @@
-# app_readonly.py
-# Vendors Read-only — wide layout, collapsed sidebar, FTS option,
-# per-column character widths (with ellipsis), and website links.
+# app.py  (or app_readonly.py)
+# Vendors Read-only — wide layout, collapsed sidebar, fixed character widths per column,
+# and Website hyperlink column immediately after Address.
 
 from __future__ import annotations
 
@@ -14,10 +14,10 @@ from sqlalchemy import create_engine
 from sqlalchemy.engine import Engine
 from sqlalchemy.sql import text as sql_text
 
-# Wide page and collapsed sidebar for maximum table area
+# ---------- PAGE LAYOUT ----------
 st.set_page_config(page_title="Vendors", layout="wide", initial_sidebar_state="collapsed")
 
-# ======== Secrets / Config ========
+# ---------- DB CONFIG ----------
 LIBSQL_URL = (
     st.secrets.get("LIBSQL_URL")
     or os.getenv("LIBSQL_URL")
@@ -33,6 +33,7 @@ VENDORS_DB_PATH = st.secrets.get("VENDORS_DB_PATH") or os.getenv("VENDORS_DB_PAT
 USE_TURSO = bool(LIBSQL_URL and LIBSQL_AUTH_TOKEN)
 
 def _as_sqlalchemy_url(u: str) -> str:
+    """Convert libsql://... to sqlite+libsql://... (SQLAlchemy dialect)."""
     if not u:
         return u
     if u.startswith("sqlite+libsql://"):
@@ -56,7 +57,7 @@ def make_engine() -> Engine:
 engine: Engine = make_engine()
 DB_SOURCE = f"(Turso) {_as_sqlalchemy_url(LIBSQL_URL) or ''}" if USE_TURSO else f"(SQLite) {VENDORS_DB_PATH}"
 
-# ======== Small DB helpers ========
+# ---------- HELPERS ----------
 def run_df(sql: str, params: Dict | None = None) -> pd.DataFrame:
     with engine.begin() as conn:
         return pd.read_sql_query(sql_text(sql), conn, params=dict(params or {}))
@@ -67,14 +68,16 @@ def query_scalar(sql: str, params: Dict | None = None):
         return row[0] if row else None
 
 def table_exists(name: str) -> bool:
-    return query_scalar("SELECT 1 FROM sqlite_master WHERE type='table' AND name=:n LIMIT 1;", {"n": name}) is not None
+    return query_scalar(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name=:n LIMIT 1;", {"n": name}
+    ) is not None
 
 def table_columns(table: str) -> List[str]:
     with engine.begin() as conn:
         rows = conn.execute(sql_text(f"PRAGMA table_info({table});")).fetchall()
         return [r[1] for r in rows]
 
-# ======== Schema detection ========
+# ---------- SCHEMA ----------
 def detect_schema():
     if not table_exists("vendors"):
         st.error("Table 'vendors' not found. Check DB connection/path.")
@@ -97,14 +100,17 @@ def detect_schema():
 
 SCHEMA = detect_schema()
 
-# ======== Catalog loaders ========
+# ---------- CATALOG LOADERS ----------
 def get_categories() -> List[str]:
     if SCHEMA["has_categories_table"]:
         df = run_df("SELECT name FROM categories ORDER BY name;")
         if not df.empty:
             return df["name"].tolist()
     if SCHEMA["uses_cat_text"]:
-        df = run_df("SELECT DISTINCT TRIM(category) AS name FROM vendors WHERE TRIM(category) <> '' ORDER BY 1;")
+        df = run_df(
+            "SELECT DISTINCT TRIM(category) AS name FROM vendors "
+            "WHERE TRIM(category) <> '' ORDER BY 1;"
+        )
         return df["name"].tolist()
     return []
 
@@ -114,24 +120,22 @@ def get_services() -> List[str]:
         if not df.empty:
             return df["name"].tolist()
     if SCHEMA["uses_svc_text"]:
-        df = run_df("SELECT DISTINCT TRIM(service) AS name FROM vendors WHERE TRIM(service) <> '' ORDER BY 1;")
+        df = run_df(
+            "SELECT DISTINCT TRIM(service) AS name FROM vendors "
+            "WHERE TRIM(service) <> '' ORDER BY 1;"
+        )
         return df["name"].tolist()
     return []
 
-# ======== Query ========
+# ---------- SEARCH ----------
 def _fts_query_string(q: str) -> str:
     toks = re.findall(r"[A-Za-z0-9]+", q or "")
     if not toks:
         return ""
     return " AND ".join(f"{t}*" for t in toks)
 
-def load_vendors_df(
-    q: str = "",
-    use_fts: bool = False,
-    category_filter: str = "",
-    service_filter: str = "",
-) -> pd.DataFrame:
-
+def load_vendors_df(q: str = "", use_fts: bool = False,
+                    category_filter: str = "", service_filter: str = "") -> pd.DataFrame:
     # Category expr/join
     if SCHEMA["uses_cat_id"]:
         cat_expr = "c.name AS Category"
@@ -205,11 +209,10 @@ def load_vendors_df(
 
     where_sql = ("WHERE " + " AND ".join(wheres)) if wheres else ""
     order_sql = 'ORDER BY "Business Name" COLLATE NOCASE ASC'
-
     sql = f"{base_select}\n{where_sql}\n{order_sql};"
     df = run_df(sql, params)
 
-    # Normalize website values to valid URLs
+    # Normalize Website URLs so LinkColumn works
     if "Website" in df.columns:
         def _normalize_url(u):
             if not u:
@@ -228,7 +231,31 @@ def load_vendors_df(
 
     return df
 
-# ======== UI ========
+# ---------- CONFIGURABLE DISPLAY WIDTHS (characters) ----------
+# Edit these numbers to control how many characters are shown per column.
+# We clip text to this character count and add an ellipsis when needed.
+CHAR_WIDTHS: Dict[str, int] = {
+    "Business Name": 36,
+    "Category": 18,
+    "Service": 24,
+    "Phone": 18,
+    "Address": 60,
+    "Notes": 120,
+    "Keywords": 80,
+    # Note: "Website" is a hyperlink column; character clipping is not applied to it.
+}
+
+def _clip(s: Optional[str], n: int) -> str:
+    if s is None:
+        return ""
+    t = str(s)
+    if len(t) <= n:
+        return t
+    if n <= 1:
+        return "…"
+    return t[: n - 1] + "…"
+
+# ---------- UI ----------
 st.title("Vendors")
 
 # Top row: search + filters + FTS toggle
@@ -242,71 +269,31 @@ service_filter = col_svc.selectbox("Service", options=["(All)"] + svcs, index=0)
 service_filter = "" if service_filter == "(All)" else service_filter
 use_fts = col_fts.checkbox("Use FTS", value=False)
 
-# Pull data
-df = load_vendors_df(
-    q=q,
-    use_fts=use_fts,
-    category_filter=category_filter,
-    service_filter=service_filter,
-)
+# Data
+df = load_vendors_df(q=q, use_fts=use_fts,
+                     category_filter=category_filter, service_filter=service_filter)
 
-# Per-column character widths (interactive)
-DEFAULT_WIDTHS: Dict[str, int] = {
-    "Business Name": 36,
-    "Category": 18,
-    "Service": 24,
-    "Phone": 16,
-    "Address": 48,
-    "Notes": 80,
-    "Keywords": 60,
-    "Website (text)": 60,   # separate, truncated text view of the URL
-}
-
-with st.expander("Display options (character widths)"):
-    widths: Dict[str, int] = {}
-    for col, default in DEFAULT_WIDTHS.items():
-        # Only show controls for columns that exist/will exist
-        if col == "Website (text)":
-            exists = "Website" in df.columns
-        else:
-            exists = col in df.columns
-        if exists:
-            widths[col] = st.number_input(f"{col}", min_value=5, max_value=200, value=default, step=5)
-
-def _clip(s: Optional[str], n: int) -> str:
-    if s is None:
-        return ""
-    t = str(s)
-    if len(t) <= n:
-        return t
-    if n <= 1:
-        return "…"
-    return t[: n - 1] + "…"
-
-# Build a display frame with clipped text columns.
 if df.empty:
     st.info("No vendors found.")
 else:
-    show = df.copy()
+    # Apply character clipping to text columns that exist (not applied to hyperlink column)
+    clipped = df.copy()
+    for col, n in CHAR_WIDTHS.items():
+        if col in clipped.columns:
+            clipped[col] = clipped[col].map(lambda x: _clip(x, n))
 
-    # Create a truncated text column for Website (so you control visible characters)
-    if "Website" in show.columns:
-        show["Website (text)"] = show["Website"].fillna("").astype(str)
+    # Column order: put Website immediately AFTER Address
+    # Only include columns that exist; always drop internal id.
+    desired_order = [
+        "Business Name", "Category", "Service", "Phone",
+        "Address", "Website",  # Website directly after Address
+        "Notes", "Keywords",
+    ]
+    cols = [c for c in desired_order if c in clipped.columns]
+    others = [c for c in clipped.columns if c not in cols and c != "id"]
+    show = clipped[cols + others].drop(columns=["id"], errors="ignore")
 
-    # Apply clipping to defined columns that exist
-    for col, n in (widths if 'widths' in locals() else DEFAULT_WIDTHS).items():
-        if col == "Website (text)":
-            if "Website (text)" in show.columns:
-                show[col] = show[col].map(lambda x: _clip(x, n))
-        elif col in show.columns:
-            show[col] = show[col].map(lambda x: _clip(x, n))
-
-    # Hide internal id
-    show = show.drop(columns=["id"], errors="ignore")
-
-    # Column configuration:
-    # - "Website": clickable link (constant label "Open")
-    # - "Website (text)": your truncated URL text for readability
+    # Render with Website as a clickable link column
     col_cfg: Dict[str, st.column_config.Column] = {
         "Business Name": st.column_config.TextColumn("Business Name", width="medium"),
         "Category":      st.column_config.TextColumn("Category",      width="small"),
@@ -317,9 +304,8 @@ else:
         "Keywords":      st.column_config.TextColumn("Keywords",      width="large"),
     }
     if "Website" in show.columns:
-        col_cfg["Website"] = st.column_config.LinkColumn("Website", display_text="Open", help="Open in new tab", width="small")
-    if "Website (text)" in show.columns:
-        col_cfg["Website (text)"] = st.column_config.TextColumn("Website (text)", width="large")
+        # Note: LinkColumn's display_text is global, not per-row; we leave the URL visible or use a fixed label.
+        col_cfg["Website"] = st.column_config.LinkColumn("Website", help="Open in new tab", width="medium")
 
     st.dataframe(
         show,
@@ -328,7 +314,7 @@ else:
         column_config=col_cfg,
     )
 
-# Tiny debug footer
+# Debug footer
 with st.expander("Debug / DB status"):
     counts = {
         "vendors": query_scalar("SELECT COUNT(*) FROM vendors;") or 0,
