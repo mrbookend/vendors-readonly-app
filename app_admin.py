@@ -492,9 +492,7 @@ def page_list(conn: sqlite3.Connection):
         # Category options
         cat_options = ["(all)"]
         if "Category" in df.columns:
-            cat_options += sorted(
-                [x for x in df["Category"].dropna().unique().tolist() if x != ""]
-            )
+            cat_options += sorted([x for x in df["Category"].dropna().unique().tolist() if x != ""])
         cat = c1.selectbox(
             "Category",
             options=cat_options,
@@ -504,9 +502,7 @@ def page_list(conn: sqlite3.Connection):
         # Service options
         svc_options = ["(all)"]
         if "Service" in df.columns:
-            svc_options += sorted(
-                [x for x in df["Service"].dropna().unique().tolist() if x != ""]
-            )
+            svc_options += sorted([x for x in df["Service"].dropna().unique().tolist() if x != ""])
         svc = c2.selectbox(
             "Service",
             options=svc_options,
@@ -517,23 +513,36 @@ def page_list(conn: sqlite3.Connection):
             df = df[df["Category"] == cat]
         if svc != "(all)" and "Service" in df.columns:
             df = df[df["Service"] == svc]
-        # re-enforce sort (stable)
-        df = df.sort_values(
-            [c for c in ["CatSvc", "Business Name"] if c in df.columns],
-            kind="mergesort",
-            ignore_index=True,
-        )
+        # re-enforce sort
+        df = df.sort_values([c for c in ["Category", "Service", "Business Name"] if c in df.columns], kind="mergesort", ignore_index=True)
 
     # Hide CatSvc from display but keep for sorting/export
     display_df = df.drop(columns=["CatSvc"], errors="ignore")
     st.dataframe(display_df, use_container_width=True, hide_index=True)
     st.download_button(
         "Download CSV (sorted view)",
-        display_df.to_csv(index=False).encode("utf-8"),
+        df.to_csv(index=False).encode("utf-8"),
         file_name="vendors_sorted.csv",
         mime="text/csv",
     )
 
+    include_inactive = st.toggle("Show inactive", value=False, help="Includes vendors with is_active=0 (normalized mode only)")
+    df = fetch_vendors_sorted(conn, include_inactive=include_inactive)
+
+    # Optional filters that DO NOT change sort order
+    with st.expander("Filters (optional)"):
+        c1, c2 = st.columns(2)
+        cat = c1.selectbox("Category", ["(all, key="list_filter_category")"] + sorted([x for x in df.get("Category", pd.Series(dtype=str)).dropna().unique().tolist() if x != ""])) if "Category" in df.columns else "(all)"
+        svc = c2.selectbox("Service", ["(all, key="list_filter_service")"] + sorted([x for x in df.get("Service", pd.Series(dtype=str)).dropna().unique().tolist() if x != ""])) if "Service" in df.columns else "(all)"
+        if cat != "(all)":
+            df = df[df["Category"] == cat]
+        if svc != "(all)":
+            df = df[df["Service"] == svc]
+        # re-enforce sort
+        df = df.sort_values([c for c in ["Category","Service","Business Name"] if c in df.columns], kind="mergesort", ignore_index=True)
+
+    st.dataframe(df, use_container_width=True, hide_index=True)
+    st.download_button("Download CSV (sorted view)", df.to_csv(index=False).encode("utf-8"), file_name="vendors_sorted.csv", mime="text/csv")
 
 
 def page_add(conn: sqlite3.Connection):
@@ -572,7 +581,12 @@ def page_edit(conn: sqlite3.Connection):
     df["Label"] = df.apply(lambda r: f"#{r['ID']} — {r.get('Business Name','')} ({r.get('Category','')} → {r.get('Service','')})", axis=1)
     choices = df[["ID","Label"]].values.tolist()
     id_to_label = {int(i): lbl for i,lbl in choices}
-    chosen_id = st.selectbox("Select Vendor", options=list(id_to_label.keys(, key="edit_vendor_select")), format_func=lambda i: id_to_label[i])
+    chosen_id = st.selectbox(
+        "Select Vendor",
+        options=sorted(id_to_label.keys()),
+        format_func=lambda i: id_to_label[i],
+        key="edit_vendor_select",
+    )), format_func=lambda i: id_to_label[i])
 
     row = df.loc[df["ID"] == chosen_id].iloc[0]
 
@@ -608,7 +622,12 @@ def page_delete(conn: sqlite3.Connection):
 
     df["Label"] = df.apply(lambda r: f"#{r['ID']} — {r.get('Business Name','')} ({r.get('Category','')} → {r.get('Service','')})", axis=1)
     id_to_label = {int(r.ID): r.Label for _, r in df[['ID','Label']].iterrows()}
-    chosen_id = st.selectbox("Select Vendor", options=list(id_to_label.keys(, key="delete_vendor_select")), format_func=lambda i: id_to_label[i])
+    chosen_id = st.selectbox(
+        "Select Vendor",
+        options=sorted(id_to_label.keys()),
+        format_func=lambda i: id_to_label[i],
+        key="delete_vendor_select",
+    )), format_func=lambda i: id_to_label[i])
 
     col1, col2 = st.columns(2)
     with col1:
