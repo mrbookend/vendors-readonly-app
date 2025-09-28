@@ -1,10 +1,9 @@
-# app_admin.py — Vendors Admin
-# - Single-table (vendors)
-# - Coalesced reads for Category/Service
-# - "Loose" normalization for matching: ignores NBSP/TAB/CR/LF and ALL spaces
-# - Strict Category→Service, with fallbacks
-# - Safe SQL debug that prints raw errors, SQL, and params
-# - Writes to snake_case (category/service) when present
+# app_admin.py — Vendors Admin (derive Service options from DataFrame)
+# Table: vendors
+# - Reads Category/Service via coalesced+normalized expressions (category/Category, service/Service)
+# - Service dropdown options are derived from the displayed DataFrame (df), not from a separate SQL
+# - Safe SQL debug for other queries; writes go to snake_case when present
+# - One-click coalesce legacy → snake_case
 
 import os
 from typing import Any, Dict, List, Optional, Sequence, Tuple
@@ -87,7 +86,7 @@ def table_exists(name: str) -> bool:
 
 def get_table_columns(table: str) -> List[str]:
     rows = exec_query(f"PRAGMA table_info('{table}')")
-    return [r[1] for r in rows]  # (cid, name, type, notnull, dflt, pk)
+    return [r[1] for r in rows]
 
 def has_without_rowid(table: str) -> bool:
     rows = exec_query("SELECT sql FROM sqlite_schema WHERE type='table' AND name=? LIMIT 1", (table,))
@@ -106,7 +105,7 @@ def detect_key_col(table: str) -> Optional[str]:
     return None
 
 # -------------------------------
-# Mapping candidates & resolver (for non-category/service fields)
+# Mapping candidates & resolver
 # -------------------------------
 
 EXPECTED = [
@@ -164,10 +163,6 @@ for friendly, canonical in [("Category", "category"), ("Service", "service")]:
 # -------------------------------
 
 def coalesce_expr(primary: str, alts: List[str]) -> str:
-    """
-    Return first non-blank among the provided columns.
-    If only one column exists, DO NOT wrap with COALESCE (SQLite requires >=2 args).
-    """
     cols = [primary] + [a for a in alts if a in COLS_SET]
     parts = [f'NULLIF(TRIM("{c}"), \'\')' for c in cols if c in COLS_SET]
     if not parts:
@@ -177,7 +172,6 @@ def coalesce_expr(primary: str, alts: List[str]) -> str:
     return "COALESCE(" + ", ".join(parts) + ")"
 
 def base_clean(expr: str) -> str:
-    # Convert NBSP→space, TAB→space, drop CR/LF, then TRIM
     return (
         f"TRIM(REPLACE(REPLACE(REPLACE(REPLACE({expr}, printf('%c',160), ' '),"
         f"        printf('%c',9),   ' '),"
@@ -186,18 +180,16 @@ def base_clean(expr: str) -> str:
     )
 
 def norm_sql_strict(expr: str) -> str:
-    # UPPER + TRIM (spaces preserved internally)
     return f"UPPER({base_clean(expr)})"
 
 def norm_sql_loose(expr: str) -> str:
-    # UPPER + remove ALL spaces (so single vs double spaces don't matter)
     return f"UPPER(REPLACE({base_clean(expr)}, ' ', ''))"
 
 CAT_READ_EXPR = coalesce_expr("category", ["Category"])
 SRV_READ_EXPR = coalesce_expr("service",  ["Service"])
 CAT_NORM_STRICT = norm_sql_strict(CAT_READ_EXPR)
-SRV_NORM_STRICT = norm_sql_strict(SRV_READ_EXPR)
 CAT_NORM_LOOSE  = norm_sql_loose(CAT_READ_EXPR)
+SRV_NORM_STRICT = norm_sql_strict(SRV_READ_EXPR)
 
 def norm_py_strict(s: str) -> str:
     if s is None:
@@ -213,7 +205,7 @@ def norm_py_loose(s: str) -> str:
 # -------------------------------
 
 st.set_page_config(page_title="Vendors - Admin", layout="wide")
-st.title("Vendors - Admin (space-insensitive Category→Service)")
+st.title("Vendors - Admin (Service options from data)")
 
 with st.expander("Diagnostics / Tools (toggle)", expanded=False):
     st.write("Driver:", DRIVER)
@@ -264,7 +256,7 @@ if not KEY_COL and WITHOUT_ROWID:
     st.stop()
 
 # -------------------------------
-# Search & grid (use coalesced fields for Cat/Service)
+# Build the grid DataFrame
 # -------------------------------
 
 select_parts: List[str] = []
@@ -286,7 +278,8 @@ for friendly in ["Business Name","Contact Name","Phone","Address","URL","Notes",
 select_sql = ", ".join(select_parts)
 
 st.subheader("Find / pick a vendor to edit")
-qtext = st.text_input("Search (business / service / phone / address / notes / keywords)", placeholder="Type to filter...").strip()
+qtext = st.text_input("Search (business / service / phone / address / notes / keywords)",
+                      placeholder="Type to filter...").strip()
 
 sql = f' SELECT {select_sql} FROM "{VENDORS_TABLE}" v WHERE 1=1 '
 params: List[Any] = []
@@ -317,116 +310,40 @@ if df.empty:
 st.dataframe(df.drop(columns=["key"], errors="ignore"), use_container_width=True, hide_index=True)
 
 # -------------------------------
-# Distinct options with loose compare
+# Derive Category → Service options from df (robust)
 # -------------------------------
 
-def distinct_options_category(limit: int = 500) -> List[str]:
-    sql = f'''
-        SELECT raw, norm_loose FROM (
-            SELECT TRIM({CAT_READ_EXPR}) AS raw, {CAT_NORM_LOOSE} AS norm_loose
-            FROM "{VENDORS_TABLE}"
-            WHERE {CAT_READ_EXPR} IS NOT NULL AND TRIM({CAT_READ_EXPR}) <> ''
-        )
-        WHERE raw IS NOT NULL AND TRIM(raw) <> ''
-        ORDER BY raw COLLATE NOCASE ASC
-        LIMIT {int(limit)}
-    '''
-    rows, _ = safe_query(sql)
-    seen = set()
-    opts: List[str] = []
-    for raw, n in rows:
-        if not isinstance(raw, str):
+def norm_key_loose_py(s: str) -> str:
+    return norm_py_loose(s or "")
+
+def build_services_map(frame: pd.DataFrame) -> Dict[str, List[str]]:
+    """Map normalized Category → sorted list of unique non-empty Services."""
+    m: Dict[str, set] = {}
+    if "Category" not in frame.columns or "Service" not in frame.columns:
+        return {}
+    for _, r in frame.iterrows():
+        cat = (r.get("Category") or "").strip()
+        srv = (r.get("Service") or "").strip()
+        if not cat or not srv:
             continue
-        if n in seen:
-            continue
-        seen.add(n)
-        opts.append(raw.strip())
-    return opts
+        key = norm_key_loose_py(cat)
+        m.setdefault(key, set()).add(srv)
+    return {k: sorted(v, key=lambda x: x.upper()) for k, v in m.items()}
 
-def distinct_options_service_for_strict(category_value: str, limit: int = 500) -> List[str]:
-    # Use LOOSE normalization on Category equality
-    norm_param = norm_py_loose(category_value)
-    sql = f'''
-        SELECT raw, norm FROM (
-            SELECT TRIM({SRV_READ_EXPR}) AS raw, {SRV_NORM_STRICT} AS norm
-            FROM "{VENDORS_TABLE}"
-            WHERE {CAT_READ_EXPR} IS NOT NULL
-              AND {SRV_READ_EXPR} IS NOT NULL
-              AND TRIM({SRV_READ_EXPR}) <> ''
-              AND {CAT_NORM_LOOSE} = ?
-        )
-        WHERE raw IS NOT NULL AND TRIM(raw) <> ''
-        ORDER BY raw COLLATE NOCASE ASC
-        LIMIT {int(limit)}
-    '''
-    rows, _ = safe_query(sql, (norm_param,))
-    seen = set(); opts: List[str] = []
-    for raw, n in rows:
-        if not isinstance(raw, str): continue
-        if n in seen: continue
-        seen.add(n); opts.append(raw.strip())
-    return opts
+SERVICES_BY_CATEGORY = build_services_map(df)
 
-def distinct_options_service_fallback(category_value: str, limit: int = 500) -> List[str]:
-    # If strict returns nothing, try LIKE with a pattern that collapses runs of spaces:
-    # pattern = "%Auto%Services%" will match "Auto  Services" too.
-    val = (category_value or "").strip()
-    if not val:
-        return []
-    pattern = "%".join(val.split())  # collapse spaces → wildcard
-    sql = f'''
-        SELECT DISTINCT TRIM({SRV_READ_EXPR}) AS v
-        FROM "{VENDORS_TABLE}"
-        WHERE {CAT_READ_EXPR} IS NOT NULL
-          AND UPPER({base_clean(CAT_READ_EXPR)}) LIKE UPPER(?)
-          AND {SRV_READ_EXPR} IS NOT NULL
-          AND TRIM({SRV_READ_EXPR}) <> ''
-        ORDER BY v COLLATE NOCASE ASC
-        LIMIT {int(limit)}
-    '''
-    rows, _ = safe_query(sql, (f"%{pattern}%",))
-    return [r[0].strip() for r in rows if isinstance(r[0], str) and r[0].strip()]
+def distinct_options_category_from_df() -> List[str]:
+    vals = sorted({(c or "").strip() for c in df.get("Category", pd.Series(dtype=str)).tolist()
+                   if isinstance(c, str) and c.strip()},
+                  key=lambda x: x.upper())
+    return vals
 
-def select_or_text_category(current: str = "") -> str:
-    opts = distinct_options_category()
-    base = ["(blank)"] + opts + ["(custom…)"]
-    cur = (current or "").strip()
-    default = "(blank)" if not cur else (cur if cur in opts else "(custom…)")
-    try:
-        idx = base.index(default)
-    except ValueError:
-        idx = 0
-    choice = st.selectbox("Category", options=base, index=idx, key="Category_select")
-    if choice == "(custom…)":
-        return st.text_input("Category (custom)", value=(cur if default == "(custom…)" else ""))
-    elif choice == "(blank)":
-        return ""
-    else:
-        return choice
-
-def select_or_text_service(current: str, category_value: str) -> str:
-    cur = (current or "").strip()
-    opts: List[str] = []
-    if category_value and category_value not in ("(blank)", "(custom…)"):
-        opts = distinct_options_service_for_strict(category_value)
-        if not opts:
-            opts = distinct_options_service_fallback(category_value)
-    base = ["(blank)"] + opts + ["(custom…)"]
-    default = "(blank)" if not cur else (cur if cur in opts else "(custom…)")
-    try:
-        idx = base.index(default)
-    except ValueError:
-        idx = 0
-    choice = st.selectbox("Service", options=base, index=idx, key="Service_select")
-    if choice == "(custom…)":
-        return st.text_input("Service (custom)", value=(cur if default == "(custom…)" else ""))
-    elif choice == "(blank)":
-        return ""
-    else:
-        return choice
+def services_for_category_from_df(category_value: str) -> List[str]:
+    key = norm_key_loose_py(category_value)
+    return SERVICES_BY_CATEGORY.get(key, [])
 
 # -------------------------------
-# Selection label & Dataframe picker
+# Select vendor / forms
 # -------------------------------
 
 def make_label(row: pd.Series) -> str:
@@ -501,16 +418,53 @@ def delete_vendor(key: Any) -> str:
     return f"Deleted ({n})" if not e else "Delete error (see above)"
 
 # -------------------------------
-# Forms
+# Forms (Service options derived from df)
 # -------------------------------
 
 st.markdown("---")
 
+def select_or_text_category_from_df(current: str = "") -> str:
+    opts = distinct_options_category_from_df()
+    base = ["(blank)"] + opts + ["(custom…)"]
+    cur = (current or "").strip()
+    default = "(blank)" if not cur else (cur if cur in opts else "(custom…)")
+    try:
+        idx = base.index(default)
+    except ValueError:
+        idx = 0
+    choice = st.selectbox("Category", options=base, index=idx, key="Category_select")
+    if choice == "(custom…)":
+        return st.text_input("Category (custom)", value=(cur if default == "(custom…)" else ""))
+    elif choice == "(blank)":
+        return ""
+    else:
+        return choice
+
+def select_or_text_service_from_df(current: str, category_value: str) -> str:
+    cur = (current or "").strip()
+    if not category_value or category_value in ("(blank)", "(custom…)"):
+        opts: List[str] = []
+    else:
+        opts = services_for_category_from_df(category_value)
+    base = ["(blank)"] + opts + ["(custom…)"]
+    default = "(blank)" if not cur else (cur if cur in opts else "(custom…)")
+    try:
+        idx = base.index(default)
+    except ValueError:
+        idx = 0
+    choice = st.selectbox("Service", options=base, index=idx, key="Service_select")
+    if choice == "(custom…)":
+        return st.text_input("Service (custom)", value=(cur if default == "(custom…)" else ""))
+    elif choice == "(blank)":
+        return ""
+    else:
+        return choice
+
 def render_inputs(init: Dict[str, Any]) -> Dict[str, Any]:
     c1, c2 = st.columns(2)
     with c1:
-        v_category = select_or_text_category(init.get("Category", ""))
-        v_service  = select_or_text_service(init.get("Service", ""), v_category)
+        v_category = select_or_text_category_from_df(init.get("Category", ""))
+        v_service  = select_or_text_service_from_df(init.get("Service", ""), v_category)
         v_biz      = st.text_input("Business Name", value=init.get("Business Name", ""))
         v_contact  = st.text_input("Contact Name",  value=init.get("Contact Name", ""))
         v_phone    = st.text_input("Phone",         value=init.get("Phone", ""))
@@ -520,6 +474,12 @@ def render_inputs(init: Dict[str, Any]) -> Dict[str, Any]:
         v_website  = st.text_input("Website",  value=init.get("Website", ""))
         v_keywords = st.text_input("Keywords", value=init.get("Keywords", ""))
         v_notes    = st.text_area ("Notes",    value=init.get("Notes", ""),    height=80)
+
+    # Small inline diagnostics for your selection
+    if v_category:
+        found = services_for_category_from_df(v_category)
+        st.caption(f"Services found for '{v_category}': {len(found)} — {', '.join(found[:8])}{' …' if len(found) > 8 else ''}")
+
     return {
         "Category": v_category,
         "Service": v_service,
