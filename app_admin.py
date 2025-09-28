@@ -473,8 +473,8 @@ def page_list(conn: sqlite3.Connection):
     # Optional filters that DO NOT change sort order
     with st.expander("Filters (optional)"):
         c1, c2 = st.columns(2)
-        cat = c1.selectbox("Category", ["(all)"] + sorted([x for x in df.get("Category", pd.Series(dtype=str)).dropna().unique().tolist() if x != ""])) if "Category" in df.columns else "(all)"
-        svc = c2.selectbox("Service", ["(all)"] + sorted([x for x in df.get("Service", pd.Series(dtype=str)).dropna().unique().tolist() if x != ""])) if "Service" in df.columns else "(all)"
+        cat = c1.selectbox("Category", ["(all, key="list_filter_category")"] + sorted([x for x in df.get("Category", pd.Series(dtype=str)).dropna().unique().tolist() if x != ""])) if "Category" in df.columns else "(all)"
+        svc = c2.selectbox("Service", ["(all, key="list_filter_service")"] + sorted([x for x in df.get("Service", pd.Series(dtype=str)).dropna().unique().tolist() if x != ""])) if "Service" in df.columns else "(all)"
         if cat != "(all)":
             df = df[df["Category"] == cat]
         if svc != "(all)":
@@ -522,7 +522,7 @@ def page_edit(conn: sqlite3.Connection):
     df["Label"] = df.apply(lambda r: f"#{r['ID']} — {r.get('Business Name','')} ({r.get('Category','')} → {r.get('Service','')})", axis=1)
     choices = df[["ID","Label"]].values.tolist()
     id_to_label = {int(i): lbl for i,lbl in choices}
-    chosen_id = st.selectbox("Select Vendor", options=list(id_to_label.keys()), format_func=lambda i: id_to_label[i])
+    chosen_id = st.selectbox("Select Vendor", options=list(id_to_label.keys(, key="edit_vendor_select")), format_func=lambda i: id_to_label[i])
 
     row = df.loc[df["ID"] == chosen_id].iloc[0]
 
@@ -558,7 +558,7 @@ def page_delete(conn: sqlite3.Connection):
 
     df["Label"] = df.apply(lambda r: f"#{r['ID']} — {r.get('Business Name','')} ({r.get('Category','')} → {r.get('Service','')})", axis=1)
     id_to_label = {int(r.ID): r.Label for _, r in df[['ID','Label']].iterrows()}
-    chosen_id = st.selectbox("Select Vendor", options=list(id_to_label.keys()), format_func=lambda i: id_to_label[i])
+    chosen_id = st.selectbox("Select Vendor", options=list(id_to_label.keys(, key="delete_vendor_select")), format_func=lambda i: id_to_label[i])
 
     col1, col2 = st.columns(2)
     with col1:
@@ -590,7 +590,7 @@ def page_manage_taxonomy(conn: sqlite3.Connection):
         if cats.empty:
             st.info("No categories yet. Add a category first.")
         else:
-            cat_name = st.selectbox("Category", options=cats["name"].tolist())
+            cat_name = st.selectbox("Category", options=cats["name"].tolist(), key="manage_svc_cat")
             cat_id = int(cats.loc[cats["name"]==cat_name].iloc[0]["id"])
             with st.form("add_svc_form", clear_on_submit=True):
                 name = st.text_input("Service name")
