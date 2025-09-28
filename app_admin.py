@@ -1,15 +1,16 @@
 # app_admin.py — Vendors Admin (single-table; strict Category→Service filtering)
 # Works with ONE table: vendors
-#   Expected logical fields (any physical names; app auto-maps):
+#   Logical fields (any physical names; app auto-maps):
 #     Category, Service, Business Name, Contact Name, Phone, Address, URL, Notes, Keywords, Website
+#
 # Keying:
 #   - Prefer "id" if present
 #   - Else use single-column PRIMARY KEY if table has one
-#   - Else fall back to rowid (normal tables only)
+#   - Else fall back to rowid (only if table is NOT WITHOUT ROWID)
 #
 # Strict filtering:
 #   - Service dropdown is LIMITED to services that exist with the chosen Category
-#   - If no Category selected (or Category column unmapped), Service list is empty (only blank/custom)
+#   - If no Category selected (or Category column unmapped), Service list shows only (blank) and (custom…)
 
 import os
 import contextlib
@@ -81,7 +82,6 @@ def detect_key_col(table: str) -> Optional[str]:
     pk_cols = [r[1] for r in info if int(r[5] or 0) > 0]
     if len(pk_cols) == 1:
         return pk_cols[0]
-    # no single PK; caller may fall back to rowid (if supported)
     return None
 
 # -------------------------------
@@ -93,6 +93,8 @@ EXPECTED = [
     "Category", "Service", "Business Name", "Contact Name", "Phone",
     "Address", "URL", "Notes", "Keywords", "Website",
 ]
+
+# Put the MOST likely actual column names FIRST so mapping prefers them.
 CANDIDATES: Dict[str, List[str]] = {
     "Category":      ["category", "Category", "cat"],
     "Service":       ["service", "Service", "svc"],
@@ -134,10 +136,12 @@ with st.expander("Diagnostics (toggle)", expanded=False):
     st.write("Driver:", DRIVER)
     st.write("Using table:", VENDORS_TABLE)
     st.write("Mapping (friendly → actual):", MAPPING)
-    st.write("Detected key column:", KEY_COL or "(none; will try rowid)" )
+    st.write("Detected key column:", KEY_COL or "(none; will try rowid)")
     st.write("Table WITHOUT ROWID:", WITHOUT_ROWID)
-    if not MAPPING.get("Category"): st.warning("Category column not mapped — Service list will remain empty (by design).")
-    if not MAPPING.get("Service"):  st.warning("Service column not mapped — Service list cannot populate.")
+    if not MAPPING.get("Category"):
+        st.warning("Category column not mapped — Service list will remain empty (by design).")
+    if not MAPPING.get("Service"):
+        st.warning("Service column not mapped — Service list cannot populate.")
 
 if not table_exists(VENDORS_TABLE):
     st.error(f'Table "{VENDORS_TABLE}" not found.')
@@ -168,8 +172,10 @@ for friendly in EXPECTED:
 select_sql = ", ".join(select_parts)
 
 st.subheader("Find / pick a vendor to edit")
-qtext = st.text_input("Search (business / service / phone / address / notes / keywords)",
-                      placeholder="Type to filter...").strip()
+qtext = st.text_input(
+    "Search (business / service / phone / address / notes / keywords)",
+    placeholder="Type to filter..."
+).strip()
 
 sql = f' SELECT {select_sql} FROM "{VENDORS_TABLE}" v WHERE 1=1 '
 params: List[Any] = []
@@ -194,7 +200,8 @@ if df.empty:
     st.info("No vendors match your filter. Clear the search to see all.")
     st.stop()
 
-st.dataframe(df.drop(columns=["key"], errors="ignore"), use_container_width=True, hide_index=True)
+st.dataframe(df.drop(columns=["key"], errors="ignore"),
+             use_container_width=True, hide_index=True)
 
 # -------------------------------
 # STRICT options helpers
@@ -207,14 +214,15 @@ def distinct_options_for(
 ) -> List[str]:
     """
     Returns DISTINCT non-empty options for `friendly` column.
-    If `filter_by` is provided, we add equality filters for those mapped columns.
-    STRICT rule: If a filter was requested but nothing usable applied (unmapped/blank), return [].
+    STRICT behavior:
+      * If a filter was requested but is not usable (unmapped/blank/custom), return [].
+      * Compare filters case-insensitively with TRIM.
     """
     if friendly not in MAPPING:
         return []
     actual = MAPPING[friendly]
 
-    where_clauses = [f'TRIM("{actual}") IS NOT NULL AND TRIM("{actual}") <> \'\'']
+    where_clauses = [f'TRIM("{actual}") <> \'\'']
     qparams: List[Any] = []
 
     had_filter = False
@@ -222,13 +230,15 @@ def distinct_options_for(
         for fkey, fval in filter_by.items():
             if fkey in MAPPING:
                 val = (fval or "").strip()
-                if val:
-                    where_clauses.append(f'TRIM("{MAPPING[fkey]}") = ?')
+                if val and val not in ("(blank)", "(custom…)", "(add new…)"):
+                    fac = MAPPING[fkey]
+                    # Case-insensitive, trimmed equality on the filter
+                    where_clauses.append(f'UPPER(TRIM("{fac}")) = UPPER(?)')
                     qparams.append(val)
                     had_filter = True
 
     if filter_by and not had_filter:
-        # Strict: a filter was requested but not usable (e.g., missing Category or unmapped) -> no options
+        # A filter was requested but we couldn't apply any -> no options
         return []
 
     sql = f'''
@@ -248,8 +258,9 @@ def select_or_text(
     filter_by: Optional[Dict[str, str]] = None
 ) -> str:
     """
-    Dropdown with distinct options (and (blank)/(custom…)). If "(custom…)" picked, show text input.
-    If friendly not mapped, just a text input.
+    Dropdown with distinct options plus (blank)/(custom…).
+    If "(custom…)" picked, show a text input.
+    If the friendly field isn't mapped, show a plain text input.
     """
     current = (current or "").strip()
     if friendly not in MAPPING:
@@ -360,7 +371,7 @@ def render_inputs(init: Dict[str, Any]) -> Dict[str, Any]:
     c1, c2 = st.columns(2)
     with c1:
         v_category = select_or_text("Category", "Category", init.get("Category", ""))
-        # STRICT: ALWAYS pass Category as a filter. Helper will return [] if filter unusable.
+        # STRICT: ALWAYS pass Category as a filter. Helper returns [] if filter unusable.
         v_service  = select_or_text("Service", "Service", init.get("Service", ""), filter_by={"Category": v_category})
         v_biz      = st.text_input("Business Name", value=init.get("Business Name", ""))
         v_contact  = st.text_input("Contact Name",  value=init.get("Contact Name", ""))
@@ -390,7 +401,6 @@ if selected_row is None:
         vals = render_inputs({})
         submitted = st.form_submit_button("Add Vendor")
         if submitted:
-            # Require Business Name if mapped
             if "Business Name" in MAPPING and not (vals.get("Business Name") or "").strip():
                 st.error('Business Name is required (it maps to a DB column).')
             else:
