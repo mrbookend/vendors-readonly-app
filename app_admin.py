@@ -111,8 +111,6 @@ def ensure_normalized_schema(conn: sqlite3.Connection) -> None:
         """
     )
 
-    # If a vendors table already exists but is legacy (no category_id/service_id),
-    # do NOT try to create normalized indexes that would fail.
     vendors_exists = table_exists(conn, "vendors")
     has_cat_id = column_exists(conn, "vendors", "category_id") if vendors_exists else False
     has_svc_id = column_exists(conn, "vendors", "service_id") if vendors_exists else False
@@ -145,7 +143,6 @@ def ensure_normalized_schema(conn: sqlite3.Connection) -> None:
     if has_cat_id and has_svc_id:
         conn.execute("CREATE INDEX IF NOT EXISTS idx_vendors_cat_svc ON vendors(category_id, service_id)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_services_cat ON services(category_id)")
-
     conn.commit()
 
 
@@ -191,6 +188,36 @@ def upsert_service(conn: sqlite3.Connection, category_id: int, name: str) -> int
     )
     row = cur.fetchone()
     return int(row[0])
+
+
+# ---------- Legacy-derived choices (used when taxonomy tables are empty) -----
+
+def get_legacy_categories(conn: sqlite3.Connection) -> pd.DataFrame:
+    """Distinct textual categories from a legacy flat vendors table."""
+    if not column_exists(conn, "vendors", "category"):
+        return pd.DataFrame({"name": []})
+    return pd.read_sql_query(
+        "SELECT DISTINCT TRIM(COALESCE(category,'')) AS name "
+        "FROM vendors "
+        "WHERE TRIM(COALESCE(category,'')) <> '' "
+        "ORDER BY name ASC",
+        conn,
+    )
+
+
+def get_legacy_services_for_category(conn: sqlite3.Connection, category_name: str) -> pd.DataFrame:
+    """Distinct services for a given textual category in legacy mode."""
+    if not column_exists(conn, "vendors", "service") or not column_exists(conn, "vendors", "category"):
+        return pd.DataFrame({"name": []})
+    return pd.read_sql_query(
+        "SELECT DISTINCT TRIM(COALESCE(service,'')) AS name "
+        "FROM vendors "
+        "WHERE TRIM(COALESCE(category,'')) = ? "
+        "  AND TRIM(COALESCE(service,'')) <> '' "
+        "ORDER BY name ASC",
+        conn,
+        params=(category_name.strip(),),
+    )
 
 
 # ----------------------------- Fetch / List ---------------------------------
@@ -436,14 +463,30 @@ def hard_delete_vendor(conn: sqlite3.Connection, vendor_id: int) -> None:
 # ----------------------------- UI Components --------------------------------
 
 def select_category(conn: sqlite3.Connection, label: str, key: str, default: Optional[str] = None) -> Tuple[int, str]:
+    """
+    Select a category. If the categories table is empty, seed choices from
+    distinct textual vendors.category values. Returns (category_id, category_name).
+    """
     cats = get_categories(conn)
-    names = cats["name"].tolist()
+    if cats.empty:
+        # Seed from legacy textual data if present
+        legacy = get_legacy_categories(conn)
+        if not legacy.empty:
+            for n in legacy["name"].tolist():
+                if n:
+                    upsert_category(conn, n)
+            cats = get_categories(conn)
+
+    names = cats["name"].tolist() if not cats.empty else []
     if default and default not in names:
         names.append(default)
-    choices = sorted(set(names + ["(add new…)"]))
-    chosen = st.selectbox(label, options=choices,
-                          index=(choices.index(default) if default in choices else 0),
-                          key=key)
+    choices = sorted(set(names + ["(add new…)"])) if names else ["(add new…)"]
+    chosen = st.selectbox(
+        label,
+        options=choices,
+        index=(choices.index(default) if default in choices else 0),
+        key=key,
+    )
     if chosen == "(add new…)":
         with st.popover("New Category"):
             new_name = st.text_input("Category name", key=f"new_cat_{key}")
@@ -451,24 +494,54 @@ def select_category(conn: sqlite3.Connection, label: str, key: str, default: Opt
                 cat_id = upsert_category(conn, new_name.strip())
                 st.success(f"Created: {new_name}")
                 return cat_id, new_name.strip()
-    if chosen and chosen != "(add new…)":
+
+    if chosen and chosen != "(add new…)" and not cats.empty:
         row = cats.loc[cats["name"] == chosen]
         if not row.empty:
             return int(row.iloc[0]["id"]), chosen
+
     if chosen and chosen not in (None, "(add new…)"):
         return upsert_category(conn, chosen), chosen
+
     return upsert_category(conn, "Uncategorized"), "Uncategorized"
 
 
-def select_service(conn: sqlite3.Connection, category_id: int, label: str, key: str, default: Optional[str] = None) -> Tuple[int, str]:
-    svcs = get_services_for_category(conn, category_id)
-    names = svcs["name"].tolist()
+def select_service(
+    conn: sqlite3.Connection,
+    category_id: int,
+    label: str,
+    key: str,
+    default: Optional[str] = None,
+    category_name_for_legacy: Optional[str] = None,
+) -> Tuple[int, str]:
+    """
+    Select a service. If services for the chosen category are empty, seed choices
+    from distinct textual vendors.service values filtered by the chosen category.
+    Returns (service_id, service_name).
+    """
+    svcs = get_services_for_category(conn, category_id) if has_normalized(conn) else pd.DataFrame({"name": []})
+    if svcs.empty:
+        legacy_svcs = (
+            get_legacy_services_for_category(conn, category_name_for_legacy or "")
+            if category_name_for_legacy else
+            pd.DataFrame({"name": []})
+        )
+        if not legacy_svcs.empty:
+            for n in legacy_svcs["name"].tolist():
+                if n:
+                    upsert_service(conn, category_id, n)
+            svcs = get_services_for_category(conn, category_id)
+
+    names = svcs["name"].tolist() if not svcs.empty else []
     if default and default not in names:
         names.append(default)
-    choices = sorted(set(names + ["(add new…)"]))
-    chosen = st.selectbox(label, options=choices,
-                          index=(choices.index(default) if default in choices else 0),
-                          key=key)
+    choices = sorted(set(names + ["(add new…)"])) if names else ["(add new…)"]
+    chosen = st.selectbox(
+        label,
+        options=choices,
+        index=(choices.index(default) if default in choices else 0),
+        key=key,
+    )
     if chosen == "(add new…)":
         with st.popover("New Service"):
             new_name = st.text_input("Service name", key=f"new_svc_{key}")
@@ -476,12 +549,15 @@ def select_service(conn: sqlite3.Connection, category_id: int, label: str, key: 
                 svc_id = upsert_service(conn, category_id, new_name.strip())
                 st.success(f"Created: {new_name}")
                 return svc_id, new_name.strip()
-    if chosen and chosen != "(add new…)":
+
+    if chosen and chosen != "(add new…)" and not svcs.empty:
         row = svcs.loc[svcs["name"] == chosen]
         if not row.empty:
             return int(row.iloc[0]["id"]), chosen
+
     if chosen and chosen not in (None, "(add new…)"):
         return upsert_service(conn, category_id, chosen), chosen
+
     return upsert_service(conn, category_id, "(Unspecified)"), "(Unspecified)"
 
 
@@ -553,7 +629,7 @@ def page_add(conn: sqlite3.Connection):
     ensure_normalized_schema(conn)
 
     cat_id, cat_name = select_category(conn, "Category", key="add_cat")
-    svc_id, svc_name = select_service(conn, cat_id, "Service", key="add_svc")
+    svc_id, svc_name = select_service(conn, cat_id, "Service", key="add_svc", category_name_for_legacy=cat_name)
 
     with st.form("add_vendor_form", clear_on_submit=True):
         business = st.text_input("Business Name", max_chars=200)
@@ -606,7 +682,8 @@ def page_edit(conn: sqlite3.Connection):
         conn, "Category", key=f"edit_cat_{chosen_id}", default=str(row.get("Category", ""))
     )
     svc_id, svc_name = select_service(
-        conn, cat_id, "Service", key=f"edit_svc_{chosen_id}", default=str(row.get("Service", ""))
+        conn, cat_id, "Service", key=f"edit_svc_{chosen_id}",
+        default=str(row.get("Service", "")), category_name_for_legacy=cat_name
     )
 
     with st.form(f"edit_vendor_form_{chosen_id}"):
