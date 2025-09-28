@@ -190,24 +190,48 @@ def upsert_service(conn: sqlite3.Connection, category_id: int, name: str) -> int
 
 def fetch_vendors_sorted(conn: sqlite3.Connection, include_inactive: bool = False) -> pd.DataFrame:
     """Return vendors sorted by Category asc, Service asc, Business asc.
-    Works in normalized mode, falls back to legacy flat table.
+    Works in normalized mode, falls back to legacy flat table. Tolerates
+    partial/older normalized schemas missing `is_active`, `created_at`,
+    or `updated_at` by probing columns and adapting the SELECT/WHERE.
     """
     if has_normalized(conn):
-        where = "" if include_inactive else "WHERE COALESCE(v.is_active,1)=1"
+        # Probe optional columns safely
+        has_is_active = column_exists(conn, "vendors", "is_active")
+        has_created = column_exists(conn, "vendors", "created_at")
+        has_updated = column_exists(conn, "vendors", "updated_at")
+
+        where = ""
+        if has_is_active and not include_inactive:
+            where = "WHERE COALESCE(v.is_active,1)=1"
+
+        select_bits = [
+            "v.id as ID",
+            "c.name AS Category",
+            "s.name AS Service",
+            "v.business_name AS 'Business Name'",
+            "COALESCE(v.contact_name,'') AS 'Contact Name'",
+            "COALESCE(v.phone,'') AS Phone",
+            "COALESCE(v.address,'') AS Address",
+            "COALESCE(v.notes,'') AS Notes",
+            "COALESCE(v.website,'') AS Website",
+        ]
+        # Optional fields
+        if has_is_active:
+            select_bits.append("COALESCE(v.is_active,1) AS Active")
+        else:
+            select_bits.append("1 AS Active")
+        if has_created:
+            select_bits.append("COALESCE(v.created_at,'') AS Created")
+        else:
+            select_bits.append("'' AS Created")
+        if has_updated:
+            select_bits.append("COALESCE(v.updated_at,'') AS Updated")
+        else:
+            select_bits.append("'' AS Updated")
+
         sql = f"""
             SELECT
-                v.id as ID,
-                c.name AS Category,
-                s.name AS Service,
-                v.business_name AS "Business Name",
-                COALESCE(v.contact_name,'') AS "Contact Name",
-                COALESCE(v.phone,'') AS Phone,
-                COALESCE(v.address,'') AS Address,
-                COALESCE(v.notes,'') AS Notes,
-                COALESCE(v.website,'') AS Website,
-                COALESCE(v.is_active,1) AS Active,
-                COALESCE(v.created_at,'') AS Created,
-                COALESCE(v.updated_at,'') AS Updated
+                {', '.join(select_bits)}
             FROM vendors v
             LEFT JOIN categories c ON c.id = v.category_id
             LEFT JOIN services   s ON s.id = v.service_id
@@ -229,7 +253,14 @@ def fetch_vendors_sorted(conn: sqlite3.Connection, include_inactive: bool = Fals
             FROM vendors
             ORDER BY Category ASC, Service ASC, "Business Name" ASC
         """
+
     df = pd.read_sql_query(sql, conn)
+
+    # Defensive post-sort
+    sort_cols = [c for c in ["Category", "Service", "Business Name"] if c in df.columns]
+    if sort_cols:
+        df = df.sort_values(sort_cols, kind="mergesort", ignore_index=True)
+    return df
 
     # Defensive post-sort
     sort_cols = [c for c in ["Category", "Service", "Business Name"] if c in df.columns]
