@@ -1,9 +1,9 @@
-# app_admin.py — Vendors Admin (single-table; coalesced+normalized reads; strict Category→Service)
+# app_admin.py — Vendors Admin (single-table; coalesced+normalized reads; strict Category→Service; safe SQL debug)
 # Table: vendors
 # UI fields: Category, Service, Business Name, Contact Name, Phone, Address, URL, Notes, Keywords, Website
-# Reads Category/Service using COALESCE(category,"Category") and COALESCE(service,"Service")
-# Compares using normalized values (trimmed, case-insensitive, NBSP/tab/newline handled).
-# Writes go to snake_case (category/service) when present.
+# - Reads Category/Service via COALESCE(category,"Category"), COALESCE(service,"Service") with normalization.
+# - Writes always target snake_case (category/service) when present.
+# - All critical queries go through safe_query() which shows the RAW sqlite3 error, full SQL, and params.
 
 import os
 from typing import Any, Dict, List, Optional, Sequence, Tuple
@@ -29,6 +29,8 @@ def _connect():
     path = os.environ.get("SQLITE_PATH", "vendors.db")
     conn = sqlite3.connect(path, check_same_thread=False)
     conn.row_factory = sqlite3.Row
+    # optional: be explicit
+    conn.execute("PRAGMA foreign_keys = ON;")
     return conn, "sqlite"
 
 CONN, DRIVER = _connect()
@@ -50,6 +52,29 @@ def exec_write(sql: str, params: Sequence[Any] = ()) -> int:
         cur = CONN.execute(sql, params)
         CONN.commit()
         return cur.rowcount
+
+def safe_query(sql: str, params: Sequence[Any] = ()) -> Tuple[List[Tuple], Optional[str]]:
+    """Run a query and surface the REAL sqlite error (unredacted) in the UI."""
+    try:
+        return exec_query(sql, params), None
+    except Exception as e:
+        st.error("SQL failed")
+        st.code(sql)
+        st.write("params:", list(params))
+        st.write("driver:", DRIVER)
+        st.exception(e)  # shows exact sqlite3 error
+        return [], f"{type(e).__name__}: {e}"
+
+def safe_write(sql: str, params: Sequence[Any] = ()) -> Tuple[int, Optional[str]]:
+    try:
+        return exec_write(sql, params), None
+    except Exception as e:
+        st.error("SQL write failed")
+        st.code(sql)
+        st.write("params:", list(params))
+        st.write("driver:", DRIVER)
+        st.exception(e)
+        return 0, f"{type(e).__name__}: {e}"
 
 # -------------------------------
 # Schema helpers
@@ -185,7 +210,7 @@ def norm_py(s: str) -> str:
 # -------------------------------
 
 st.set_page_config(page_title="Vendors - Admin", layout="wide")
-st.title("Vendors - Admin (coalesced & normalized)")
+st.title("Vendors - Admin (coalesced & normalized + safe SQL)")
 
 with st.expander("Diagnostics / Tools (toggle)", expanded=False):
     st.write("Driver:", DRIVER)
@@ -200,33 +225,32 @@ with st.expander("Diagnostics / Tools (toggle)", expanded=False):
 
     # One-click coalesce legacy → snake_case when snake_case blank
     def coalesce_legacy_to_snake() -> Tuple[int, int]:
-        n1 = exec_write(
-            f'''
+        sql1 = f'''
             UPDATE "{VENDORS_TABLE}"
             SET category = TRIM(COALESCE(NULLIF(category,''), NULLIF("Category",'')))
             WHERE COALESCE(NULLIF("Category",''),'') <> ''
               AND (category IS NULL OR TRIM(category) = '');
-            '''
-        )
-        n2 = exec_write(
-            f'''
+        '''
+        sql2 = f'''
             UPDATE "{VENDORS_TABLE}"
             SET service = TRIM(COALESCE(NULLIF(service,''), NULLIF("Service",'')))
             WHERE COALESCE(NULLIF("Service",''),'') <> ''
               AND (service IS NULL OR TRIM(service) = '');
-            '''
-        )
-        exec_write(f'UPDATE "{VENDORS_TABLE}" SET category = TRIM(category) WHERE category IS NOT NULL;')
-        exec_write(f'UPDATE "{VENDORS_TABLE}" SET service  = TRIM(service)  WHERE service  IS NOT NULL;')
-        return n1, n2
+        '''
+        n1, e1 = safe_write(sql1)
+        n2, e2 = safe_write(sql2)
+        if not e1 and not e2:
+            safe_write(f'UPDATE "{VENDORS_TABLE}" SET category = TRIM(category) WHERE category IS NOT NULL;')
+            safe_write(f'UPDATE "{VENDORS_TABLE}" SET service  = TRIM(service)  WHERE service  IS NOT NULL;')
+        return n1, n2, e1 or e2
 
     if st.button("Coalesce legacy Category/Service → snake_case"):
-        try:
-            c_cat, c_srv = coalesce_legacy_to_snake()
+        c_cat, c_srv, err = coalesce_legacy_to_snake()
+        if err:
+            st.error(f"Coalesce encountered an error (details above).")
+        else:
             st.success(f"Coalesced rows — category: {c_cat}, service: {c_srv}.")
             st.rerun()
-        except Exception as e:
-            st.error(f"Coalesce failed: {type(e).__name__}: {e}")
 
 if not table_exists(VENDORS_TABLE):
     st.error(f'Table "{VENDORS_TABLE}" not found.')
@@ -240,6 +264,7 @@ if not KEY_COL and WITHOUT_ROWID:
 # Search & grid (use coalesced fields for Cat/Service)
 # -------------------------------
 
+# SELECT list: key + coalesced Category/Service + mapped others
 select_parts: List[str] = []
 if KEY_COL:
     select_parts.append(f'v."{KEY_COL}" AS key')
@@ -277,12 +302,17 @@ if qtext:
             params.append(like)
     sql += "\n  AND (" + "\n       OR ".join(where_bits) + ")"
 
+# Order by business name if available
 order_by = f'v."{MAPPING["Business Name"]}" COLLATE NOCASE' if "Business Name" in MAPPING else "key"
 sql += f"\nORDER BY {order_by} ASC\nLIMIT 500"
 
-rows = exec_query(sql, params)
+rows, err = safe_query(sql, params)
 cols_out = ["key"] + EXPECTED
-df = pd.DataFrame(rows, columns=cols_out)
+df = pd.DataFrame(rows, columns=cols_out) if rows else pd.DataFrame(columns=cols_out)
+
+if df.empty and err:
+    # We already showed exact error above; let the page continue without crashing.
+    st.stop()
 
 if df.empty:
     st.info("No vendors match your filter. Clear the search to see all.")
@@ -292,7 +322,7 @@ st.dataframe(df.drop(columns=["key"], errors="ignore"),
              use_container_width=True, hide_index=True)
 
 # -------------------------------
-# Distinct options with normalized compare
+# Distinct options with normalized compare (safe)
 # -------------------------------
 
 def distinct_options_category(limit: int = 500) -> List[str]:
@@ -306,7 +336,7 @@ def distinct_options_category(limit: int = 500) -> List[str]:
         ORDER BY raw COLLATE NOCASE ASC
         LIMIT {int(limit)}
     '''
-    rows = exec_query(sql)
+    rows, _ = safe_query(sql)
     seen = set()
     opts: List[str] = []
     for raw, norm in rows:
@@ -333,7 +363,7 @@ def distinct_options_service_for(category_value: str, limit: int = 500) -> List[
         ORDER BY raw COLLATE NOCASE ASC
         LIMIT {int(limit)}
     '''
-    rows = exec_query(sql, (norm_param,))
+    rows, _ = safe_query(sql, (norm_param,))
     seen = set()
     opts: List[str] = []
     for raw, norm in rows:
@@ -439,8 +469,8 @@ def insert_vendor(values: Dict[str, Any]) -> str:
         return "Nothing to insert: no mapped columns."
     placeholders = ", ".join(["?"] * len(vals_db))
     sql = f'INSERT INTO "{VENDORS_TABLE}" ({", ".join(cols_db)}) VALUES ({placeholders})'
-    n = exec_write(sql, vals_db)
-    return f"Inserted ({n})"
+    n, e = safe_write(sql, vals_db)
+    return f"Inserted ({n})" if not e else f"Insert error (see above)"
 
 def update_vendor(key: Any, values: Dict[str, Any]) -> str:
     cols_db, vals_db = values_to_db_params(values)
@@ -451,16 +481,16 @@ def update_vendor(key: Any, values: Dict[str, Any]) -> str:
         sql = f'UPDATE "{VENDORS_TABLE}" SET {sets} WHERE "{KEY_COL}"=?'
     else:
         sql = f'UPDATE "{VENDORS_TABLE}" SET {sets} WHERE rowid=?'
-    n = exec_write(sql, vals_db + [key])
-    return f"Updated ({n})"
+    n, e = safe_write(sql, vals_db + [key])
+    return f"Updated ({n})" if not e else f"Update error (see above)"
 
 def delete_vendor(key: Any) -> str:
     if KEY_COL:
         sql = f'DELETE FROM "{VENDORS_TABLE}" WHERE "{KEY_COL}"=?'
     else:
         sql = f'DELETE FROM "{VENDORS_TABLE}" WHERE rowid=?'
-    n = exec_write(sql, (key,))
-    return f"Deleted ({n})"
+    n, e = safe_write(sql, (key,))
+    return f"Deleted ({n})" if not e else f"Delete error (see above)"
 
 # -------------------------------
 # Forms (STRICT Category→Service)
