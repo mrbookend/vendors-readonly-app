@@ -299,9 +299,9 @@ else:
         "Category":      st.column_config.TextColumn("Category",      width="small"),
         "Service":       st.column_config.TextColumn("Service",       width="small"),
         "Phone":         st.column_config.TextColumn("Phone",         width="small"),
-        "Address":       st.column_config.TextColumn("Address",       width="large"),
-        "Notes":         st.column_config.TextColumn("Notes",         width="large"),
-        "Keywords":      st.column_config.TextColumn("Keywords",      width="large"),
+        "Address":       st.column_config.TextColumn("Address",       width="medium"),
+        "Notes":         st.column_config.TextColumn("Notes",         width="medium"),
+        "Keywords":      st.column_config.TextColumn("Keywords",      width="small"),
     }
     if "Website" in show.columns:
         # Note: LinkColumn's display_text is global, not per-row; we leave the URL visible or use a fixed label.
