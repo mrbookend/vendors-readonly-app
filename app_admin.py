@@ -184,10 +184,9 @@ display_df = df.drop(columns=_cols_to_hide, errors="ignore") if _cols_to_hide el
 
 st.dataframe(display_df, use_container_width=True, hide_index=True)
 
-
-    options = ["New vendor..."] + [f"{r[1]} - {r[2]}" for r in rows]
-    pick_ix = st.selectbox("Select to edit", range(len(options)), index=0, format_func=lambda i: options[i])
-    vid = None if pick_ix == 0 else rows[pick_ix - 1][0]
+options = ["New vendor..."] + [f"{r[1]} - {r[2]}" for r in rows]
+pick_ix = st.selectbox("Select to edit", range(len(options)), index=0, format_func=lambda i: options[i])
+vid = None if pick_ix == 0 else rows[pick_ix - 1][0]
 
 current = (
     one(
