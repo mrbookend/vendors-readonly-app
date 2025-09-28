@@ -1,26 +1,5 @@
-.streamlit/
-
-# --- local/dev only ---
-.streamlit/
 .venv/
 __pycache__/
-*.pyc
-
-# caches & sqlite sidecars
-.libsql_cache/
-vendors_admin_cache.db*
 *.db-shm
 *.db-wal
-*.db-info
-
-# dumps/backups/temp
-vendors_dump.sql
-*.bak
-*.broken.*
-
-# editors
-.vscode/
-.idea/
-.DS_Store
-.streamlit/
-.streamlit/
+vendors.backup-*.db
