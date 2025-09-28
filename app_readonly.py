@@ -236,12 +236,12 @@ def load_vendors_df(q: str = "", use_fts: bool = False,
 # We clip text to this character count and add an ellipsis when needed.
 CHAR_WIDTHS: Dict[str, int] = {
     "Business Name": 36,
-    "Category": 18,
-    "Service": 24,
-    "Phone": 18,
-    "Address": 60,
-    "Notes": 120,
-    "Keywords": 80,
+    "Category": 30,
+    "Service": 30,
+    "Phone": 24,
+    "Address": 40,
+    "Notes": 36,
+    "Keywords": 10,
     # Note: "Website" is a hyperlink column; character clipping is not applied to it.
 }
 
