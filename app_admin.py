@@ -148,6 +148,11 @@ def ensure_normalized_schema(conn: sqlite3.Connection) -> None:
 
 
 def has_normalized(conn: sqlite3.Connection) -> bool:
+    """Return True only if vendors has foreign-key columns AND taxonomy tables exist."""
+    if not (table_exists(conn, "vendors") and table_exists(conn, "categories") and table_exists(conn, "services")):
+        return False
+    return column_exists(conn, "vendors", "category_id") and column_exists(conn, "vendors", "service_id")
+
     return table_exists(conn, "vendors") and table_exists(conn, "categories") and table_exists(conn, "services")
 
 
@@ -190,15 +195,18 @@ def upsert_service(conn: sqlite3.Connection, category_id: int, name: str) -> int
 
 def fetch_vendors_sorted(conn: sqlite3.Connection, include_inactive: bool = False) -> pd.DataFrame:
     """Return vendors sorted by Category asc, Service asc, Business asc.
-    Works in normalized mode, falls back to legacy flat table. Tolerates
-    partial/older normalized schemas missing `is_active`, `created_at`,
-    or `updated_at` by probing columns and adapting the SELECT/WHERE.
+    Chooses normalized path only if vendors.category_id & vendors.service_id exist.
+    Tolerates older normalized variants missing is_active/created_at/updated_at.
+    Also tolerates `business` vs `business_name` column naming.
     """
-    if has_normalized(conn):
-        # Probe optional columns safely
+    normalized = has_normalized(conn)
+
+    if normalized:
+        # Probe vendor columns
         has_is_active = column_exists(conn, "vendors", "is_active")
         has_created = column_exists(conn, "vendors", "created_at")
         has_updated = column_exists(conn, "vendors", "updated_at")
+        vb_col = "business_name" if column_exists(conn, "vendors", "business_name") else ("business" if column_exists(conn, "vendors", "business") else None)
 
         where = ""
         if has_is_active and not include_inactive:
@@ -208,27 +216,23 @@ def fetch_vendors_sorted(conn: sqlite3.Connection, include_inactive: bool = Fals
             "v.id as ID",
             "c.name AS Category",
             "s.name AS Service",
-            "v.business_name AS 'Business Name'",
-            "COALESCE(v.contact_name,'') AS 'Contact Name'",
-            "COALESCE(v.phone,'') AS Phone",
-            "COALESCE(v.address,'') AS Address",
-            "COALESCE(v.notes,'') AS Notes",
-            "COALESCE(v.website,'') AS Website",
         ]
-        # Optional fields
-        if has_is_active:
-            select_bits.append("COALESCE(v.is_active,1) AS Active")
+        if vb_col:
+            select_bits.append(f"v.{vb_col} AS 'Business Name'")
         else:
-            select_bits.append("1 AS Active")
-        if has_created:
-            select_bits.append("COALESCE(v.created_at,'') AS Created")
-        else:
-            select_bits.append("'' AS Created")
-        if has_updated:
-            select_bits.append("COALESCE(v.updated_at,'') AS Updated")
-        else:
-            select_bits.append("'' AS Updated")
+            select_bits.append("'' AS 'Business Name'")
+        select_bits += [
+            "COALESCE(v.contact_name,'') AS 'Contact Name'" if column_exists(conn, "vendors", "contact_name") else "'' AS 'Contact Name'",
+            "COALESCE(v.phone,'') AS Phone" if column_exists(conn, "vendors", "phone") else "'' AS Phone",
+            "COALESCE(v.address,'') AS Address" if column_exists(conn, "vendors", "address") else "'' AS Address",
+            "COALESCE(v.notes,'') AS Notes" if column_exists(conn, "vendors", "notes") else "'' AS Notes",
+            "COALESCE(v.website,'') AS Website" if column_exists(conn, "vendors", "website") else "'' AS Website",
+        ]
+        select_bits.append("COALESCE(v.is_active,1) AS Active" if has_is_active else "1 AS Active")
+        select_bits.append("COALESCE(v.created_at,'') AS Created" if has_created else "'' AS Created")
+        select_bits.append("COALESCE(v.updated_at,'') AS Updated" if has_updated else "'' AS Updated")
 
+        order_business = f", v.{vb_col} ASC" if vb_col else ""
         sql = f"""
             SELECT
                 {', '.join(select_bits)}
@@ -236,27 +240,41 @@ def fetch_vendors_sorted(conn: sqlite3.Connection, include_inactive: bool = Fals
             LEFT JOIN categories c ON c.id = v.category_id
             LEFT JOIN services   s ON s.id = v.service_id
             {where}
-            ORDER BY c.name ASC, s.name ASC, v.business_name ASC
+            ORDER BY c.name ASC, s.name ASC{order_business}
         """
     else:
-        sql = """
-            SELECT
-                rowid as ID,
-                COALESCE(category,'') AS Category,
-                COALESCE(service,'') AS Service,
-                COALESCE(business_name, business,'') AS "Business Name",
-                COALESCE(contact_name,'') AS "Contact Name",
-                COALESCE(phone,'') AS Phone,
-                COALESCE(address,'') AS Address,
-                COALESCE(notes,'') AS Notes,
-                COALESCE(website,'') AS Website
-            FROM vendors
-            ORDER BY Category ASC, Service ASC, "Business Name" ASC
-        """
+        # Legacy flat vendors table path
+        # Try to discover likely column names for business/contact/etc
+        vb_col = "business_name" if column_exists(conn, "vendors", "business_name") else ("business" if column_exists(conn, "vendors", "business") else None)
+        cat_txt = "category" if column_exists(conn, "vendors", "category") else None
+        svc_txt = "service" if column_exists(conn, "vendors", "service") else None
+
+        select_bits = [
+            "rowid as ID",
+            f"COALESCE({cat_txt},'') AS Category" if cat_txt else "'' AS Category",
+            f"COALESCE({svc_txt},'') AS Service" if svc_txt else "'' AS Service",
+            f"COALESCE({vb_col},'') AS 'Business Name'" if vb_col else "'' AS 'Business Name'",
+        ]
+        for name, alias in [
+            ("contact_name", "Contact Name"),
+            ("phone", "Phone"),
+            ("address", "Address"),
+            ("notes", "Notes"),
+            ("website", "Website"),
+        ]:
+            select_bits.append(f"COALESCE({name},'') AS '{alias}'" if column_exists(conn, "vendors", name) else f"'' AS '{alias}'")
+
+        order_bits = []
+        if cat_txt: order_bits.append("Category ASC")
+        if svc_txt: order_bits.append("Service ASC")
+        if vb_col: order_bits.append("'Business Name' ASC")
+        order_clause = (" ORDER BY " + ", ".join(order_bits)) if order_bits else ""
+
+        sql = f"SELECT {', '.join(select_bits)} FROM vendors{order_clause}"
 
     df = pd.read_sql_query(sql, conn)
 
-    # Defensive post-sort
+    # Defensive post-sort in Python (stable mergesort)
     sort_cols = [c for c in ["Category", "Service", "Business Name"] if c in df.columns]
     if sort_cols:
         df = df.sort_values(sort_cols, kind="mergesort", ignore_index=True)
