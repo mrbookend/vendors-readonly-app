@@ -16,10 +16,17 @@ from sqlalchemy.engine import Engine
 st.set_page_config(page_title="Vendors Admin", layout="wide")
 
 # ========= Secrets / Config =========
-LIBSQL_URL = st.secrets.get("LIBSQL_URL") or os.getenv("LIBSQL_URL") \
-             or os.getenv("TURSO_DATABASE_URL")
-LIBSQL_AUTH_TOKEN = st.secrets.get("LIBSQL_AUTH_TOKEN") or os.getenv("LIBSQL_AUTH_TOKEN") \
-                    or os.getenv("TURSO_AUTH_TOKEN")
+# Accept common env names as well (TURSO_*).
+LIBSQL_URL = (
+    st.secrets.get("LIBSQL_URL")
+    or os.getenv("LIBSQL_URL")
+    or os.getenv("TURSO_DATABASE_URL")
+)
+LIBSQL_AUTH_TOKEN = (
+    st.secrets.get("LIBSQL_AUTH_TOKEN")
+    or os.getenv("LIBSQL_AUTH_TOKEN")
+    or os.getenv("TURSO_AUTH_TOKEN")
+)
 VENDORS_DB_PATH = st.secrets.get("VENDORS_DB_PATH") or os.getenv("VENDORS_DB_PATH") or "vendors.db"
 ADMIN_PASSWORD = st.secrets.get("ADMIN_PASSWORD") or os.getenv("ADMIN_PASSWORD") or "ADMIN"
 
