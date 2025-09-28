@@ -260,7 +260,7 @@ else:
         "Category":      st.column_config.TextColumn("Category",      width="medium"),
         "Phone":         st.column_config.TextColumn("Phone",         width="medium"),
         "Address":       st.column_config.TextColumn("Address",       width="large"),
-        "Notes":         st.column_config.TextColumn("Notes",         width="medium"),
+        "Notes":         st.column_config.TextColumn("Notes",         width="small"),
     }
     if "Website" in show.columns:
         col_cfg["Website"] = st.column_config.LinkColumn("Website", help="Open in new tab", width="small")
