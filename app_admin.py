@@ -1,7 +1,7 @@
-# app_admin.py — Vendors Admin (single-table; robust mapping; strict Category→Service filtering)
+# app_admin.py — Vendors Admin (single-table; robust mapping; canonical snake_case; strict Category→Service filtering)
 # One table: vendors
-# Logical fields the UI expects (physical names can vary; auto-mapped by data density):
-#   Category, Service, Business Name, Contact Name, Phone, Address, URL, Notes, Keywords, Website
+# UI-friendly fields (physical names can vary; auto-mapped): Category, Service, Business Name, Contact Name, Phone,
+# Address, URL, Notes, Keywords, Website
 
 import os
 from typing import Any, Dict, List, Optional, Sequence, Tuple
@@ -80,7 +80,7 @@ def detect_key_col(table: str) -> Optional[str]:
     return None
 
 # -------------------------------
-# Mapping config (candidates) — include common variants
+# Candidate names & robust resolver
 # -------------------------------
 
 EXPECTED = [
@@ -88,7 +88,7 @@ EXPECTED = [
     "Address", "URL", "Notes", "Keywords", "Website",
 ]
 
-# Order here is only a hint; robust resolver will choose the candidate with the most non-empty rows.
+# Prefer snake_case first; robust resolver will still pick the column with most data.
 CANDIDATES: Dict[str, List[str]] = {
     "Category":      ["category", "Category", "cat"],
     "Service":       ["service", "Service", "svc"],
@@ -106,7 +106,7 @@ def resolve_mapping(table: str) -> Dict[str, str]:
     """
     Data-aware resolver:
       For each friendly field, consider all candidate columns that exist.
-      Choose the one with the most non-empty values (TRIM(col)<>''), so we map to where the data actually is.
+      Choose the one with the most non-empty values (TRIM(col)<>''), i.e., where the data actually is.
       Falls back to the first present candidate if counts tie or all are empty.
     """
     if not table_exists(table):
@@ -136,14 +136,20 @@ MAPPING = resolve_mapping(VENDORS_TABLE)
 KEY_COL = detect_key_col(VENDORS_TABLE)
 WITHOUT_ROWID = has_without_rowid(VENDORS_TABLE)
 
+# Force canonical mapping to snake_case if those columns exist.
+cols_set = set(get_table_columns(VENDORS_TABLE)) if table_exists(VENDORS_TABLE) else set()
+for friendly, canonical in [("Category", "category"), ("Service", "service")]:
+    if canonical in cols_set:
+        MAPPING[friendly] = canonical
+
 # -------------------------------
 # Streamlit UI
 # -------------------------------
 
 st.set_page_config(page_title="Vendors - Admin", layout="wide")
-st.title("Vendors - Admin (single-table, robust mapping)")
+st.title("Vendors - Admin (single-table, robust snake_case mapping)")
 
-with st.expander("Diagnostics (toggle)", expanded=False):
+with st.expander("Diagnostics / Tools (toggle)", expanded=False):
     st.write("Driver:", DRIVER)
     st.write("Using table:", VENDORS_TABLE)
     st.write("Mapping (friendly → actual):", MAPPING)
@@ -153,6 +159,39 @@ with st.expander("Diagnostics (toggle)", expanded=False):
         st.warning("Category not mapped — Service list will remain empty (by design).")
     if not MAPPING.get("Service"):
         st.warning("Service not mapped — Service list cannot populate.")
+
+    # One-click coalesce: copy legacy "Category"/"Service" into snake_case where snake_case is blank
+    def coalesce_legacy_to_snake() -> Tuple[int, int]:
+        n1 = exec_write(
+            f'''
+            UPDATE "{VENDORS_TABLE}"
+            SET category = TRIM(COALESCE(NULLIF(category,''), NULLIF("Category",'')))
+            WHERE COALESCE(NULLIF("Category",''),'') <> ''
+              AND (category IS NULL OR TRIM(category) = '');
+            '''
+        )
+        n2 = exec_write(
+            f'''
+            UPDATE "{VENDORS_TABLE}"
+            SET service = TRIM(COALESCE(NULLIF(service,''), NULLIF("Service",'')))
+            WHERE COALESCE(NULLIF("Service",''),'') <> ''
+              AND (service IS NULL OR TRIM(service) = '');
+            '''
+        )
+        # Normalize whitespace
+        exec_write(f'UPDATE "{VENDORS_TABLE}" SET category = TRIM(category) WHERE category IS NOT NULL;')
+        exec_write(f'UPDATE "{VENDORS_TABLE}" SET service  = TRIM(service)  WHERE service  IS NOT NULL;')
+        return n1, n2
+
+    st.markdown("**Data repair:** If some rows only populated legacy columns (\"Category\"/\"Service\"), coalesce them:")
+    if st.button("Coalesce legacy Category/Service → snake_case"):
+        try:
+            c_cat, c_srv = coalesce_legacy_to_snake()
+            st.success(f"Coalesced rows — category: {c_cat}, service: {c_srv}.")
+            st.caption("If Services still look empty for a chosen Category, reload and try again.")
+            st.rerun()
+        except Exception as e:
+            st.error(f"Coalesce failed: {type(e).__name__}: {e}")
 
 if not table_exists(VENDORS_TABLE):
     st.error(f'Table "{VENDORS_TABLE}" not found.')
