@@ -1,10 +1,8 @@
-# app_admin.py — Vendors Admin (DB-derived Service options; Python normalization; safe SQL)
-# - Single vendors table
-# - Distinct (Category, Service) pairs loaded with simple SQL
-# - Category→Service map built in Python with robust normalization
-# - Writes to snake_case (category/service) when present
-# - Safe SQL debug everywhere
-# - One-click coalesce legacy TitleCase → snake_case
+# app_admin.py — Vendors Admin
+# Fix: Category selection moved OUTSIDE forms so Service options update immediately.
+# Robust Category→Service mapping from DB (distinct pairs); Python normalization.
+# Automatic fallback: if no services found for selected category, show ALL services (with a warning).
+# Safe SQL debug, snake_case writes, and a coalesce button for legacy columns.
 
 import os
 from typing import Any, Dict, List, Optional, Sequence, Tuple
@@ -204,7 +202,7 @@ def norm_loose_py(s: Any) -> str:
 # -------------------------------
 
 st.set_page_config(page_title="Vendors - Admin", layout="wide")
-st.title("Vendors - Admin (DB-derived services; Python-normalized)")
+st.title("Vendors - Admin")
 
 with st.expander("Diagnostics / Tools (toggle)", expanded=False):
     st.write("Driver:", DRIVER)
@@ -311,11 +309,12 @@ st.dataframe(df.drop(columns=["key"], errors="ignore"),
 # Build Category→Service options DIRECTLY from DB (not from grid / not filtered)
 # -------------------------------
 
-def load_category_service_pairs() -> Tuple[Dict[str, List[str]], List[str]]:
+def load_category_service_pairs() -> Tuple[Dict[str, List[str]], List[str], List[str]]:
     """
     Returns:
       - services_by_key: dict of normalized category key -> sorted service list
       - category_display_options: canonical display list for categories (sorted)
+      - all_services: ALL distinct services across DB (sorted)
     """
     sql_pairs = f'''
         SELECT DISTINCT c, s FROM (
@@ -326,9 +325,11 @@ def load_category_service_pairs() -> Tuple[Dict[str, List[str]], List[str]]:
           AND s IS NOT NULL AND TRIM(s) <> '';
     '''
     rows, _ = safe_query(sql_pairs)
-    # Build normalization + display preference
+
     disp_counts: Dict[str, Counter] = defaultdict(Counter)  # key -> Counter(display->count)
     svc_map: Dict[str, set] = defaultdict(set)             # key -> set(services)
+    all_services_set: set = set()
+
     for c, s in rows:
         cd = (str(c) if c is not None else "").strip()
         sd = (str(s) if s is not None else "").strip()
@@ -337,8 +338,8 @@ def load_category_service_pairs() -> Tuple[Dict[str, List[str]], List[str]]:
         key = norm_loose_py(cd)
         disp_counts[key][cd] += 1
         svc_map[key].add(sd)
+        all_services_set.add(sd)
 
-    # pick canonical category display per key: highest count, then shortest, then alpha
     def pick_display(cnt: Counter) -> str:
         if not cnt:
             return ""
@@ -350,27 +351,28 @@ def load_category_service_pairs() -> Tuple[Dict[str, List[str]], List[str]]:
     services_by_key: Dict[str, List[str]] = {
         k: sorted(list(v), key=lambda s: s.upper())
         for k, v in svc_map.items()
-        if k  # non-empty key
+        if k
     }
     category_display = [pick_display(cnt) for k, cnt in disp_counts.items() if k]
     category_display = sorted([c for c in category_display if c], key=lambda s: s.upper())
-    return services_by_key, category_display
+    all_services = sorted(list(all_services_set), key=lambda s: s.upper())
+    return services_by_key, category_display, all_services
 
-SERVICES_BY_KEY, CATEGORY_OPTIONS = load_category_service_pairs()
+SERVICES_BY_KEY, CATEGORY_OPTIONS, ALL_SERVICES = load_category_service_pairs()
 
 with st.expander("Category/Service diagnostics", expanded=False):
     st.write(f"Categories found: {len(CATEGORY_OPTIONS)}")
     sample = ", ".join(CATEGORY_OPTIONS[:12]) + (" …" if len(CATEGORY_OPTIONS) > 12 else "")
     st.caption(f"Sample categories: {sample}")
-    # count total pairs
     total_pairs = sum(len(v) for v in SERVICES_BY_KEY.values())
     st.write(f"Distinct (Category, Service) pairs: {total_pairs}")
+    st.write(f"All distinct services: {len(ALL_SERVICES)}")
 
 # -------------------------------
-# UI helpers (category/service from DB-derived map)
+# Category & Service selectors OUTSIDE forms (so they cause reruns)
 # -------------------------------
 
-def select_or_text_category(current: str = "") -> str:
+def category_selector(prefix: str, current: str = "") -> str:
     base = ["(blank)"] + CATEGORY_OPTIONS + ["(custom…)"]
     cur = (current or "").strip()
     default = "(blank)" if not cur else (cur if cur in CATEGORY_OPTIONS else "(custom…)")
@@ -378,39 +380,49 @@ def select_or_text_category(current: str = "") -> str:
         idx = base.index(default)
     except ValueError:
         idx = 0
-    choice = st.selectbox("Category", options=base, index=idx, key="Category_select")
-    if choice == "(custom…)":
-        return st.text_input("Category (custom)", value=(cur if default == "(custom…)" else ""))
-    elif choice == "(blank)":
+    sel = st.selectbox(f"{prefix} — Category", options=base, index=idx, key=f"{prefix}_cat_sel")
+    if sel == "(custom…)":
+        return st.text_input(f"{prefix} — Category (custom)", value=(cur if default == "(custom…)" else ""), key=f"{prefix}_cat_custom")
+    elif sel == "(blank)":
         return ""
     else:
-        return choice
+        return sel
 
 def services_for_category(category_value: str) -> List[str]:
     key = norm_loose_py(category_value)
     return SERVICES_BY_KEY.get(key, [])
 
-def select_or_text_service(current: str, category_value: str) -> str:
+def service_selector(prefix: str, category_value: str, current: str = "") -> str:
     cur = (current or "").strip()
     opts = []
     if category_value and category_value not in ("(blank)", "(custom…)"):
         opts = services_for_category(category_value)
+
+    # Auto-fallback to ALL services if none found for the chosen category
+    used_all = False
+    if not opts and category_value:
+        opts = ALL_SERVICES
+        used_all = True
+
     base = ["(blank)"] + opts + ["(custom…)"]
     default = "(blank)" if not cur else (cur if cur in opts else "(custom…)")
     try:
         idx = base.index(default)
     except ValueError:
         idx = 0
-    choice = st.selectbox("Service", options=base, index=idx, key="Service_select")
-    if choice == "(custom…)":
-        return st.text_input("Service (custom)", value=(cur if default == "(custom…)" else ""))
-    elif choice == "(blank)":
+
+    sel = st.selectbox(f"{prefix} — Service", options=base, index=idx, key=f"{prefix}_srv_sel")
+    if used_all and category_value not in ("", "(blank)"):
+        st.warning("No services matched that Category. Showing ALL services as a fallback.")
+    if sel == "(custom…)":
+        return st.text_input(f"{prefix} — Service (custom)", value=(cur if default == "(custom…)" else ""), key=f"{prefix}_srv_custom")
+    elif sel == "(blank)":
         return ""
     else:
-        return choice
+        return sel
 
 # -------------------------------
-# Selection label (grid)
+# Picker from grid
 # -------------------------------
 
 def make_label(row: pd.Series) -> str:
@@ -437,7 +449,7 @@ if choice != "New vendor...":
             selected_row = m.iloc[0]
 
 # -------------------------------
-# CRUD (writes to snake_case when available)
+# CRUD helpers (writes to snake_case when available)
 # -------------------------------
 
 def values_to_db_params(values: Dict[str, Any]) -> Tuple[List[str], List[Any]]:
@@ -485,73 +497,106 @@ def delete_vendor(key: Any) -> str:
     return f"Deleted ({n})" if not e else "Delete error (see above)"
 
 # -------------------------------
-# Forms (Category→Service from DB-derived map)
+# Add / Edit flows
 # -------------------------------
 
 st.markdown("---")
 
-def render_inputs(init: Dict[str, Any]) -> Dict[str, Any]:
-    c1, c2 = st.columns(2)
-    with c1:
-        v_category = select_or_text_category(init.get("Category", ""))
-        v_service  = select_or_text_service(init.get("Service", ""), v_category)
-        v_biz      = st.text_input("Business Name", value=init.get("Business Name", ""))
-        v_contact  = st.text_input("Contact Name",  value=init.get("Contact Name", ""))
-        v_phone    = st.text_input("Phone",         value=init.get("Phone", ""))
-    with c2:
-        v_address  = st.text_area ("Address",  value=init.get("Address", ""),  height=80)
-        v_url      = st.text_input("URL",      value=init.get("URL", ""))
-        v_website  = st.text_input("Website",  value=init.get("Website", ""))
-        v_keywords = st.text_input("Keywords", value=init.get("Keywords", ""))
-        v_notes    = st.text_area ("Notes",    value=init.get("Notes", ""),    height=80)
-
-    # Inline diagnostics for your selection
-    if v_category:
-        found = services_for_category(v_category)
-        st.caption(f"Services for '{v_category}': {len(found)} — {', '.join(found[:12])}{' …' if len(found) > 12 else ''}")
-
-    return {
-        "Category": v_category,
-        "Service": v_service,
-        "Business Name": v_biz,
-        "Contact Name": v_contact,
-        "Phone": v_phone,
-        "Address": v_address,
-        "URL": v_url,
-        "Website": v_website,
-        "Keywords": v_keywords,
-        "Notes": v_notes,
-    }
-
 if selected_row is None:
     st.subheader("Add a new vendor")
+
+    # Category selection OUTSIDE the form (causes rerun)
+    add_cat = category_selector("New", current="")
+    # Service selection OUTSIDE the form, based on chosen category
+    add_srv = service_selector("New", category_value=add_cat, current="")
+
     with st.form("add_vendor"):
-        vals = render_inputs({})
+        v_biz      = st.text_input("Business Name", value="")
+        v_contact  = st.text_input("Contact Name",  value="")
+        v_phone    = st.text_input("Phone",         value="")
+
+        c1, c2 = st.columns(2)
+        with c1:
+            v_address  = st.text_area ("Address",  value="", height=80)
+            v_url      = st.text_input("URL",      value="")
+        with c2:
+            v_website  = st.text_input("Website",  value="")
+            v_keywords = st.text_input("Keywords", value="")
+            v_notes    = st.text_area ("Notes",    value="", height=80)
+
         submitted = st.form_submit_button("Add Vendor")
         if submitted:
-            if "Business Name" in MAPPING and not (vals.get("Business Name") or "").strip():
+            if "Business Name" in MAPPING and not v_biz.strip():
                 st.error("Business Name is required.")
             else:
+                vals = {
+                    "Category": add_cat,
+                    "Service": add_srv,
+                    "Business Name": v_biz,
+                    "Contact Name": v_contact,
+                    "Phone": v_phone,
+                    "Address": v_address,
+                    "URL": v_url,
+                    "Website": v_website,
+                    "Keywords": v_keywords,
+                    "Notes": v_notes,
+                }
                 msg = insert_vendor(vals)
                 st.success(msg)
                 st.rerun()
+
 else:
     st.subheader("Edit vendor")
     key_val = selected_row["key"]
-    init_vals = {k: selected_row.get(k, "") for k in EXPECTED}
+
+    # Pre-fill current values
+    cur_cat = (selected_row.get("Category") or "").strip()
+    cur_srv = (selected_row.get("Service") or "").strip()
+
+    # Category OUTSIDE the form (causes rerun and refreshes Service list)
+    edit_cat = category_selector("Edit", current=cur_cat)
+    # Service OUTSIDE the form based on chosen category
+    edit_srv = service_selector("Edit", category_value=edit_cat, current=cur_srv)
+
     with st.form("edit_vendor"):
-        vals = render_inputs(init_vals)
+        v_biz      = st.text_input("Business Name", value=(selected_row.get("Business Name") or ""))
+        v_contact  = st.text_input("Contact Name",  value=(selected_row.get("Contact Name") or ""))
+        v_phone    = st.text_input("Phone",         value=(selected_row.get("Phone") or ""))
+
+        c1, c2 = st.columns(2)
+        with c1:
+            v_address  = st.text_area ("Address",  value=(selected_row.get("Address") or ""), height=80)
+            v_url      = st.text_input("URL",      value=(selected_row.get("URL") or ""))
+        with c2:
+            v_website  = st.text_input("Website",  value=(selected_row.get("Website") or ""))
+            v_keywords = st.text_input("Keywords", value=(selected_row.get("Keywords") or ""))
+            v_notes    = st.text_area ("Notes",    value=(selected_row.get("Notes") or ""), height=80)
+
         delete_confirmed = st.checkbox("Yes, permanently delete this vendor.")
-        c1, c2 = st.columns([1,1])
-        do_update = c1.form_submit_button("Update")
-        do_delete = c2.form_submit_button("Delete")
+        c3, c4 = st.columns([1,1])
+        do_update = c3.form_submit_button("Update")
+        do_delete = c4.form_submit_button("Delete")
+
         if do_update:
-            if "Business Name" in MAPPING and not (vals.get("Business Name") or "").strip():
+            if "Business Name" in MAPPING and not v_biz.strip():
                 st.error("Business Name is required.")
             else:
+                vals = {
+                    "Category": edit_cat,
+                    "Service": edit_srv,
+                    "Business Name": v_biz,
+                    "Contact Name": v_contact,
+                    "Phone": v_phone,
+                    "Address": v_address,
+                    "URL": v_url,
+                    "Website": v_website,
+                    "Keywords": v_keywords,
+                    "Notes": v_notes,
+                }
                 msg = update_vendor(key_val, vals)
                 st.success(msg)
                 st.rerun()
+
         if do_delete:
             if not delete_confirmed:
                 st.warning("Check the confirmation box above, then click Delete.")
