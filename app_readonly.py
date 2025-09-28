@@ -245,9 +245,9 @@ else:
 
     # Column order: Website immediately AFTER Address
     desired_order = [
-        "Business Name", "Category", "Phone",
+        "Business Name",  "Phone",
         "Address", "Website",  # Website directly after Address
-        "Notes",
+        "Notes", "Category",
         # Service/Keywords intentionally left out
     ]
     cols = [c for c in desired_order if c in clipped.columns]
