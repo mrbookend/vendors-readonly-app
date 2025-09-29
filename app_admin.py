@@ -1,3 +1,10 @@
+# app_admin.py
+# Vendors Admin — Turso (libSQL) first, SQLite fallback.
+# SQLAlchemy engine, safe params, category→service flow, phone/URL normalization,
+# optional Keywords support (only if vendors.keywords exists).
+
+from __future__ import annotations
+
 import os
 import re
 from typing import List, Tuple, Dict, Optional
@@ -746,4 +753,3 @@ elif page == "Categories & Services Admin":
             else:
                 st.info("No services found.")
 # EOF
-PY
