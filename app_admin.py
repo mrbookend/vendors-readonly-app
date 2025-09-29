@@ -199,6 +199,20 @@ def normalize_and_validate_url(raw: str) -> tuple[str, bool, str]:
         return s, False, "URL must include a valid host (e.g., example.com)."
     return s, True, ""
 
+def normalize_keywords_input(raw: str) -> str:
+    """Accept comma or spaces as separators; return comma+space joined unique tokens."""
+    if not raw:
+        return ""
+    tokens = [t.strip() for t in re.split(r"[,\s]+", raw) if t.strip()]
+    # Keep order, drop dups
+    seen = {}
+    out = []
+    for t in tokens:
+        if t.lower() not in seen:
+            seen[t.lower()] = True
+            out.append(t)
+    return ", ".join(out)
+
 # ========= Vendors data (list/detail) =========
 def load_vendors_df() -> pd.DataFrame:
     if SCHEMA["uses_cat_id"]:
@@ -379,53 +393,6 @@ def update_vendor(vendor_id: int, payload: Dict) -> None:
 def delete_vendor(vendor_id: int) -> None:
     run_exec("DELETE FROM vendors WHERE id = :id;", {"id": vendor_id})
 
-# ========= Categories/Services admin =========
-def rename_category(old_name: str, new_name: str) -> None:
-    new_name = new_name.strip()
-    if SCHEMA["has_categories_table"] and SCHEMA["uses_cat_id"]:
-        run_exec("UPDATE OR IGNORE categories SET name = :n WHERE name = :o;", {"n": new_name, "o": old_name})
-    elif SCHEMA["uses_cat_text"]:
-        run_exec("UPDATE vendors SET category = :n WHERE category = :o;", {"n": new_name, "o": old_name})
-
-def rename_service(old_name: str, new_name: str) -> None:
-    new_name = new_name.strip()
-    if SCHEMA["has_categories_table"] and SCHEMA["uses_svc_id"]:
-        run_exec("UPDATE OR IGNORE services SET name = :n WHERE name = :o;", {"n": new_name, "o": old_name})
-    elif SCHEMA["uses_svc_text"]:
-        run_exec("UPDATE vendors SET service = :n WHERE service = :o;", {"n": new_name, "o": old_name})
-
-def delete_category_val(name: str) -> Tuple[bool, str]:
-    if SCHEMA["has_categories_table"] and SCHEMA["uses_cat_id"]:
-        n = query_scalar(
-            "SELECT COUNT(*) FROM vendors v JOIN categories c ON v.category_id=c.id WHERE c.name=:n;", {"n": name}
-        )
-        if n:
-            return False, f"Cannot delete '{name}': it is in use by {n} vendor(s)."
-        run_exec("DELETE FROM categories WHERE name=:n;", {"n": name})
-        return True, f"Deleted category '{name}'."
-    elif SCHEMA["uses_cat_text"]:
-        n = query_scalar("SELECT COUNT(*) FROM vendors WHERE category=:n;", {"n": name})
-        if n:
-            return False, f"Cannot delete '{name}': it is in use by {n} vendor(s)."
-        return True, f"'{name}' removed from catalog view."
-    return False, "Category storage not found."
-
-def delete_service_val(name: str) -> Tuple[bool, str]:
-    if SCHEMA["has_categories_table"] and SCHEMA["uses_svc_id"]:
-        n = query_scalar(
-            "SELECT COUNT(*) FROM vendors v JOIN services s ON v.service_id=s.id WHERE s.name=:n;", {"n": name}
-        )
-        if n:
-            return False, f"Cannot delete '{name}': it is in use by {n} vendor(s)."
-        run_exec("DELETE FROM services WHERE name=:n;", {"n": name})
-        return True, f"Deleted service '{name}'."
-    elif SCHEMA["uses_svc_text"]:
-        n = query_scalar("SELECT COUNT(*) FROM vendors WHERE service=:n;", {"n": name})
-        if n:
-            return False, f"Cannot delete '{name}': it is in use by {n} vendor(s)."
-        return True, f"'{name}' removed from catalog view."
-    return False, "Service storage not found."
-
 # ========= Auth gate (Enter submits) =========
 if "auth_ok" not in st.session_state:
     st.session_state.auth_ok = False
@@ -458,7 +425,7 @@ with st.expander("Database Status & Schema (debug)"):
     counts = {
         "vendors": query_scalar("SELECT COUNT(*) FROM vendors;") or 0,
         "categories": query_scalar("SELECT COUNT(*) FROM categories;") if table_exists("categories") else None,
-        "services": query_scalar("SELECT COUNT(*) FROM services;") if table_exists("services") else None,
+        "services": query_scalar("SELECT COUNT(*) FROM services") if table_exists("services") else None,
     }
     st.write({
         "db_source": DB_SOURCE,
@@ -491,60 +458,79 @@ if page == "View":
 
 elif page == "Add":
     st.header("Add Vendor")
-    with st.form("add_vendor_form", clear_on_submit=True):
-        col1, col2 = st.columns(2)
+    # LIVE INPUTS (no st.form) so the button can enable/disable as you type.
 
-        with col1:
-            business_name = st.text_input("Business Name").strip()
-            contact_name = st.text_input("Contact Name").strip()
-            phone = st.text_input("Phone", key="add_phone", placeholder="(210) 555-1212").strip()
+    col1, col2 = st.columns(2)
 
-            category_name = category_selector("add", default_name=None)
-            service_name = service_selector_filtered("add", category_name, default_name=None)
+    with col1:
+        business_name = st.text_input("Business Name").strip()
+        contact_name  = st.text_input("Contact Name").strip()
 
-        with col2:
-            address = st.text_area("Address").strip()
-            notes = st.text_area("Notes").strip()
+        st.markdown("**Phone**")
+        p1, p2, p3, p4, p5, p6 = st.columns([0.15, 0.9, 0.15, 0.9, 0.15, 1.2])
+        with p1: st.markdown("**(**")
+        with p2:
+            ac = st.text_input("Area", key="add_phone_ac", max_chars=3, label_visibility="collapsed")
+        with p3: st.markdown("**)**")
+        with p4:
+            pre = st.text_input("Prefix", key="add_phone_pre", max_chars=3, label_visibility="collapsed")
+        with p5: st.markdown("**-**")
+        with p6:
+            line = st.text_input("Line", key="add_phone_line", max_chars=4, label_visibility="collapsed")
 
-            website_raw = st.text_input("Website (URL)", key="add_website").strip()
-            norm_url, url_ok, url_msg = normalize_and_validate_url(website_raw)
-            if website_raw and not url_ok:
-                st.error(url_msg)
-            elif website_raw and url_ok:
-                st.caption("Preview:")
-                st.markdown(f"[Open link]({norm_url})")
+        category_name = category_selector("add", default_name=None)
+        service_name  = service_selector_filtered("add", category_name, default_name=None)
 
-            keywords = st.text_input("Keywords (comma-separated)").strip()
+    with col2:
+        address = st.text_area("Address").strip()
+        notes   = st.text_area("Notes").strip()
 
-        errors = []
-        if not business_name:
-            errors.append("Business Name is required.")
-        d = re.sub(r"\D", "", phone or "")
-        if phone and not (len(d) == 10 or (len(d) == 11 and d.startswith("1"))):
-            errors.append("Phone must have 10 digits (optionally leading 1).")
+        website_raw = st.text_input("Website (URL)", key="add_website").strip()
+        norm_url, url_ok, url_msg = normalize_and_validate_url(website_raw)
         if website_raw and not url_ok:
-            errors.append("Website/URL is not valid.")
+            st.error(url_msg)
+        elif website_raw and url_ok:
+            st.caption("Preview:")
+            st.markdown(f"[Open link]({norm_url})")
 
-        submitted = st.form_submit_button("Add Vendor", type="primary", disabled=bool(errors))
+        kw_raw = st.text_input("Keywords (comma-separated)").strip()
+        kw_norm = normalize_keywords_input(kw_raw)
+        if kw_norm:
+            st.caption(f"Keywords parsed: _{kw_norm}_")
 
-    if submitted:
-        payload = {
-            "Business Name": business_name or None,
-            "Contact Name": contact_name or None,
-            "Phone": format_us_phone(phone) if phone else None,
-            "Address": address or None,
-            "Notes": notes or None,
-            "Website": norm_url if website_raw else None,
-            "Category": category_name or None,
-            "Service": service_name or None,
-        }
-        if SCHEMA["has_keywords"]:
-            payload["Keywords"] = keywords or None
-        try:
-            new_id = insert_vendor(payload)
-            st.success(f"Vendor added (id={new_id}).")
-        except Exception as e:
-            st.error(f"Failed to add vendor: {e}")
+    # Validation
+    phone_digits = re.sub(r"\D", "", f"{ac}{pre}{line}")
+    phone_ok = (len(phone_digits) == 0) or (len(phone_digits) == 10)
+    ready = bool(business_name) and bool(url_ok) and phone_ok
+
+    add_clicked = st.button("Add Vendor", type="primary", disabled=not ready)
+
+    if add_clicked:
+        if not phone_ok:
+            st.error("Phone must have 10 digits (or leave blank).")
+        elif website_raw and not url_ok:
+            st.error("Website/URL is not valid.")
+        elif not business_name:
+            st.error("Business Name is required.")
+        else:
+            payload = {
+                "Business Name": business_name or None,
+                "Contact Name": contact_name or None,
+                "Phone": format_us_phone(phone_digits) if phone_digits else None,
+                "Address": address or None,
+                "Notes": notes or None,
+                "Website": norm_url if website_raw else None,
+                "Category": category_name or None,
+                "Service": service_name or None,
+            }
+            if SCHEMA["has_keywords"]:
+                payload["Keywords"] = kw_norm or None
+            try:
+                new_id = insert_vendor(payload)
+                st.success(f"Vendor added (id={new_id}).")
+            except Exception as e:
+                st.error(f"Failed to add vendor: {e}")
+
     refresh_notice()
 
 elif page == "Edit":
@@ -563,17 +549,17 @@ elif page == "Edit":
             col1, col2 = st.columns(2)
             with col1:
                 business_name = st.text_input("Business Name", value=row.get("Business Name") or "").strip()
-                contact_name = st.text_input("Contact Name", value=row.get("Contact Name") or "").strip()
+                contact_name  = st.text_input("Contact Name", value=row.get("Contact Name") or "").strip()
 
                 phone_init = format_us_phone(row.get("Phone") or "")
                 phone = st.text_input("Phone", key="edit_phone", value=phone_init).strip()
 
                 category_name = category_selector("edit", default_name=row.get("Category"))
-                service_name = service_selector_filtered("edit", category_name, default_name=row.get("Service"))
+                service_name  = service_selector_filtered("edit", category_name, default_name=row.get("Service"))
 
             with col2:
                 address = st.text_area("Address", value=row.get("Address") or "").strip()
-                notes = st.text_area("Notes", value=row.get("Notes") or "").strip()
+                notes   = st.text_area("Notes",   value=row.get("Notes")   or "").strip()
 
                 website_raw = st.text_input("Website (URL)", value=row.get("Website") or "").strip()
                 norm_url, url_ok, url_msg = normalize_and_validate_url(website_raw)
@@ -585,7 +571,8 @@ elif page == "Edit":
 
                 if SCHEMA["has_keywords"]:
                     keywords_init = row.get("Keywords") or ""
-                    keywords = st.text_input("Keywords (comma-separated)", value=keywords_init).strip()
+                    kw_norm = normalize_keywords_input(keywords_init)
+                    keywords = st.text_input("Keywords (comma-separated)", value=kw_norm).strip()
                 else:
                     keywords = ""
 
@@ -611,12 +598,13 @@ elif page == "Edit":
                 "Service": service_name or None,
             }
             if SCHEMA["has_keywords"]:
-                payload["Keywords"] = keywords or None
+                payload["Keywords"] = normalize_keywords_input(keywords) or None
             try:
                 update_vendor(int(vid), payload)
                 st.success("Vendor updated.")
             except Exception as e:
                 st.error(f"Failed to update vendor: {e}")
+
     refresh_notice()
 
 elif page == "Delete":
