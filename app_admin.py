@@ -1,10 +1,10 @@
 # app_admin.py
 # Vendors Admin for Streamlit: SQLite (default) or libSQL via DATABASE_URL).
-# - Robust cache clearing (no AttributeError if cache wrapper not present yet)
-# - Edit/Delete dropdowns show only Business Name.
-# - Safe Category/Service rename/delete with reassignment guardrails.
-# - Edit form: proper dirty detection + required fields.
-# - Phone/URL normalization; keywords parse (spaces or commas).
+# - Add Vendor: Category/Service dropdowns from existing data + “+ Add new…” option.
+# - Edit Vendor: Select Vendor sorted A→Z by Business Name.
+# - Phone validation robust (10 digits or 11 with leading '1'); auto-format to (xxx) xxx-xxxx.
+# - Save button enables correctly once changes are valid & non-noop.
+# - Safe cache clearing; category/service rename/delete with reassignment guardrails.
 
 from __future__ import annotations
 
@@ -30,11 +30,11 @@ def run_sql(sql: str, params: Dict[str, Any] | None = None):
     with engine.begin() as conn:
         return conn.execute(text(sql), params or {})
 
-def fetchall(sql: str, params: Dict[str, Any] | None = None) -> List[Tuple]:
+def fetchall(sql: str, params: Dict[str, Any] | None = None) -> List[tuple]:
     with engine.begin() as conn:
         return list(conn.execute(text(sql), params or {}).fetchall())
 
-def fetchone(sql: str, params: Dict[str, Any] | None = None) -> Optional[Tuple]:
+def fetchone(sql: str, params: Dict[str, Any] | None = None) -> Optional[tuple]:
     with engine.begin() as conn:
         return conn.execute(text(sql), params or {}).fetchone()
 
@@ -47,14 +47,21 @@ def has_column(tbl: str, col: str) -> bool:
 # ---------------------------
 # Helpers: normalize fields
 # ---------------------------
-PHONE_DIGITS = re.compile(r"\D+")
+DIGITS_RE = re.compile(r"\d")
+
+def phone_digits(raw: str) -> str:
+    return "".join(DIGITS_RE.findall(raw or ""))
 
 def normalize_phone(raw: str) -> str:
+    """Accept 10 digits or 11 with leading '1'; format to (xxx) xxx-xxxx.
+       If >=10 digits, use the LAST 10 (common copy/paste cases)."""
     if not raw:
         return ""
-    digits = PHONE_DIGITS.sub("", raw)
-    if len(digits) == 10:
-        return f"({digits[0:3]}) {digits[3:6]}-{digits[6:10]}"
+    d = phone_digits(raw)
+    if len(d) >= 10:
+        # Use last 10 digits; handles leading '1' or pasted junk.
+        d10 = d[-10:]
+        return f"({d10[0:3]}) {d10[3:6]}-{d10[6:10]}"
     return raw.strip()
 
 def normalize_url(raw: str) -> str:
@@ -134,11 +141,10 @@ def vendor_by_id(vid: int) -> Dict[str, Any] | None:
     return dict(zip(cols, row))
 
 # ---------------------------
-# Safe cache clearing (prevents AttributeError)
+# Safe cache clearing
 # ---------------------------
 def _safe_clear(fn):
     try:
-        # Streamlit cache wrappers expose .clear(); plain funcs don’t.
         clear = getattr(fn, "clear", None)
         if callable(clear):
             clear()
@@ -279,10 +285,13 @@ def required_ok(data: Dict[str, Any]) -> Tuple[bool, str]:
             missing.append(k)
     if missing:
         return False, "Missing: " + ", ".join(missing)
-    ph = data.get("phone","").strip()
-    d = PHONE_DIGITS.sub("", ph)
-    if ph and len(d) not in (0,10):
-        return False, "Phone must be 10 digits or left blank."
+
+    ph_raw = (data.get("phone") or "").strip()
+    if ph_raw:
+        d = phone_digits(ph_raw)
+        # Accept 10 digits OR 11 with leading 1; normalize formats in normalize_phone
+        if not (len(d) == 10 or (len(d) == 11 and d[0] == "1") or len(d) > 11):
+            return False, "Phone must be 10 digits (or 11 with leading 1) or left blank."
     return True, ""
 
 def compute_dirty(original: Dict[str, Any], edited: Dict[str, Any]) -> bool:
@@ -322,23 +331,50 @@ with tabs[0]:
 
     if mode == "Add":
         with st.form("add_vendor_form", clear_on_submit=False):
-            col1, col2, col3 = st.columns(3)
-            with col1:
-                category = st.text_input("Category", placeholder="e.g., Plumbing")
-                service  = st.text_input("Service", placeholder="e.g., Water Heaters")
-                business = st.text_input("Business Name", placeholder="Company LLC")
-            with col2:
-                contact  = st.text_input("Contact Name", placeholder="Jane Smith")
-                phone    = st.text_input("Phone (auto-formats)", placeholder="(210) 555-1212")
-                address  = st.text_input("Address", placeholder="123 Main St, San Antonio, TX")
-            with col3:
-                website  = st.text_input("Website", placeholder="example.com")
-                notes    = st.text_area("Notes", placeholder="Free estimates, etc.", height=88)
-                keywords = st.text_input("Keywords (space or comma)", placeholder="drain leak emergency") if HAS_KEYWORDS else ""
+            # Populate dropdowns
+            cats = list_categories()
+            cats_display = ["(blank)"] + cats + ["+ Add new…"]
+
+            # Category select
+            cat_choice = st.selectbox("Category", options=cats_display, index=0, key="add_cat")
+            new_cat = ""
+            resolved_cat = ""
+            if cat_choice == "(blank)":
+                resolved_cat = ""
+            elif cat_choice == "+ Add new…":
+                new_cat = st.text_input("New Category", placeholder="e.g., Plumbing", key="add_cat_new")
+                resolved_cat = new_cat.strip()
+            else:
+                resolved_cat = cat_choice
+
+            # Service select depends on resolved_cat
+            svc_list = list_services_for(resolved_cat) if resolved_cat != "" else []
+            svcs_display = ["(blank)"] + svc_list + ["+ Add new…"]
+            svc_choice = st.selectbox("Service", options=svcs_display, index=0, key="add_svc")
+            new_svc = ""
+            resolved_svc = ""
+            if svc_choice == "(blank)":
+                resolved_svc = ""
+            elif svc_choice == "+ Add new…":
+                new_svc = st.text_input("New Service", placeholder="e.g., Water Heaters", key="add_svc_new")
+                resolved_svc = new_svc.strip()
+            else:
+                resolved_svc = svc_choice
+
+            col2a, col2b = st.columns(2)
+            with col2a:
+                business = st.text_input("Business Name", placeholder="Company LLC", key="add_business")
+                contact  = st.text_input("Contact Name", placeholder="Jane Smith", key="add_contact")
+                phone    = st.text_input("Phone (auto-formats)", placeholder="(210) 555-1212", key="add_phone")
+            with col2b:
+                address  = st.text_input("Address", placeholder="123 Main St, San Antonio, TX", key="add_addr")
+                website  = st.text_input("Website", placeholder="example.com", key="add_site")
+                notes    = st.text_area("Notes", placeholder="Free estimates, etc.", height=88, key="add_notes")
+            keywords = st.text_input("Keywords (space or comma)", placeholder="drain leak emergency", key="add_kw") if HAS_KEYWORDS else ""
 
             data = {
-                "category": (category or "").strip(),
-                "service": (service or "").strip(),
+                "category": resolved_cat,
+                "service": resolved_svc,
                 "business_name": (business or "").strip(),
                 "contact_name": (contact or "").strip(),
                 "phone": normalize_phone(phone or ""),
@@ -357,14 +393,19 @@ with tabs[0]:
                 clear_caches()
                 st.rerun()
 
+            if not ok_req:
+                st.warning(msg_req)
+
     elif mode == "Edit":
         if df.empty:
             st.info("No vendors to edit.")
         else:
-            # Labels: ONLY Business Name
-            id_to_label = {int(r.id): f"{r.business_name}" for r in df.itertuples()}
+            # Sort vendor list A→Z by business_name (case-insensitive)
+            df_names = df.sort_values("business_name", key=lambda s: s.str.lower())
+            id_to_label = {int(r.id): f"{r.business_name}" for r in df_names.itertuples()}
             chosen_id = st.selectbox("Select Vendor", options=list(id_to_label.keys()),
-                                     format_func=lambda i: id_to_label[i])
+                                     format_func=lambda i: id_to_label[i], key="edit_select_vendor")
+
             original = vendor_by_id(chosen_id)
             if not original:
                 st.error("Could not load vendor record.")
@@ -372,18 +413,18 @@ with tabs[0]:
                 with st.form("edit_vendor_form"):
                     col1, col2, col3 = st.columns(3)
                     with col1:
-                        category = st.text_input("Category", value=original.get("category") or "")
-                        service  = st.text_input("Service", value=original.get("service") or "")
-                        business = st.text_input("Business Name", value=original.get("business_name") or "")
+                        category = st.text_input("Category", value=original.get("category") or "", key="edit_cat")
+                        service  = st.text_input("Service", value=original.get("service") or "", key="edit_svc")
+                        business = st.text_input("Business Name", value=original.get("business_name") or "", key="edit_biz")
                     with col2:
-                        contact  = st.text_input("Contact Name", value=original.get("contact_name") or "")
-                        phone    = st.text_input("Phone (auto-formats)", value=original.get("phone") or "")
-                        address  = st.text_input("Address", value=original.get("address") or "")
+                        contact  = st.text_input("Contact Name", value=original.get("contact_name") or "", key="edit_contact")
+                        phone    = st.text_input("Phone (auto-formats)", value=original.get("phone") or "", key="edit_phone")
+                        address  = st.text_input("Address", value=original.get("address") or "", key="edit_addr")
                     with col3:
-                        website  = st.text_input("Website", value=original.get("website") or "")
-                        notes    = st.text_area("Notes", value=original.get("notes") or "", height=88)
+                        website  = st.text_input("Website", value=original.get("website") or "", key="edit_site")
+                        notes    = st.text_area("Notes", value=original.get("notes") or "", height=88, key="edit_notes")
                         keywords = st.text_input("Keywords (space or comma)",
-                                                 value=original.get("keywords") or "") if HAS_KEYWORDS else ""
+                                                 value=original.get("keywords") or "", key="edit_kw") if HAS_KEYWORDS else ""
 
                     edited = {
                         "id": original["id"],
@@ -417,10 +458,11 @@ with tabs[0]:
         if df.empty:
             st.info("No vendors to delete.")
         else:
-            # Labels: ONLY Business Name
-            id_to_label = {int(r.id): f"{r.business_name}" for r in df.itertuples()}
+            # Labels: ONLY Business Name, sorted A→Z
+            df_names = df.sort_values("business_name", key=lambda s: s.str.lower())
+            id_to_label = {int(r.id): f"{r.business_name}" for r in df_names.itertuples()}
             chosen_id = st.selectbox("Select Vendor to Delete", options=list(id_to_label.keys()),
-                                     format_func=lambda i: id_to_label[i])
+                                     format_func=lambda i: id_to_label[i], key="del_select_vendor")
             confirm = st.checkbox("Yes, delete this vendor")
             if st.button("Delete", disabled=not confirm):
                 delete_vendor(chosen_id)
