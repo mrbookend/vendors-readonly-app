@@ -1,3 +1,7 @@
 streamlit==1.36.0
-pandas>=2.0
-numpy>=1.24
+pandas>=2.0,<3
+numpy>=1.24,<3
+SQLAlchemy>=2.0,<3
+sqlalchemy-libsql>=0.1.0
+libsql-client>=0.4
+
