@@ -1,6 +1,12 @@
-streamlit==1.39.0
+pip==24.2
+setuptools==72.1.0
+wheel==0.44.0
+
+# App deps (SQLite-only)
+streamlit==1.36.0
 pandas==2.2.2
-SQLAlchemy==2.0.32
-greenlet==3.0.3
-sqlalchemy-libsql==0.2.0
-libsql-client==0.3.1
+numpy==1.26.4
+SQLAlchemy==2.0.30
+
+# Streamlit tends to pull protobuf; this avoids odd newest-major issues
+protobuf<5
