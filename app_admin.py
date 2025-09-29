@@ -1,11 +1,15 @@
 # app_admin.py
-# Vendors Admin — Turso (libSQL) first, SQLite fallback. Robust dropdowns,
-# login form, debug panel, and safe SQLAlchemy bindings.
+# Vendors Admin — Turso (libSQL) first, SQLite fallback.
+# SQLAlchemy engine, safe params, category→service flow, phone/URL normalization,
+# optional Keywords support (only if vendors.keywords exists).
 
 from __future__ import annotations
 
 import os
+import re
 from typing import List, Tuple, Dict, Optional
+from urllib.parse import urlparse
+from pathlib import Path
 
 import pandas as pd
 import streamlit as st
@@ -16,19 +20,26 @@ from sqlalchemy.engine import Engine
 st.set_page_config(page_title="Vendors Admin", layout="wide")
 
 # ========= Secrets / Config =========
-# Accept common env names as well (TURSO_*).
 LIBSQL_URL = (
-    st.secrets.get("LIBSQL_URL")
+    (st.secrets.get("LIBSQL_URL") if hasattr(st, "secrets") else None)
     or os.getenv("LIBSQL_URL")
     or os.getenv("TURSO_DATABASE_URL")
 )
 LIBSQL_AUTH_TOKEN = (
-    st.secrets.get("LIBSQL_AUTH_TOKEN")
+    (st.secrets.get("LIBSQL_AUTH_TOKEN") if hasattr(st, "secrets") else None)
     or os.getenv("LIBSQL_AUTH_TOKEN")
     or os.getenv("TURSO_AUTH_TOKEN")
 )
-VENDORS_DB_PATH = st.secrets.get("VENDORS_DB_PATH") or os.getenv("VENDORS_DB_PATH") or "vendors.db"
-ADMIN_PASSWORD = st.secrets.get("ADMIN_PASSWORD") or os.getenv("ADMIN_PASSWORD") or "ADMIN"
+VENDORS_DB_PATH = (
+    (st.secrets.get("VENDORS_DB_PATH") if hasattr(st, "secrets") else None)
+    or os.getenv("VENDORS_DB_PATH")
+    or str((Path(__file__).resolve().parent / "vendors.db"))
+)
+ADMIN_PASSWORD = (
+    (st.secrets.get("ADMIN_PASSWORD") if hasattr(st, "secrets") else None)
+    or os.getenv("ADMIN_PASSWORD")
+    or "ADMIN"
+)
 
 USE_TURSO = bool(LIBSQL_URL and LIBSQL_AUTH_TOKEN)
 
@@ -97,6 +108,7 @@ def detect_schema():
         "uses_svc_id": "service_id" in vcols and has_services,
         "uses_cat_text": "category" in vcols,
         "uses_svc_text": "service" in vcols,
+        "has_keywords": "keywords" in vcols,  # optional column
     }
 
 SCHEMA = detect_schema()
@@ -130,6 +142,23 @@ def get_services() -> List[str]:
         return df["name"].tolist()
     return []
 
+def get_services_for_category(cat: str) -> List[str]:
+    """Filter services by chosen category when possible; fallback to unfiltered."""
+    if not cat:
+        return get_services()
+    # If denormalized vendors has both category + service:
+    if SCHEMA["uses_cat_text"] and SCHEMA["uses_svc_text"]:
+        df = run_df(
+            "SELECT DISTINCT TRIM(service) AS name FROM vendors "
+            "WHERE category = :c AND service IS NOT NULL AND TRIM(service) <> '' "
+            "ORDER BY 1;",
+            {"c": cat},
+        )
+        lst = df["name"].tolist()
+        return lst if lst else get_services()
+    # If normalized, but services table not linked to categories: fallback to all services
+    return get_services()
+
 def get_or_create_category(name: str) -> Optional[int]:
     if not name or not SCHEMA["has_categories_table"]:
         return None
@@ -150,6 +179,32 @@ def get_or_create_service(name: str) -> Optional[int]:
     run_exec("INSERT INTO services(name) VALUES(:n);", {"n": name})
     return query_scalar("SELECT id FROM services WHERE name=:n;", {"n": name})
 
+# ========= Format / Validate helpers =========
+def format_us_phone(raw: str) -> str:
+    d = re.sub(r"\D", "", raw or "")
+    if len(d) == 11 and d.startswith("1"):
+        d = d[1:]
+    if len(d) != 10:
+        return raw or ""
+    return f"({d[:3]}) {d[3:6]}-{d[6:]}"
+
+def normalize_and_validate_url(raw: str) -> tuple[str, bool, str]:
+    """
+    If blank: return ("", True, "") so blank is allowed.
+    If present: ensure scheme; require valid host with a dot; no spaces.
+    """
+    if not raw:
+        return "", True, ""
+    s = raw.strip()
+    if " " in s:
+        return s, False, "URL cannot contain spaces."
+    if not re.match(r"^[a-zA-Z][a-zA-Z0-9+.-]*://", s):
+        s = "https://" + s
+    p = urlparse(s)
+    if not p.netloc or "." not in p.netloc:
+        return s, False, "URL must include a valid host (e.g., example.com)."
+    return s, True, ""
+
 # ========= Vendors data (list/detail) =========
 def load_vendors_df() -> pd.DataFrame:
     if SCHEMA["uses_cat_id"]:
@@ -168,6 +223,8 @@ def load_vendors_df() -> pd.DataFrame:
     else:
         svc_expr, svc_join = "NULL AS Service", ""
 
+    kw_expr = "v.keywords AS Keywords" if SCHEMA["has_keywords"] else "NULL AS Keywords"
+
     sql = f"""
         SELECT
           v.id AS id,
@@ -178,7 +235,8 @@ def load_vendors_df() -> pd.DataFrame:
           v.phone         AS Phone,
           v.address       AS Address,
           v.notes         AS Notes,
-          v.website       AS Website
+          v.website       AS Website,
+          {kw_expr}
         FROM vendors v
         {cat_join}
         {svc_join}
@@ -196,6 +254,7 @@ def vendor_display_label(row: pd.Series) -> str:
 # ========= UI helpers =========
 ADD_NEW_CAT = "➕ Add new category…"
 ADD_NEW_SVC = "➕ Add new service…"
+CUSTOM_SERVICE = "⟂ Custom…"
 
 def category_selector(key_prefix: str, default_name: Optional[str]) -> str:
     options = [""] + get_categories() + [ADD_NEW_CAT]
@@ -205,12 +264,16 @@ def category_selector(key_prefix: str, default_name: Optional[str]) -> str:
         return st.text_input("New category name", key=f"{key_prefix}_cat_new").strip()
     return sel.strip() if sel else ""
 
-def service_selector(key_prefix: str, default_name: Optional[str]) -> str:
-    options = [""] + get_services() + [ADD_NEW_SVC]
+def service_selector_filtered(key_prefix: str, category_name: str, default_name: Optional[str]) -> str:
+    base = get_services_for_category(category_name)
+    options = [""] + base + [CUSTOM_SERVICE, ADD_NEW_SVC]
+    # prefer default if present in options
     idx = options.index(default_name) if default_name in options else 0
     sel = st.selectbox("Service", options=options, index=idx, key=f"{key_prefix}_svc_select")
     if sel == ADD_NEW_SVC:
         return st.text_input("New service name", key=f"{key_prefix}_svc_new").strip()
+    if sel == CUSTOM_SERVICE:
+        return st.text_input("Custom service", key=f"{key_prefix}_svc_custom").strip()
     return sel.strip() if sel else ""
 
 # ========= CRUD =========
@@ -248,7 +311,8 @@ def insert_vendor(payload: Dict) -> int:
         elif SCHEMA["uses_svc_text"]:
             sets.append("service = :service"); vals["service"] = svc_name or None
 
-        mapping = {
+        # Base mappings always present in your schema:
+        base_mapping = {
             "Business Name": "business_name",
             "Contact Name": "contact_name",
             "Phone": "phone",
@@ -256,7 +320,11 @@ def insert_vendor(payload: Dict) -> int:
             "Notes": "notes",
             "Website": "website",
         }
-        for k_src, k_db in mapping.items():
+        # Optional mapping only if vendors.keywords exists
+        if SCHEMA["has_keywords"]:
+            base_mapping["Keywords"] = "keywords"
+
+        for k_src, k_db in base_mapping.items():
             sets.append(f"{k_db} = :{k_db}")
             vals[k_db] = payload.get(k_src) or None
 
@@ -300,7 +368,7 @@ def update_vendor(vendor_id: int, payload: Dict) -> None:
         elif SCHEMA["uses_svc_text"]:
             sets.append("service = :service"); vals["service"] = svc_name or None
 
-        mapping = {
+        base_mapping = {
             "Business Name": "business_name",
             "Contact Name": "contact_name",
             "Phone": "phone",
@@ -308,7 +376,10 @@ def update_vendor(vendor_id: int, payload: Dict) -> None:
             "Notes": "notes",
             "Website": "website",
         }
-        for k_src, k_db in mapping.items():
+        if SCHEMA["has_keywords"]:
+            base_mapping["Keywords"] = "keywords"
+
+        for k_src, k_db in base_mapping.items():
             sets.append(f"{k_db} = :{k_db}")
             vals[k_db] = payload.get(k_src) or None
 
@@ -327,7 +398,7 @@ def rename_category(old_name: str, new_name: str) -> None:
 
 def rename_service(old_name: str, new_name: str) -> None:
     new_name = new_name.strip()
-    if SCHEMA["has_services_table"] and SCHEMA["uses_svc_id"]:
+    if SCHEMA["has_categories_table"] and SCHEMA["uses_svc_id"]:
         run_exec("UPDATE OR IGNORE services SET name = :n WHERE name = :o;", {"n": new_name, "o": old_name})
     elif SCHEMA["uses_svc_text"]:
         run_exec("UPDATE vendors SET service = :n WHERE service = :o;", {"n": new_name, "o": old_name})
@@ -407,6 +478,7 @@ with st.expander("Database Status & Schema (debug)"):
         "uses_svc_id": SCHEMA["uses_svc_id"],
         "uses_cat_text": SCHEMA["uses_cat_text"],
         "uses_svc_text": SCHEMA["uses_svc_text"],
+        "has_keywords": SCHEMA["has_keywords"],
         "counts": counts,
         "sample_categories": get_categories()[:15],
         "sample_services": get_services()[:15],
@@ -422,43 +494,76 @@ if page == "View":
     if df.empty:
         st.info("No vendors found.")
     else:
-        st.dataframe(df.drop(columns=["id"]), use_container_width=True, hide_index=True)
+        drop_cols = [c for c in ("id",) if c in df.columns]
+        st.dataframe(df.drop(columns=drop_cols), use_container_width=True, hide_index=True)
     refresh_notice()
 
 elif page == "Add":
     st.header("Add Vendor")
     with st.form("add_vendor_form", clear_on_submit=True):
+
+        # LEFT column: Business/Contact/Phone + CATEGORY, then SERVICE under it (filtered)
         col1, col2 = st.columns(2)
+
         with col1:
             business_name = st.text_input("Business Name").strip()
             contact_name = st.text_input("Contact Name").strip()
-            phone = st.text_input("Phone").strip()
+
+            # live phone formatting via on_change
+            def _cb_add_phone():
+                st.session_state["add_phone"] = format_us_phone(st.session_state.get("add_phone", ""))
+
+            phone = st.text_input("Phone", key="add_phone", placeholder="(210) 555-1212", on_change=_cb_add_phone).strip()
+
             category_name = category_selector("add", default_name=None)
+            service_name = service_selector_filtered("add", category_name, default_name=None)
+
         with col2:
             address = st.text_area("Address").strip()
             notes = st.text_area("Notes").strip()
-            website = st.text_input("Website (URL)").strip()
-            service_name = service_selector("add", default_name=None)
-        submitted = st.form_submit_button("Add Vendor")
-    if submitted:
+
+            website_raw = st.text_input("Website (URL)", key="add_website").strip()
+            norm_url, url_ok, url_msg = normalize_and_validate_url(website_raw)
+            if website_raw and not url_ok:
+                st.error(url_msg)
+            elif website_raw and url_ok:
+                st.caption("Preview:")
+                st.markdown(f"[Open link]({norm_url})")
+
+            # New: Keywords (only saved if column exists)
+            keywords = st.text_input("Keywords (comma-separated)").strip()
+
+        # Validation
+        errors = []
         if not business_name:
-            st.error("Business Name is required.")
-        else:
-            payload = {
-                "Business Name": business_name or None,
-                "Contact Name": contact_name or None,
-                "Phone": phone or None,
-                "Address": address or None,
-                "Notes": notes or None,
-                "Website": website or None,
-                "Category": category_name or None,
-                "Service": service_name or None,
-            }
-            try:
-                new_id = insert_vendor(payload)
-                st.success(f"Vendor added (id={new_id}).")
-            except Exception as e:
-                st.error(f"Failed to add vendor: {e}")
+            errors.append("Business Name is required.")
+        # Phone: allow blank or valid US 10 digits (optionally leading 1)
+        d = re.sub(r"\D", "", phone or "")
+        if phone and not (len(d) == 10 or (len(d) == 11 and d.startswith("1"))):
+            errors.append("Phone must have 10 digits (optionally leading 1).")
+        # Website must be valid if supplied
+        if website_raw and not url_ok:
+            errors.append("Website/URL is not valid.")
+
+        submitted = st.form_submit_button("Add Vendor", type="primary", disabled=bool(errors))
+    if submitted:
+        payload = {
+            "Business Name": business_name or None,
+            "Contact Name": contact_name or None,
+            "Phone": format_us_phone(phone) if phone else None,
+            "Address": address or None,
+            "Notes": notes or None,
+            "Website": norm_url if website_raw else None,
+            "Category": category_name or None,
+            "Service": service_name or None,
+        }
+        if SCHEMA["has_keywords"]:
+            payload["Keywords"] = keywords or None
+        try:
+            new_id = insert_vendor(payload)
+            st.success(f"Vendor added (id={new_id}).")
+        except Exception as e:
+            st.error(f"Failed to add vendor: {e}")
     refresh_notice()
 
 elif page == "Edit":
@@ -476,35 +581,65 @@ elif page == "Edit":
         with st.form("edit_vendor_form"):
             col1, col2 = st.columns(2)
             with col1:
-                business_name = st.text_input("Business Name", value=row["Business Name"] or "").strip()
-                contact_name = st.text_input("Contact Name", value=row["Contact Name"] or "").strip()
-                phone = st.text_input("Phone", value=row["Phone"] or "").strip()
-                category_name = category_selector("edit", default_name=row["Category"])
+                business_name = st.text_input("Business Name", value=row.get("Business Name") or "").strip()
+                contact_name = st.text_input("Contact Name", value=row.get("Contact Name") or "").strip()
+
+                def _cb_edit_phone():
+                    st.session_state["edit_phone"] = format_us_phone(st.session_state.get("edit_phone", ""))
+
+                phone_init = format_us_phone(row.get("Phone") or "")
+                phone = st.text_input("Phone", key="edit_phone", value=phone_init, on_change=_cb_edit_phone).strip()
+
+                category_name = category_selector("edit", default_name=row.get("Category"))
+                service_name = service_selector_filtered("edit", category_name, default_name=row.get("Service"))
+
             with col2:
-                address = st.text_area("Address", value=row["Address"] or "").strip()
-                notes = st.text_area("Notes", value=row["Notes"] or "").strip()
-                website = st.text_input("Website (URL)", value=row["Website"] or "").strip()
-                service_name = service_selector("edit", default_name=row["Service"])
-            save = st.form_submit_button("Save Changes")
-        if save:
+                address = st.text_area("Address", value=row.get("Address") or "").strip()
+                notes = st.text_area("Notes", value=row.get("Notes") or "").strip()
+
+                website_raw = st.text_input("Website (URL)", value=row.get("Website") or "").strip()
+                norm_url, url_ok, url_msg = normalize_and_validate_url(website_raw)
+                if website_raw and not url_ok:
+                    st.error(url_msg)
+                elif website_raw and url_ok:
+                    st.caption("Preview:")
+                    st.markdown(f"[Open link]({norm_url})")
+
+                if SCHEMA["has_keywords"]:
+                    keywords_init = row.get("Keywords") or ""
+                    keywords = st.text_input("Keywords (comma-separated)", value=keywords_init).strip()
+                else:
+                    keywords = ""
+
+            # Validation
+            errors = []
             if not business_name:
-                st.error("Business Name is required.")
-            else:
-                payload = {
-                    "Business Name": business_name or None,
-                    "Contact Name": contact_name or None,
-                    "Phone": phone or None,
-                    "Address": address or None,
-                    "Notes": notes or None,
-                    "Website": website or None,
-                    "Category": category_name or None,
-                    "Service": service_name or None,
-                }
-                try:
-                    update_vendor(int(vid), payload)
-                    st.success("Vendor updated.")
-                except Exception as e:
-                    st.error(f"Failed to update vendor: {e}")
+                errors.append("Business Name is required.")
+            d = re.sub(r"\D", "", phone or "")
+            if phone and not (len(d) == 10 or (len(d) == 11 and d.startswith("1"))):
+                errors.append("Phone must have 10 digits (optionally leading 1).")
+            if website_raw and not url_ok:
+                errors.append("Website/URL is not valid.")
+
+            save = st.form_submit_button("Save Changes", disabled=bool(errors))
+        if save:
+            payload = {
+                "Business Name": business_name or None,
+                "Contact Name": contact_name or None,
+                "Phone": format_us_phone(phone) if phone else None,
+                "Address": address or None,
+                "Notes": notes or None,
+                "Website": norm_url if website_raw else None,
+                "Category": category_name or None,
+                "Service": service_name or None,
+            }
+            if SCHEMA["has_keywords"]:
+                payload["Keywords"] = keywords or None
+            try:
+                update_vendor(int(vid), payload)
+                st.success("Vendor updated.")
+            except Exception as e:
+                st.error(f"Failed to update vendor: {e}")
     refresh_notice()
 
 elif page == "Delete":
