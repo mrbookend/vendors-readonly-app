@@ -502,26 +502,36 @@ elif page == "Add":
     st.header("Add Vendor")
     with st.form("add_vendor_form", clear_on_submit=True):
 
-        # LEFT column: Business/Contact/Phone + CATEGORY, then SERVICE under it (filtered)
+        # LEFT column: Business/Contact/Phone + CATEGORY, then SERVICE **under it** (filtered)
         col1, col2 = st.columns(2)
 
         with col1:
             business_name = st.text_input("Business Name").strip()
             contact_name = st.text_input("Contact Name").strip()
 
-            # live phone formatting via on_change
+            # Auto-format phone on change
             def _cb_add_phone():
                 st.session_state["add_phone"] = format_us_phone(st.session_state.get("add_phone", ""))
 
-            phone = st.text_input("Phone", key="add_phone", placeholder="(210) 555-1212", on_change=_cb_add_phone).strip()
+            phone = st.text_input(
+                "Phone",
+                key="add_phone",
+                placeholder="(210) 555-1212",
+                on_change=_cb_add_phone
+            ).strip()
 
+            # Category first
             category_name = category_selector("add", default_name=None)
+
+            # Service immediately under Category (filtered by chosen Category)
+            # NOTE: uses service_selector_filtered we added earlier
             service_name = service_selector_filtered("add", category_name, default_name=None)
 
         with col2:
             address = st.text_area("Address").strip()
             notes = st.text_area("Notes").strip()
 
+            # Website normalize + validate + preview
             website_raw = st.text_input("Website (URL)", key="add_website").strip()
             norm_url, url_ok, url_msg = normalize_and_validate_url(website_raw)
             if website_raw and not url_ok:
@@ -530,22 +540,21 @@ elif page == "Add":
                 st.caption("Preview:")
                 st.markdown(f"[Open link]({norm_url})")
 
-            # New: Keywords (only saved if column exists)
+            # NEW: Keywords (saved only if vendors.keywords exists)
             keywords = st.text_input("Keywords (comma-separated)").strip()
 
         # Validation
         errors = []
         if not business_name:
             errors.append("Business Name is required.")
-        # Phone: allow blank or valid US 10 digits (optionally leading 1)
         d = re.sub(r"\D", "", phone or "")
         if phone and not (len(d) == 10 or (len(d) == 11 and d.startswith("1"))):
             errors.append("Phone must have 10 digits (optionally leading 1).")
-        # Website must be valid if supplied
         if website_raw and not url_ok:
             errors.append("Website/URL is not valid.")
 
         submitted = st.form_submit_button("Add Vendor", type="primary", disabled=bool(errors))
+
     if submitted:
         payload = {
             "Business Name": business_name or None,
@@ -559,12 +568,15 @@ elif page == "Add":
         }
         if SCHEMA["has_keywords"]:
             payload["Keywords"] = keywords or None
+
         try:
             new_id = insert_vendor(payload)
             st.success(f"Vendor added (id={new_id}).")
         except Exception as e:
             st.error(f"Failed to add vendor: {e}")
+
     refresh_notice()
+
 
 elif page == "Edit":
     st.header("Edit Vendor")
