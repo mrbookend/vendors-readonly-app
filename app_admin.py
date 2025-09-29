@@ -145,7 +145,7 @@ def get_services() -> List[str]:
 def get_services_for_category(cat: str) -> List[str]:
     """Filter services by chosen category when possible; fallback to unfiltered."""
     if not cat:
-         return get_services()
+        return get_services()
     if SCHEMA["uses_cat_text"] and SCHEMA["uses_svc_text"]:
         df = run_df(
             "SELECT DISTINCT TRIM(service) AS name FROM vendors "
@@ -492,22 +492,12 @@ if page == "View":
 elif page == "Add":
     st.header("Add Vendor")
     with st.form("add_vendor_form", clear_on_submit=True):
-        # LEFT column: Business/Contact/Phone + CATEGORY, then SERVICE **under it** (filtered)
         col1, col2 = st.columns(2)
 
         with col1:
             business_name = st.text_input("Business Name").strip()
             contact_name = st.text_input("Contact Name").strip()
-
-            def _cb_add_phone():
-                st.session_state["add_phone"] = format_us_phone(st.session_state.get("add_phone", ""))
-
-            phone = st.text_input(
-                "Phone",
-                key="add_phone",
-                placeholder="(210) 555-1212",
-                on_change=_cb_add_phone
-            ).strip()
+            phone = st.text_input("Phone", key="add_phone", placeholder="(210) 555-1212").strip()
 
             category_name = category_selector("add", default_name=None)
             service_name = service_selector_filtered("add", category_name, default_name=None)
@@ -550,7 +540,6 @@ elif page == "Add":
         }
         if SCHEMA["has_keywords"]:
             payload["Keywords"] = keywords or None
-
         try:
             new_id = insert_vendor(payload)
             st.success(f"Vendor added (id={new_id}).")
@@ -576,11 +565,8 @@ elif page == "Edit":
                 business_name = st.text_input("Business Name", value=row.get("Business Name") or "").strip()
                 contact_name = st.text_input("Contact Name", value=row.get("Contact Name") or "").strip()
 
-                def _cb_edit_phone():
-                    st.session_state["edit_phone"] = format_us_phone(st.session_state.get("edit_phone", ""))
-
                 phone_init = format_us_phone(row.get("Phone") or "")
-                phone = st.text_input("Phone", key="edit_phone", value=phone_init, on_change=_cb_edit_phone).strip()
+                phone = st.text_input("Phone", key="edit_phone", value=phone_init).strip()
 
                 category_name = category_selector("edit", default_name=row.get("Category"))
                 service_name = service_selector_filtered("edit", category_name, default_name=row.get("Service"))
