@@ -3,3 +3,10 @@ __pycache__/
 *.db-shm
 *.db-wal
 vendors.backup-*.db
+# local noise (backups, caches, dumps)
+.streamlit/
+*.backup-*.py
+vendors_admin_cache.db*
+*.sqlite
+*.sql
+add_vendor.sh.bak
