@@ -145,7 +145,7 @@ def get_services() -> List[str]:
 def get_services_for_category(cat: str) -> List[str]:
     """Filter services by chosen category when possible; fallback to unfiltered."""
     if not cat:
-        return get_services()
+         return get_services()
     if SCHEMA["uses_cat_text"] and SCHEMA["uses_svc_text"]:
         df = run_df(
             "SELECT DISTINCT TRIM(service) AS name FROM vendors "
@@ -492,7 +492,6 @@ if page == "View":
 elif page == "Add":
     st.header("Add Vendor")
     with st.form("add_vendor_form", clear_on_submit=True):
-
         # LEFT column: Business/Contact/Phone + CATEGORY, then SERVICE **under it** (filtered)
         col1, col2 = st.columns(2)
 
