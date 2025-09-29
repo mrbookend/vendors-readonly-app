@@ -1,6 +1,3 @@
-streamlit==1.39.0
-pandas==2.2.2
-SQLAlchemy==2.0.32
-greenlet==3.0.3
-sqlalchemy-libsql==0.2.0
-libsql-client==0.3.1
+streamlit==1.36.0
+pandas>=2.0
+numpy>=1.24
