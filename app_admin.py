@@ -1,10 +1,3 @@
-# app_admin.py
-# Vendors Admin — Turso (libSQL) first, SQLite fallback.
-# SQLAlchemy engine, safe params, category→service flow, phone/URL normalization,
-# optional Keywords support (only if vendors.keywords exists).
-
-from __future__ import annotations
-
 import os
 import re
 from typing import List, Tuple, Dict, Optional
@@ -146,7 +139,6 @@ def get_services_for_category(cat: str) -> List[str]:
     """Filter services by chosen category when possible; fallback to unfiltered."""
     if not cat:
         return get_services()
-    # If denormalized vendors has both category + service:
     if SCHEMA["uses_cat_text"] and SCHEMA["uses_svc_text"]:
         df = run_df(
             "SELECT DISTINCT TRIM(service) AS name FROM vendors "
@@ -156,7 +148,6 @@ def get_services_for_category(cat: str) -> List[str]:
         )
         lst = df["name"].tolist()
         return lst if lst else get_services()
-    # If normalized, but services table not linked to categories: fallback to all services
     return get_services()
 
 def get_or_create_category(name: str) -> Optional[int]:
@@ -189,10 +180,6 @@ def format_us_phone(raw: str) -> str:
     return f"({d[:3]}) {d[3:6]}-{d[6:]}"
 
 def normalize_and_validate_url(raw: str) -> tuple[str, bool, str]:
-    """
-    If blank: return ("", True, "") so blank is allowed.
-    If present: ensure scheme; require valid host with a dot; no spaces.
-    """
     if not raw:
         return "", True, ""
     s = raw.strip()
@@ -267,7 +254,6 @@ def category_selector(key_prefix: str, default_name: Optional[str]) -> str:
 def service_selector_filtered(key_prefix: str, category_name: str, default_name: Optional[str]) -> str:
     base = get_services_for_category(category_name)
     options = [""] + base + [CUSTOM_SERVICE, ADD_NEW_SVC]
-    # prefer default if present in options
     idx = options.index(default_name) if default_name in options else 0
     sel = st.selectbox("Service", options=options, index=idx, key=f"{key_prefix}_svc_select")
     if sel == ADD_NEW_SVC:
@@ -311,7 +297,6 @@ def insert_vendor(payload: Dict) -> int:
         elif SCHEMA["uses_svc_text"]:
             sets.append("service = :service"); vals["service"] = svc_name or None
 
-        # Base mappings always present in your schema:
         base_mapping = {
             "Business Name": "business_name",
             "Contact Name": "contact_name",
@@ -320,7 +305,6 @@ def insert_vendor(payload: Dict) -> int:
             "Notes": "notes",
             "Website": "website",
         }
-        # Optional mapping only if vendors.keywords exists
         if SCHEMA["has_keywords"]:
             base_mapping["Keywords"] = "keywords"
 
@@ -420,7 +404,7 @@ def delete_category_val(name: str) -> Tuple[bool, str]:
     return False, "Category storage not found."
 
 def delete_service_val(name: str) -> Tuple[bool, str]:
-    if SCHEMA["has_services_table"] and SCHEMA["uses_svc_id"]:
+    if SCHEMA["has_categories_table"] and SCHEMA["uses_svc_id"]:
         n = query_scalar(
             "SELECT COUNT(*) FROM vendors v JOIN services s ON v.service_id=s.id WHERE s.name=:n;", {"n": name}
         )
@@ -509,7 +493,6 @@ elif page == "Add":
             business_name = st.text_input("Business Name").strip()
             contact_name = st.text_input("Contact Name").strip()
 
-            # Auto-format phone on change
             def _cb_add_phone():
                 st.session_state["add_phone"] = format_us_phone(st.session_state.get("add_phone", ""))
 
@@ -520,18 +503,13 @@ elif page == "Add":
                 on_change=_cb_add_phone
             ).strip()
 
-            # Category first
             category_name = category_selector("add", default_name=None)
-
-            # Service immediately under Category (filtered by chosen Category)
-            # NOTE: uses service_selector_filtered we added earlier
             service_name = service_selector_filtered("add", category_name, default_name=None)
 
         with col2:
             address = st.text_area("Address").strip()
             notes = st.text_area("Notes").strip()
 
-            # Website normalize + validate + preview
             website_raw = st.text_input("Website (URL)", key="add_website").strip()
             norm_url, url_ok, url_msg = normalize_and_validate_url(website_raw)
             if website_raw and not url_ok:
@@ -540,10 +518,8 @@ elif page == "Add":
                 st.caption("Preview:")
                 st.markdown(f"[Open link]({norm_url})")
 
-            # NEW: Keywords (saved only if vendors.keywords exists)
             keywords = st.text_input("Keywords (comma-separated)").strip()
 
-        # Validation
         errors = []
         if not business_name:
             errors.append("Business Name is required.")
@@ -574,9 +550,7 @@ elif page == "Add":
             st.success(f"Vendor added (id={new_id}).")
         except Exception as e:
             st.error(f"Failed to add vendor: {e}")
-
     refresh_notice()
-
 
 elif page == "Edit":
     st.header("Edit Vendor")
@@ -623,7 +597,6 @@ elif page == "Edit":
                 else:
                     keywords = ""
 
-            # Validation
             errors = []
             if not business_name:
                 errors.append("Business Name is required.")
@@ -773,3 +746,4 @@ elif page == "Categories & Services Admin":
             else:
                 st.info("No services found.")
 # EOF
+PY
