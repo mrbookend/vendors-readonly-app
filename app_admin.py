@@ -1,607 +1,293 @@
-# app_admin.py — Vendors Admin (SQLite) with phone normalization, inline Category→Service,
-# Browse (non-FTS search), and maintenance tools
-#
-# Features:
-# - Enforce/normalize phone to (xxx) xxx-xxxx on add/edit. Accepts raw digits (e.g., 2108333141 or 2108333141.0).
-# - Add/Edit/Delete flows; business picker sorted A→Z; immediate refresh after mutations (st.rerun()).
-# - Category → Service cascade; dropdowns show a placeholder ("— select —") and a "+ Add New…" inline path.
-# - Categories & Services Admin page to add categories/services and a one-click "Repair Services Table" button.
-# - Browse page: non-FTS, case-insensitive substring search across ALL vendor fields, with All/Any term mode.
-# - Works with only vendors table present; uses categories/services tables when available; auto-migrates legacy services schema.
+# app_admin.py — Vendors Admin (Browse + Add on one page)
+# Forward-looking, simpler nav (sidebar radio), immediate refresh on add,
+# non-FTS word search across all fields, optional Keywords support.
 
 from __future__ import annotations
 
 import os
 import re
-import sqlite3
-from contextlib import closing
-from typing import List, Optional, Tuple, Dict
+from pathlib import Path
+from typing import Dict, List, Tuple
+from urllib.parse import urlparse
 
 import pandas as pd
 import streamlit as st
+from sqlalchemy import create_engine
+from sqlalchemy.sql import text as sql_text
 
-# -----------------------------------------------------------------------------
-# Config
-# -----------------------------------------------------------------------------
-DB_PATH = os.getenv("VENDORS_DB", "/mount/src/vendors-readonly-app/vendors.db")
-PLACEHOLDER = "— select —"
-ADD_NEW = "+ Add New…"
-REQUIRED_COLUMNS = [
-    "id",
-    "category",
-    "service",
-    "business_name",
-    "contact_name",
-    "phone",
-    "address",
-    "website",
-    "notes",
-    "keywords",
-]
-SEARCH_COLS_DEFAULT = [
-    "category",
-    "service",
-    "business_name",
-    "contact_name",
-    "phone",
-    "address",
-    "website",
-    "notes",
-    "keywords",
-]
+APP_TITLE = "Vendors Admin"
 
-# -----------------------------------------------------------------------------
-# Database helpers
-# -----------------------------------------------------------------------------
-def conn() -> sqlite3.Connection:
-    c = sqlite3.connect(DB_PATH)
-    c.row_factory = sqlite3.Row
-    return c
+# Set page config FIRST to avoid Streamlit warning.
+st.set_page_config(page_title=APP_TITLE, layout="wide")
+
+# DB URL: default to SQLite vendors.db next to this file.
+# You can override with env var DB_URL (e.g., libsql/turso).
+DEFAULT_DB_PATH = Path(__file__).resolve().parent / "vendors.db"
+DB_URL = os.getenv("DB_URL") or f"sqlite:///{DEFAULT_DB_PATH}"
+
+# ---------- DB helpers ----------
+@st.cache_resource(show_spinner=False)
+def get_engine():
+    return create_engine(DB_URL, future=True)
 
 
-def table_exists(c: sqlite3.Connection, table: str) -> bool:
-    cur = c.execute("SELECT name FROM sqlite_master WHERE type='table' AND name=?", (table,))
-    return cur.fetchone() is not None
+def get_columns(engine) -> List[str]:
+    with engine.begin() as con:
+        info = con.execute(sql_text("PRAGMA table_info(vendors)")).fetchall()
+    return [r[1] for r in info]
 
 
-def table_cols(c: sqlite3.Connection, table: str) -> List[str]:
-    cur = c.execute(f"PRAGMA table_info({table})")
-    return [row[1] for row in cur.fetchall()]
-
-
-def migrate_services_if_needed(c: sqlite3.Connection) -> None:
-    """If services table exists with wrong schema (e.g., id,name), rebuild correctly."""
-    if not table_exists(c, "services"):
-        return
-    cols = set(table_cols(c, "services"))
-    want = {"category", "service"}
-    if want.issubset(cols):
-        return
-    # Rebuild as services_new
-    c.execute(
-        """
-        CREATE TABLE IF NOT EXISTS services_new (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            category TEXT NOT NULL,
-            service  TEXT NOT NULL,
-            UNIQUE(category, service)
-        )
-        """
-    )
-    # Populate from vendors distinct pairs
-    c.execute(
-        """
-        INSERT OR IGNORE INTO services_new(category, service)
-        SELECT DISTINCT IFNULL(category,''), IFNULL(service,'')
-        FROM vendors
-        WHERE IFNULL(category,'')<>'' AND IFNULL(service,'')<>''
-        """
-    )
-    c.execute("DROP TABLE IF EXISTS services")
-    c.execute("ALTER TABLE services_new RENAME TO services")
-    c.commit()
-
-
-def ensure_aux_tables(c: sqlite3.Connection) -> None:
-    c.execute(
-        """
-        CREATE TABLE IF NOT EXISTS categories (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            name TEXT UNIQUE NOT NULL
-        )
-        """
-    )
-    c.execute(
-        """
-        CREATE TABLE IF NOT EXISTS services (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            category TEXT NOT NULL,
-            service  TEXT NOT NULL,
-            UNIQUE(category, service)
-        )
-        """
-    )
-    migrate_services_if_needed(c)
-    c.commit()
-
-
-def repair_services_table() -> Dict[str, object]:
-    """Force repair services table to expected schema; return summary."""
-    with closing(conn()) as cxn:
-        before = {
-            "has_services": table_exists(cxn, "services"),
-            "cols": table_cols(cxn, "services") if table_exists(cxn, "services") else [],
-        }
-        cxn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS services_new (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                category TEXT NOT NULL,
-                service  TEXT NOT NULL,
-                UNIQUE(category, service)
-            )
-            """
-        )
-        cxn.execute(
-            """
-            INSERT OR IGNORE INTO services_new(category, service)
-            SELECT DISTINCT IFNULL(category,''), IFNULL(service,'')
-            FROM vendors
-            WHERE IFNULL(category,'')<>'' AND IFNULL(service,'')<>''
-            """
-        )
-        cxn.execute("DROP TABLE IF EXISTS services")
-        cxn.execute("ALTER TABLE services_new RENAME TO services")
-        cxn.commit()
-        after = {"has_services": table_exists(cxn, "services"), "cols": table_cols(cxn, "services")}
-        rows = cxn.execute(
-            "SELECT category, COUNT(*) AS n FROM services GROUP BY category ORDER BY category"
-        ).fetchall()
-        return {
-            "before": before,
-            "after": after,
-            "category_counts": [{"category": r[0], "n": r[1]} for r in rows],
-        }
-
-# -----------------------------------------------------------------------------
-# Data access
-# -----------------------------------------------------------------------------
-def get_vendors_df() -> pd.DataFrame:
-    with closing(conn()) as c:
-        df = pd.read_sql_query("SELECT * FROM vendors", c)
-    for col in REQUIRED_COLUMNS:
-        if col not in df.columns:
-            df[col] = ""
+def load_df(engine) -> pd.DataFrame:
+    cols = get_columns(engine)
+    ordered = [
+        "id",
+        "category",
+        "service",
+        "business_name",
+        "contact_name",
+        "phone",
+        "address",
+        "website",
+        "notes",
+        "keywords",
+    ]
+    select_cols = [c for c in ordered if c in cols]
+    sql = f"SELECT {', '.join(select_cols)} FROM vendors ORDER BY business_name COLLATE NOCASE"
+    with engine.begin() as con:
+        df = pd.read_sql_query(sql, con)
     return df
 
 
-def get_categories() -> List[str]:
-    with closing(conn()) as c:
-        if table_exists(c, "categories"):
-            rows = c.execute("SELECT name FROM categories ORDER BY name").fetchall()
-            return [r[0] for r in rows]
-        rows = c.execute(
-            "SELECT DISTINCT category FROM vendors WHERE IFNULL(category,'')<>'' ORDER BY category"
-        ).fetchall()
-        return [r[0] for r in rows]
+def get_distinct(engine, col: str, where: Tuple[str, dict] | None = None) -> List[str]:
+    if where:
+        sql = f"SELECT DISTINCT {col} FROM vendors WHERE {where[0]} ORDER BY {col} COLLATE NOCASE"
+        params = where[1]
+    else:
+        sql = f"SELECT DISTINCT {col} FROM vendors ORDER BY {col} COLLATE NOCASE"
+        params = {}
+    with engine.begin() as con:
+        rows = con.execute(sql_text(sql), params).fetchall()
+    # Filter out blanks/NULLs
+    return [r[0] for r in rows if (r[0] is not None and str(r[0]).strip() != "")]
 
 
-def get_services_for_category(category: str) -> List[str]:
-    if not category:
-        return []
-    with closing(conn()) as c:
-        try:
-            if table_exists(c, "services"):
-                ensure_aux_tables(c)  # no-op if already correct
-                rows = c.execute(
-                    "SELECT service FROM services WHERE category=? ORDER BY service",
-                    (category,),
-                ).fetchall()
-                return [r[0] for r in rows]
-        except sqlite3.OperationalError:
-            pass
-        rows = c.execute(
-            """
-            SELECT DISTINCT service FROM vendors
-            WHERE IFNULL(service,'')<>'' AND category=?
-            ORDER BY service
-            """,
-            (category,),
-        ).fetchall()
-        return [r[0] for r in rows]
+# ---------- Normalizers & validators ----------
+PHONE_ERR = "Phone must be 10 digits (US) or left blank"
+URL_ERR = "Website must be a valid URL (with or without https://) or left blank"
 
 
-def upsert_category(name: str) -> None:
-    with closing(conn()) as c:
-        ensure_aux_tables(c)
-        c.execute("INSERT OR IGNORE INTO categories(name) VALUES(?)", (name.strip(),))
-        c.commit()
-
-
-def upsert_service(category: str, service: str) -> None:
-    with closing(conn()) as c:
-        ensure_aux_tables(c)
-        c.execute(
-            "INSERT OR IGNORE INTO services(category, service) VALUES(?,?)",
-            (category.strip(), service.strip()),
-        )
-        c.commit()
-
-
-def insert_vendor(rec: dict) -> int:
-    with closing(conn()) as c:
-        cur = c.execute(
-            """
-            INSERT INTO vendors (category, service, business_name, contact_name, phone, address, website, notes, keywords)
-            VALUES (:category, :service, :business_name, :contact_name, :phone, :address, :website, :notes, :keywords)
-            """,
-            rec,
-        )
-        c.commit()
-        return cur.lastrowid
-
-
-def update_vendor(vid: int, rec: dict) -> None:
-    with closing(conn()) as c:
-        c.execute(
-            """
-            UPDATE vendors
-            SET category=:category,
-                service=:service,
-                business_name=:business_name,
-                contact_name=:contact_name,
-                phone=:phone,
-                address=:address,
-                website=:website,
-                notes=:notes,
-                keywords=:keywords
-            WHERE id=:id
-            """,
-            {**rec, "id": vid},
-        )
-        c.commit()
-
-
-def delete_vendor(vid: int) -> None:
-    with closing(conn()) as c:
-        c.execute("DELETE FROM vendors WHERE id=?", (vid,))
-        c.commit()
-
-# -----------------------------------------------------------------------------
-# Validation / Normalization
-# -----------------------------------------------------------------------------
-def normalize_phone(raw: str) -> str:
-    """Return phone as (xxx) xxx-xxxx or '' if blank. Accepts 10 digits only.
-    Handles float-looking inputs like '2108333141.0'.
-    """
-    if raw is None:
-        return ""
-    s = str(raw).strip()
+def normalize_phone(s: str) -> str:
+    s = re.sub(r"\D", "", (s or ""))
     if not s:
         return ""
-    digits = re.sub(r"\D", "", s)
-    digits = digits.rstrip("0") if s.endswith(".0") and len(digits) > 10 else digits
-    if len(digits) == 11 and digits.startswith("1"):
-        digits = digits[1:]
-    if len(digits) != 10:
-        raise ValueError("Phone must be 10 digits or left blank")
-    area, mid, last = digits[:3], digits[3:6], digits[6:]
-    return f"({area}) {mid}-{last}"
+    if len(s) == 11 and s.startswith("1"):
+        s = s[1:]
+    if len(s) != 10:
+        raise ValueError(PHONE_ERR)
+    return f"({s[0:3]}) {s[3:6]}-{s[6:10]}"
 
 
-def require(text: str, label: str) -> None:
-    if not text or not text.strip():
-        raise ValueError(f"{label} is required")
+def normalize_url(u: str) -> str:
+    u = (u or "").strip()
+    if not u:
+        return ""
+    if not re.match(r"^[a-zA-Z][a-zA-Z0-9+.-]*://", u):
+        u = "https://" + u
+    parsed = urlparse(u)
+    if not parsed.netloc:
+        raise ValueError(URL_ERR)
+    return parsed.geturl()
 
-# -----------------------------------------------------------------------------
-# UI Helpers
-# -----------------------------------------------------------------------------
-def section(title: str):
-    st.markdown(f"## {title}")
+
+def normalize_keywords(s: str) -> str:
+    s = (s or "").strip()
+    if not s:
+        return ""
+    parts = re.split(r"[\s,]+", s)
+    parts = sorted(set([p.strip() for p in parts if p.strip()]))
+    return ", ".join(parts)
 
 
-def select_with_add(label: str, options: List[str], key: str) -> Tuple[str, Optional[str]]:
-    """Selectbox with placeholder and + Add New…; returns (value, new_value)."""
-    opts = [PLACEHOLDER] + options + [ADD_NEW]
-    choice = st.selectbox(label, opts, index=0, key=key)
-    new_val = None
-    if choice == ADD_NEW:
-        new_val = st.text_input(f"New {label}", key=f"{key}_new")
-    return ("" if choice in (PLACEHOLDER, ADD_NEW) else choice, new_val)
+def insert_vendor(engine, row: Dict[str, str]) -> None:
+    cols = get_columns(engine)
+    allowed = [
+        "category",
+        "service",
+        "business_name",
+        "contact_name",
+        "phone",
+        "address",
+        "website",
+        "notes",
+        "keywords",
+    ]
+    values = {k: row.get(k, "") for k in allowed if k in cols}
+    placeholders = ", ".join([f":{k}" for k in values.keys()])
+    columns = ", ".join(values.keys())
+    sql = f"INSERT INTO vendors ({columns}) VALUES ({placeholders})"
+    with engine.begin() as con:
+        con.execute(sql_text(sql), values)
 
-# -----------------------------------------------------------------------------
-# Pages
-# -----------------------------------------------------------------------------
-def page_browse():
-    section("Browse / Search (non-FTS)")
-    df = get_vendors_df()
 
-    # Choose columns to search and show
-    avail_cols = [c for c in SEARCH_COLS_DEFAULT if c in df.columns]
-    with st.expander("Search options", expanded=True):
-        query = st.text_input("Search terms (space/comma separated; case-insensitive)", key="browse_q")
-        mode = st.radio("Match mode", options=("All terms", "Any term"), index=0, horizontal=True, key="browse_mode")
-        show_cols = st.multiselect("Columns to display", options=["category","service","business_name","contact_name","phone","address","website","notes","keywords"], default=["category","service","business_name","contact_name","phone","address","website","notes","keywords"], key="browse_cols")
-        sort_by = st.selectbox("Sort by", options=["business_name","category","service","contact_name","phone"], index=0)
-        st.button("Refresh", on_click=st.rerun, key="browse_refresh")
+# ---------- Filtering ----------
+def filter_df(df: pd.DataFrame, query: str) -> pd.DataFrame:
+    query = (query or "").strip()
+    if not query:
+        return df
+    tokens = [t for t in re.split(r"\s+", query) if t]
+    if not tokens:
+        return df
+    search_cols = [c for c in df.columns if c != "id"]
+    lower = df[search_cols].astype(str).apply(lambda s: s.str.lower())
+    mask = pd.Series(True, index=df.index)
+    for tok in tokens:
+        mask &= lower.apply(lambda s: s.str.contains(tok.lower(), na=False)).any(axis=1)
+    return df[mask]
 
-    filtered = df
-    if query:
-        terms = [t for t in re.split(r"[,\s]+", query.strip()) if t]
-        if terms:
-            mask = None
-            for term in terms:
-                # Build per-term match across ALL searchable columns
-                termmask = None
-                for col in avail_cols:
-                    colmask = df[col].astype(str).str.contains(re.escape(term), case=False, na=False)
-                    termmask = colmask if termmask is None else (termmask | colmask)
-                if mode == "All terms":
-                    mask = termmask if mask is None else (mask & termmask)
-                else:
-                    mask = termmask if mask is None else (mask | termmask)
-            if mask is not None:
-                filtered = df[mask].copy()
 
-    # Sorting & display
-    if sort_by in filtered.columns:
+# ---------- UI Sections ----------
+def render_browse_and_add(engine):
+    st.subheader("Browse & Add Vendors")
+    df = load_df(engine)
+
+    # --- Browse ---
+    with st.expander("Browse (word search across all fields)", expanded=True):
+        q = st.text_input(
+            "Search",
+            value=st.session_state.get("browse_q", ""),
+            placeholder="e.g., plumber alamo heights",
+            key="browse_q",
+            help="Type one or more words. We use AND logic across all fields (case-insensitive).",
+        )
+        filtered = filter_df(df, q)
+        col_config = {}
         try:
-            filtered = filtered.sort_values(sort_by, key=lambda s: s.astype(str).str.lower())
+            # Use LinkColumn when available (Streamlit 1.24+)
+            if hasattr(st, "column_config") and "website" in filtered.columns:
+                col_config["website"] = st.column_config.LinkColumn("Website", display_text="Open")
         except Exception:
-            filtered = filtered.sort_values(sort_by)
-
-    st.caption(f"{len(filtered)} match(es) out of {len(df)} total.")
-    # Don’t show the internal id unless needed
-    display_cols = [c for c in show_cols if c in filtered.columns]
-    if not display_cols:
-        display_cols = [c for c in SEARCH_COLS_DEFAULT if c in filtered.columns]
-    st.dataframe(filtered[display_cols], hide_index=True, use_container_width=True)
-
-def page_vendors_admin():
-    section("Vendors Admin")
-
-    df = get_vendors_df()
-    with st.expander("Database Status & Schema (debug)", expanded=False):
-        st.json({
-            "db_source": f"(SQLite) {DB_PATH}",
-            "vendors_columns": list(df.columns),
-            "has_categories_table": table_exists(conn(), "categories"),
-            "has_services_table": table_exists(conn(), "services"),
-            "uses_cat_text": True,
-            "uses_svc_text": True,
-            "has_keywords": "keywords" in df.columns,
-            "counts": {"vendors": int(df.shape[0])},
-        })
-
-    tab_add, tab_edit, tab_delete = st.tabs(["Add", "Edit", "Delete"])
-
-    # --------------------------- Add ----------------------------------------
-    with tab_add:
-        st.subheader("Add a Vendor")
-        cats = get_categories()
-        cat_val, cat_new = select_with_add("Category", cats, key="add_cat")
-        if cat_new:
-            try:
-                require(cat_new, "Category")
-                upsert_category(cat_new)
-                cat_val = cat_new
-                st.success(f"Category '{cat_new}' added.")
-                st.rerun()
-            except Exception as e:
-                st.error(str(e))
-        svcs = get_services_for_category(cat_val) if cat_val else []
-        svc_val, svc_new = select_with_add("Service", svcs, key="add_svc")
-        if svc_new:
-            try:
-                require(cat_val or cat_new, "Category (before adding a Service)")
-                require(svc_new, "Service")
-                upsert_service(cat_val, svc_new)
-                svc_val = svc_new
-                st.success(f"Service '{svc_new}' added to '{cat_val}'.")
-                st.rerun()
-            except Exception as e:
-                st.error(str(e))
-
-        business_name = st.text_input("Business Name", key="add_biz")
-        contact_name = st.text_input("Contact Name", key="add_contact")
-        phone_raw = st.text_input("Phone (digits only or (xxx) xxx-xxxx)", key="add_phone")
-        address = st.text_input("Address", key="add_addr")
-        website = st.text_input("Website (URL)", key="add_site")
-        notes = st.text_area("Notes", key="add_notes")
-        keywords = st.text_input("Keywords (comma- or space-separated)", key="add_kw")
-
-        if st.button("Add Vendor", type="primary"):
-            try:
-                require(cat_val, "Category")
-                require(svc_val, "Service")
-                require(business_name, "Business Name")
-                phone = normalize_phone(phone_raw)
-                rec = {
-                    "category": cat_val,
-                    "service": svc_val,
-                    "business_name": business_name.strip(),
-                    "contact_name": contact_name.strip(),
-                    "phone": phone,
-                    "address": address.strip(),
-                    "website": website.strip(),
-                    "notes": notes.strip(),
-                    "keywords": re.sub(r"\s*,\s*", ", ", re.sub(r"\s+", ", ", keywords.strip())).strip(", ") if keywords else "",
-                }
-                insert_vendor(rec)
-                st.success(f"Added — {business_name}")
-                st.rerun()
-            except Exception as e:
-                st.error(str(e))
-
-    # --------------------------- Edit ---------------------------------------
-    with tab_edit:
-        st.subheader("Edit a Vendor")
-        if df.empty:
-            st.info("No vendors to edit.")
-        else:
-            df_sorted = df.sort_values("business_name", key=lambda s: s.astype(str).str.lower())
-            options = [(int(r["id"]), f"{r['business_name']} — {r['category']} / {r['service']}") for _, r in df_sorted.iterrows()]
-            id_to_label = {vid: label for vid, label in options}
-            vid = st.selectbox("Select Vendor", options=[vid for vid, _ in options], format_func=lambda i: id_to_label[i], key="edit_pick")
-
-            row = df[df["id"] == vid].iloc[0]
-            cats = get_categories()
-            cat_val, cat_new = select_with_add("Category", cats, key="edit_cat")
-            if not cat_val:
-                cat_val = str(row["category"]) if row["category"] else ""
-            if cat_new:
-                try:
-                    require(cat_new, "Category")
-                    upsert_category(cat_new)
-                    cat_val = cat_new
-                    st.success(f"Category '{cat_new}' added.")
-                    st.rerun()
-                except Exception as e:
-                    st.error(str(e))
-
-            svcs = get_services_for_category(cat_val) if cat_val else []
-            svc_val, svc_new = select_with_add("Service", svcs, key="edit_svc")
-            if not svc_val:
-                svc_val = str(row["service"]) if row["service"] else ""
-            if svc_new:
-                try:
-                    require(cat_val, "Category (before adding a Service)")
-                    require(svc_new, "Service")
-                    upsert_service(cat_val, svc_new)
-                    svc_val = svc_new
-                    st.success(f"Service '{svc_new}' added to '{cat_val}'.")
-                    st.rerun()
-                except Exception as e:
-                    st.error(str(e))
-
-            business_name = st.text_input("Business Name", value=str(row["business_name"] or ""), key="edit_biz")
-            contact_name = st.text_input("Contact Name", value=str(row["contact_name"] or ""), key="edit_contact")
-            phone_raw = st.text_input("Phone (digits only or (xxx) xxx-xxxx)", value=str(row["phone"] or ""), key="edit_phone")
-            address = st.text_input("Address", value=str(row["address"] or ""), key="edit_addr")
-            website = st.text_input("Website (URL)", value=str(row["website"] or ""), key="edit_site")
-            notes = st.text_area("Notes", value=str(row["notes"] or ""), key="edit_notes")
-            keywords = st.text_input("Keywords (comma- or space-separated)", value=str(row["keywords"] or ""), key="edit_kw")
-
-            if st.button("Save Changes", type="primary"):
-                try:
-                    require(cat_val, "Category")
-                    require(svc_val, "Service")
-                    require(business_name, "Business Name")
-                    phone = normalize_phone(phone_raw)
-                    rec = {
-                        "category": cat_val,
-                        "service": svc_val,
-                        "business_name": business_name.strip(),
-                        "contact_name": contact_name.strip(),
-                        "phone": phone,
-                        "address": address.strip(),
-                        "website": website.strip(),
-                        "notes": notes.strip(),
-                        "keywords": re.sub(r"\s*,\s*", ", ", re.sub(r"\s+", ", ", keywords.strip())).strip(", ") if keywords else "",
-                    }
-                    update_vendor(int(vid), rec)
-                    st.success(f"Updated — {business_name}")
-                    st.rerun()
-                except Exception as e:
-                    st.error(str(e))
-
-    # --------------------------- Delete -------------------------------------
-    with tab_delete:
-        st.subheader("Delete a Vendor")
-        if df.empty:
-            st.info("No vendors to delete.")
-        else:
-            df_sorted = df.sort_values("business_name", key=lambda s: s.astype(str).str.lower())
-            options = [(int(r["id"]), f"{r['business_name']} — {r['category']} / {r['service']}") for _, r in df_sorted.iterrows()]
-            id_to_label = {vid: label for vid, label in options}
-            vid = st.selectbox("Select Vendor", options=[vid for vid, _ in options], format_func=lambda i: id_to_label[i], key="del_pick")
-            if st.button("Delete", type="secondary"):
-                delete_vendor(int(vid))
-                st.success(f"Deleted vendor #{vid}")
-                st.rerun()
-
-
-def page_cat_svc_admin():
-    section("Categories & Services Admin")
-    st.caption("Add new categories or services here. These feed the dropdowns in Vendors Admin.")
-
-    with closing(conn()) as c:
-        ensure_aux_tables(c)
-
-    # Maintenance actions
-    with st.expander("Maintenance", expanded=False):
-        st.write("If your Services table ever becomes mis-schematized (e.g., only has 'id, name'), use this repair tool. It rebuilds the table from distinct (Category, Service) pairs in vendors.")
-        if st.button("Repair Services Table", key="btn_repair_services"):
-            try:
-                info = repair_services_table()
-                st.success("Services table repaired.")
-                st.json(info)
-                st.rerun()
-            except Exception as e:
-                st.error(f"Repair failed: {e}")
-
-    col1, col2 = st.columns(2)
-    with col1:
-        st.subheader("Add Category")
-        new_cat = st.text_input("Category name", key="cs_new_cat")
-        if st.button("Add Category"):
-            try:
-                require(new_cat, "Category")
-                upsert_category(new_cat)
-                st.success(f"Category '{new_cat}' added.")
-                st.rerun()
-            except Exception as e:
-                st.error(str(e))
-
-    with col2:
-        st.subheader("Add Service")
-        cats = get_categories()
-        cat_val = st.selectbox("Category", [PLACEHOLDER] + cats, index=0, key="cs_cat_sel")
-        new_svc = st.text_input("Service name", key="cs_new_svc")
-        if st.button("Add Service"):
-            try:
-                require(cat_val if cat_val != PLACEHOLDER else "", "Category")
-                require(new_svc, "Service")
-                upsert_service(cat_val, new_svc)
-                st.success(f"Service '{new_svc}' added to '{cat_val}'.")
-                st.rerun()
-            except Exception as e:
-                st.error(str(e))
+            col_config = {}
+        st.dataframe(filtered, use_container_width=True, hide_index=True, column_config=col_config)
 
     st.divider()
-    st.subheader("Reference Lists")
-    st.write("Categories")
-    st.dataframe(pd.DataFrame({"Category": get_categories()}), hide_index=True, use_container_width=True)
 
-    st.write("Services (by Category)")
-    rows = []
-    for cat in get_categories():
-        for svc in get_services_for_category(cat):
-            rows.append({"Category": cat, "Service": svc})
-    st.dataframe(pd.DataFrame(rows), hide_index=True, use_container_width=True)
+    # --- Add Vendor ---
+    st.markdown("#### Add a Vendor")
+    cols = get_columns(engine)
 
-# -----------------------------------------------------------------------------
-# Router (top-of-page Navigation, not sidebar)
-# -----------------------------------------------------------------------------
-def main():
-    st.set_page_config(page_title="Vendors Admin", layout="wide")
-    st.markdown("""### Navigation
-**Go to**""")
-    page = st.radio(
-        label="",
-        options=("Browse", "Vendors Admin", "Categories & Services Admin"),
-        index=0,
-        horizontal=False,
-        key="top_nav_radio",
+    # Category selection or new
+    categories = get_distinct(engine, "category")
+    c1, c2 = st.columns([1, 2])  # removed vertical_alignment for compatibility
+    with c1:
+        cat_mode = st.radio("Category", ["Choose existing", "Add new"], horizontal=True, key="cat_mode")
+    with c2:
+        if cat_mode == "Choose existing":
+            category = st.selectbox("", [""] + categories, index=0, key="cat_select", label_visibility="collapsed")
+        else:
+            category = st.text_input("New Category", "", key="cat_new")
+
+    # Service depends on category (if present)
+    services = get_distinct(engine, "service", where=("category = :c", {"c": category})) if category else []
+    s1, s2 = st.columns([1, 2])  # removed vertical_alignment for compatibility
+    with s1:
+        svc_mode = st.radio("Service", ["Choose existing", "Add new"], horizontal=True, key="svc_mode")
+    with s2:
+        if svc_mode == "Choose existing":
+            service = st.selectbox("", [""] + services, index=0, key="svc_select", label_visibility="collapsed")
+        else:
+            service = st.text_input("New Service", "", key="svc_new")
+
+    business_name = st.text_input("Business Name *", "", key="biz")
+    contact_name = st.text_input("Contact Name", "", key="contact")
+    phone_in = st.text_input("Phone (digits only)", "", key="phone")
+    address = st.text_input("Address", "", key="addr")
+    website_in = st.text_input("Website (optional)", "", key="web")
+    notes = st.text_area("Notes", "", key="notes", height=80)
+    keywords = st.text_input("Keywords (comma or space separated)", "", key="kw") if "keywords" in cols else ""
+
+    if st.button("Add Vendor", type="primary", use_container_width=True):
+        try:
+            if not category.strip():
+                st.error("Category is required.")
+                st.stop()
+            if not service.strip():
+                st.error("Service is required.")
+                st.stop()
+            if not business_name.strip():
+                st.error("Business Name is required.")
+                st.stop()
+
+            phone = normalize_phone(phone_in)
+            website = normalize_url(website_in)
+            keywords_norm = normalize_keywords(keywords) if isinstance(keywords, str) else ""
+
+            row = {
+                "category": category.strip(),
+                "service": service.strip(),
+                "business_name": business_name.strip(),
+                "contact_name": contact_name.strip(),
+                "phone": phone,
+                "address": address.strip(),
+                "website": website,
+                "notes": notes.strip(),
+                "keywords": keywords_norm,
+            }
+            insert_vendor(engine, row)
+            st.success("Vendor added.")
+            st.rerun()  # immediate refresh so the new row appears in Browse
+        except Exception as e:
+            st.exception(e)
+
+
+def render_categories_services_admin(engine):
+    st.subheader("Categories & Services Admin")
+    st.write("Quick views of distinct categories and services.")
+    cats = pd.DataFrame({"Category": get_distinct(engine, "category")})
+    st.dataframe(cats, use_container_width=True, hide_index=True)
+    st.write("---")
+    svcs = pd.DataFrame({"Service": get_distinct(engine, "service")})
+    st.dataframe(svcs, use_container_width=True, hide_index=True)
+
+
+def render_debug(engine):
+    st.subheader("Database Status & Schema (debug)")
+    cols = get_columns(engine)
+    try:
+        vendor_count = int(load_df(engine).shape[0])
+    except Exception:
+        vendor_count = -1
+    st.json(
+        {
+            "db_source": DB_URL,
+            "vendors_columns": {i: c for i, c in enumerate(cols)},
+            "has_keywords": "keywords" in cols,
+            "counts": {"vendors": vendor_count},
+        }
     )
-    st.divider()
 
-    if page == "Browse":
-        page_browse()
-    elif page == "Vendors Admin":
-        page_vendors_admin()
+
+# ---------- Main ----------
+def main():
+    st.title(APP_TITLE)
+
+    engine = get_engine()
+
+    # Simplified, robust navigation: avoids blank screens due to nested state.
+    page = st.sidebar.radio(
+        "Go to",
+        ["Vendors Admin (Browse + Add)", "Categories & Services", "Debug"],
+        index=0,
+        key="nav_radio",
+    )
+
+    if page.startswith("Vendors Admin"):
+        render_browse_and_add(engine)
+    elif page == "Categories & Services":
+        render_categories_services_admin(engine)
+    elif page == "Debug":
+        render_debug(engine)
     else:
-        page_cat_svc_admin()
+        st.info("Select a section from the sidebar.")
 
 
 if __name__ == "__main__":
