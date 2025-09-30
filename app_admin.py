@@ -1,7 +1,8 @@
 # app_admin.py — Vendors Admin (Single page: Browse, Add, Edit, Delete; Debug at bottom)
-# Lean, robust UI (no sidebar). Immediate refresh on add/edit/delete.
+# No sidebar. Immediate refresh on add/edit/delete.
 # Non-FTS AND search across all fields. Optional "keywords" column supported.
-# Hardened against None from DB (NULLs) in all text fields.
+# Capitalization enforced (Category, Service, Business Name, Contact Name) on Add/Edit.
+# Business Name not required. UI clears fields after Add/Save/Delete to avoid accidental repeats.
 
 from __future__ import annotations
 
@@ -72,6 +73,42 @@ def s(x) -> str:
         return x.strip()
     return str(x).strip()
 
+_ACRONYM = re.compile(r"^[A-Z0-9]{2,}$")
+def cap_words_reasonable(x: str) -> str:
+    """
+    Title-case words separated by space, '/', '&', ',', or '-'.
+    Keep acronyms (ALLCAPS / digits) as-is. Meant for names/categories/services.
+    """
+    t = s(x)
+    if not t:
+        return ""
+    parts = re.split(r'(\s+|/|&|,|-)', t)  # keep delimiters
+    out = []
+    for p in parts:
+        if not p or re.fullmatch(r'\s+|/|&|,|-', p):
+            out.append(p)
+            continue
+        if _ACRONYM.match(p):
+            out.append(p)
+        else:
+            out.append(p[:1].upper() + p[1:].lower())
+    return "".join(out)
+
+def apply_casing(d: Dict[str, str]) -> Dict[str, str]:
+    """
+    Capitalize only the fields where it 'makes sense':
+      - category, service, business_name, contact_name
+    Leave address, notes, website, keywords unchanged.
+    """
+    for k in ("category", "service", "business_name", "contact_name"):
+        if k in d:
+            d[k] = cap_words_reasonable(d[k])
+    return d
+
+def clear_keys(*keys: str) -> None:
+    for k in keys:
+        st.session_state.pop(k, None)
+
 # ---- Normalizers & validators ----
 PHONE_ERR = "Phone must be 10 digits (US) or left blank"
 URL_ERR = "Website must be a valid URL (with or without https://) or left blank"
@@ -121,6 +158,7 @@ def insert_vendor(engine, row: Dict[str, str]) -> None:
         "keywords",
     ]
     values = {k: s(row.get(k, "")) for k in allowed if k in cols}
+    values = apply_casing(values)  # enforce capitalization where it makes sense
     placeholders = ", ".join([f":{k}" for k in values.keys()])
     columns = ", ".join(values.keys())
     sql = f"INSERT INTO vendors ({columns}) VALUES ({placeholders})"
@@ -134,15 +172,37 @@ def update_vendor(engine, vid: int, updates: Dict[str, str]) -> None:
     allowed = [c for c in updates.keys() if c in cols and c != "id"]
     if not allowed:
         return
-    set_clause = ", ".join([f"{c} = :{c}" for c in allowed])
-    params = {c: s(updates[c]) for c in allowed}
-    params["id"] = vid
+    # enforce casing on the subset we will write
+    upd = {c: s(updates[c]) for c in allowed}
+    upd = apply_casing(upd)
+    set_clause = ", ".join([f"{c} = :{c}" for c in upd.keys()])
+    upd["id"] = vid
     with engine.begin() as con:
-        con.execute(sql_text(f"UPDATE vendors SET {set_clause} WHERE id = :id"), params)
+        con.execute(sql_text(f"UPDATE vendors SET {set_clause} WHERE id = :id"), upd)
 
 def delete_vendor(engine, vid: int) -> None:
     with engine.begin() as con:
         con.execute(sql_text("DELETE FROM vendors WHERE id = :id"), {"id": vid})
+
+def normalize_all_caps_now(engine) -> int:
+    """One-click normalize capitalization across all rows (where it makes sense)."""
+    df = load_df(engine)
+    count = 0
+    for _, r in df.iterrows():
+        vid = int(r["id"])
+        updates = {
+            "category": r.get("category"),
+            "service": r.get("service"),
+            "business_name": r.get("business_name"),
+            "contact_name": r.get("contact_name"),
+        }
+        # Only update if any would change after casing
+        cased = apply_casing({k: s(v) for k, v in updates.items()})
+        # Determine if any difference
+        if any(s(updates[k]) != cased[k] for k in cased):
+            update_vendor(engine, vid, cased)
+            count += 1
+    return count
 
 # ---- Search ----
 def filter_df(df: pd.DataFrame, query: str) -> pd.DataFrame:
@@ -207,7 +267,7 @@ def section_add(engine):
         else:
             service = st.text_input("New Service", "", key="svc_new")
 
-    business_name = st.text_input("Business Name *", "", key="biz")
+    business_name = st.text_input("Business Name (optional)", "", key="biz")
     contact_name  = st.text_input("Contact Name", "", key="contact")
     phone_in      = st.text_input("Phone (digits only)", "", key="phone")
     address       = st.text_input("Address", "", key="addr")
@@ -215,17 +275,15 @@ def section_add(engine):
     notes         = st.text_area("Notes", "", key="notes", height=80)
     keywords      = st.text_input("Keywords (comma or space separated)", "", key="kw") if "keywords" in cols else ""
 
-    if st.button("Add Vendor", type="primary", use_container_width=True):
+    if st.button("Add Vendor", type="primary", use_container_width=True, key="add_btn"):
         try:
             cat = s(category)
             svc = s(service)
-            bn  = s(business_name)
+            # Business Name is optional by request.
             if not cat:
                 st.error("Category is required."); st.stop()
             if not svc:
                 st.error("Service is required."); st.stop()
-            if not bn:
-                st.error("Business Name is required."); st.stop()
 
             phone   = normalize_phone(phone_in)
             website = normalize_url(website_in)
@@ -234,7 +292,7 @@ def section_add(engine):
             row = {
                 "category": cat,
                 "service": svc,
-                "business_name": bn,
+                "business_name": s(business_name),
                 "contact_name": s(contact_name),
                 "phone": phone,
                 "address": s(address),
@@ -244,6 +302,11 @@ def section_add(engine):
             }
             insert_vendor(engine, row)
             st.success("Vendor added.")
+
+            # Clear all inputs to avoid accidental double submissions
+            clear_keys("cat_mode","cat_select","cat_new",
+                       "svc_mode","svc_select","svc_new",
+                       "biz","contact","phone","addr","web","notes","kw")
             st.rerun()
         except Exception as e:
             st.exception(e)
@@ -255,12 +318,14 @@ def section_edit(engine):
         st.info("No vendors to edit.")
         return
 
-    # Build sorted selection by Business Name
+    # Build sorted selection by Business Name (fallback when blank)
     df_sorted = df.sort_values("business_name", key=lambda srs: srs.astype(str).str.lower())
     def label_for_row(r):
-        cat = s(r.get("category"))
-        svc = s(r.get("service"))
-        return f"{s(r.get('business_name'))} — {cat} / {svc}  [#{r['id']}]"
+        cat = cap_words_reasonable(r.get("category"))
+        svc = cap_words_reasonable(r.get("service"))
+        bn  = cap_words_reasonable(r.get("business_name"))
+        name = bn or f"{cat} / {svc}" or "[no name]"
+        return f"{name}  [#{r['id']}]"
 
     id_to_label = {int(r["id"]): label_for_row(r) for _, r in df_sorted.iterrows()}
     ids = list(id_to_label.keys())
@@ -303,8 +368,8 @@ def section_edit(engine):
         else:
             service = st.text_input("New Service", current_svc, key="edit_svc_new")
 
-    business_name = st.text_input("Business Name *", s(row.get("business_name")), key="edit_biz")
-    contact_name  = st.text_input("Contact Name", s(row.get("contact_name")), key="edit_contact")
+    business_name = st.text_input("Business Name (optional)", cap_words_reasonable(row.get("business_name")), key="edit_biz")
+    contact_name  = st.text_input("Contact Name", cap_words_reasonable(row.get("contact_name")), key="edit_contact")
     phone_in      = st.text_input("Phone (digits only)", s(row.get("phone")), key="edit_phone")
     address       = st.text_input("Address", s(row.get("address")), key="edit_addr")
     website_in    = st.text_input("Website (optional)", s(row.get("website")), key="edit_web")
@@ -316,20 +381,19 @@ def section_edit(engine):
         try:
             cat = s(category)
             svc = s(service)
-            bn  = s(business_name)
+            # Business Name optional by request
+            # Validate required minimal fields:
             if not cat:
                 st.error("Category is required."); st.stop()
             if not svc:
                 st.error("Service is required."); st.stop()
-            if not bn:
-                st.error("Business Name is required."); st.stop()
 
             phone   = normalize_phone(phone_in)
             website = normalize_url(website_in)
             updates = {
                 "category": cat,
                 "service": svc,
-                "business_name": bn,
+                "business_name": s(business_name),
                 "contact_name": s(contact_name),
                 "phone": phone,
                 "address": s(address),
@@ -341,6 +405,11 @@ def section_edit(engine):
 
             update_vendor(engine, int(chosen_id), updates)
             st.success("Vendor updated.")
+
+            # Clear selection and inputs to avoid accidental double-edits
+            clear_keys("edit_vendor_select","edit_cat_mode","edit_cat_select","edit_cat_new",
+                       "edit_svc_mode","edit_svc_select","edit_svc_new",
+                       "edit_biz","edit_contact","edit_phone","edit_addr","edit_web","edit_notes","edit_kw")
             st.rerun()
         except Exception as e:
             st.exception(e)
@@ -354,9 +423,11 @@ def section_delete(engine):
 
     df_sorted = df.sort_values("business_name", key=lambda srs: srs.astype(str).str.lower())
     def label_for_row(r):
-        cat = s(r.get("category"))
-        svc = s(r.get("service"))
-        return f"{s(r.get('business_name'))} — {cat} / {svc}  [#{r['id']}]"
+        cat = cap_words_reasonable(r.get("category"))
+        svc = cap_words_reasonable(r.get("service"))
+        bn  = cap_words_reasonable(r.get("business_name"))
+        name = bn or f"{cat} / {svc}" or "[no name]"
+        return f"{name}  [#{r['id']}]"
 
     id_to_label = {int(r["id"]): label_for_row(r) for _, r in df_sorted.iterrows()}
     ids = list(id_to_label.keys())
@@ -371,11 +442,13 @@ def section_delete(engine):
     st.warning("This action is irreversible.", icon="⚠️")
     cols_btn = st.columns([1, 4])
     with cols_btn[0]:
-        do_delete = st.button("Delete Vendor", type="secondary", use_container_width=True)
+        do_delete = st.button("Delete Vendor", type="secondary", use_container_width=True, key="delete_btn")
     if do_delete:
         try:
             delete_vendor(engine, int(chosen_id))
             st.success("Vendor deleted.")
+            # Clear selection to avoid accidental double-delete
+            clear_keys("del_vendor_select")
             st.rerun()
         except Exception as e:
             st.exception(e)
@@ -395,6 +468,15 @@ def section_debug(engine):
             "counts": {"vendors": vendor_count},
         }
     )
+
+    st.write("---")
+    if st.button("Normalize capitalization for all rows now", type="secondary"):
+        try:
+            n = normalize_all_caps_now(engine)
+            st.success(f"Capitalization normalized on {n} row(s).")
+            st.rerun()
+        except Exception as e:
+            st.exception(e)
 
 # ---- Main ----
 def main():
