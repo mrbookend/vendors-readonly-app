@@ -54,6 +54,43 @@ def table_exists(c: sqlite3.Connection, table: str) -> bool:
     return cur.fetchone() is not None
 
 
+def table_cols(c: sqlite3.Connection, table: str) -> list[str]:
+    cur = c.execute(f"PRAGMA table_info({table})")
+    return [row[1] for row in cur.fetchall()]
+
+def migrate_services_if_needed(c: sqlite3.Connection) -> None:
+    if not table_exists(c, "services"):
+        return
+    cols = set(table_cols(c, "services"))
+    # Desired schema: services(category TEXT NOT NULL, service TEXT NOT NULL, UNIQUE(category, service))
+    if {"category", "service"}.issubset(cols):
+        return  # already good
+    # Migrate: rebuild from distinct pairs in vendors
+    c.execute(
+        """
+        CREATE TABLE IF NOT EXISTS services_new (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            category TEXT NOT NULL,
+            service  TEXT NOT NULL,
+            UNIQUE(category, service)
+        )
+        """
+    )
+    # Populate from vendors distinct pairs (best source of truth)
+    c.execute(
+        """
+        INSERT OR IGNORE INTO services_new(category, service)
+        SELECT DISTINCT
+               IFNULL(category, ''),
+               IFNULL(service, '')
+        FROM vendors
+        WHERE IFNULL(category,'')<>'' AND IFNULL(service,'')<>''
+        """
+    )
+    c.execute("DROP TABLE IF EXISTS services")
+    c.execute("ALTER TABLE services_new RENAME TO services")
+    c.commit()
+
 def ensure_aux_tables(c: sqlite3.Connection) -> None:
     # Create if missing
     c.execute(
@@ -69,11 +106,13 @@ def ensure_aux_tables(c: sqlite3.Connection) -> None:
         CREATE TABLE IF NOT EXISTS services (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             category TEXT NOT NULL,
-            service TEXT NOT NULL,
+            service  TEXT NOT NULL,
             UNIQUE(category, service)
         )
         """
     )
+    # If a legacy services table exists with a different schema, migrate it
+    migrate_services_if_needed(c)
     c.commit()
 
 
@@ -107,12 +146,27 @@ def get_services_for_category(category: str) -> List[str]:
     if not category:
         return []
     with closing(conn()) as c:
-        if table_exists(c, "services"):
-            rows = c.execute(
-                "SELECT service FROM services WHERE category=? ORDER BY service",
-                (category,),
-            ).fetchall()
-            return [r[0] for r in rows]
+        try:
+            if table_exists(c, "services"):
+                # ensure schema is valid (will no-op if already valid)
+                ensure_aux_tables(c)
+                rows = c.execute(
+                    "SELECT service FROM services WHERE category=? ORDER BY service",
+                    (category,),
+                ).fetchall()
+                return [r[0] for r in rows]
+        except sqlite3.OperationalError:
+            # Fallback if services table exists but schema is unexpected: derive from vendors
+            pass
+        rows = c.execute(
+            """
+            SELECT DISTINCT service FROM vendors
+            WHERE IFNULL(service,'')<>'' AND category=?
+            ORDER BY service
+            """,
+            (category,),
+        ).fetchall()
+        return [r[0] for r in rows]
         else:
             rows = c.execute(
                 """
@@ -446,8 +500,19 @@ def page_cat_svc_admin():
 
 def main():
     st.set_page_config(page_title="Vendors Admin", layout="wide")
-    st.sidebar.title("Navigation")
-    page = st.sidebar.radio("Go to", ("Vendors Admin", "Categories & Services Admin"))
+
+    # Top-of-page navigation (not sidebar)
+    st.markdown("### Navigation
+**Go to**")
+    page = st.radio(
+        label="",
+        options=("Vendors Admin", "Categories & Services Admin"),
+        index=0,
+        horizontal=False,
+        key="top_nav_radio",
+    )
+    st.divider()
+
     if page == "Vendors Admin":
         page_vendors_admin()
     else:
@@ -455,4 +520,6 @@ def main():
 
 
 if __name__ == "__main__":
+    main()
+
     main()
