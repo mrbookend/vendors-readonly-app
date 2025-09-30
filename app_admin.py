@@ -502,8 +502,8 @@ def main():
     st.set_page_config(page_title="Vendors Admin", layout="wide")
 
     # Top-of-page navigation (not sidebar)
-    st.markdown("### Navigation
-**Go to**")
+    st.markdown("""### Navigation
+**Go to**""")
     page = st.radio(
         label="",
         options=("Vendors Admin", "Categories & Services Admin"),
