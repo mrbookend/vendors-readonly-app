@@ -167,16 +167,6 @@ def get_services_for_category(category: str) -> List[str]:
             (category,),
         ).fetchall()
         return [r[0] for r in rows]
-        else:
-            rows = c.execute(
-                """
-                SELECT DISTINCT service FROM vendors
-                WHERE IFNULL(service,'')<>'' AND category=?
-                ORDER BY service
-                """,
-                (category,),
-            ).fetchall()
-            return [r[0] for r in rows]
 
 
 def upsert_category(name: str) -> None:
