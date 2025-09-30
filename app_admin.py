@@ -40,7 +40,22 @@ def get_engine():
             future=True,
         )
     # Fallback: local file (dev only)
-    db_url = os.getenv("DB_URL") or f"sqlite:///{DEFAULT_DB_PATH}"
+DB_URL = os.getenv("DB_URL") or f"sqlite:///{DEFAULT_DB_PATH}"
+
+@st.cache_resource(show_spinner=False)
+def get_engine():
+    # Prefer Turso (live remote DB). Falls back to local file for dev.
+    turso_url = os.environ.get("TURSO_DATABASE_URL") or st.secrets.get("TURSO_DATABASE_URL", "")
+    turso_tok = os.environ.get("TURSO_AUTH_TOKEN")   or st.secrets.get("TURSO_AUTH_TOKEN", "")
+    if turso_url and turso_tok:
+        driver_url = turso_url.replace("libsql://", "sqlite+libsql://")
+        return create_engine(
+            f"{driver_url}?secure=true",
+            connect_args={"auth_token": turso_tok},
+            future=True,
+        )
+    db_path = Path(__file__).resolve().parent / "vendors.db"
+    db_url = os.getenv("DB_URL") or f"sqlite:///{db_path}"
     return create_engine(db_url, future=True)
 
 # ---- Safe helpers & casing ----
