@@ -1,11 +1,11 @@
-# app_admin.py — Vendors Admin (SQLite) with phone normalization
+# app_admin.py — Vendors Admin (SQLite) with phone normalization, inline Category→Service, and maintenance tools
 # Features:
-# - Enforce/normalize phone format to (xxx) xxx-xxxx on add/edit. Accepts raw digits (e.g., 2108333141 or 2108333141.0) and formats.
-# - "Add Vendor" uses Category -> Service cascade. Services are filtered by selected Category.
-# - Dropdowns have a clear placeholder ("— select —"). A special "+ Add New…" entry lets you add a new Category/Service inline.
-# - "Vendors Admin" includes Add / Edit / Delete flows. Business Name picker sorted A→Z.
-# - "Categories & Services Admin" page to add new Categories and Services (creates tables if missing).
-# - Works if you only have a vendors table; if categories/services tables exist, they are used; otherwise distinct values from vendors are used for picks.
+# - Enforce/normalize phone to (xxx) xxx-xxxx on add/edit. Accepts raw digits (e.g., 2108333141 or 2108333141.0).
+# - Add/Edit/Delete flows; business picker sorted A→Z.
+# - Category → Service cascade; dropdowns show a placeholder ("— select —") and a "+ Add New…" inline path.
+# - Categories & Services Admin page to add categories/services and a one-click "Repair Services Table" button.
+# - Works with only vendors table present; uses categories/services tables when available; auto-migrates legacy services schema.
+# - After successful Add/Edit/Delete/Repair, the app immediately refreshes (st.rerun).
 
 from __future__ import annotations
 
@@ -13,7 +13,7 @@ import os
 import re
 import sqlite3
 from contextlib import closing
-from typing import List, Optional, Tuple
+from typing import List, Optional, Tuple, Dict
 
 import pandas as pd
 import streamlit as st
@@ -48,24 +48,24 @@ def conn() -> sqlite3.Connection:
 
 
 def table_exists(c: sqlite3.Connection, table: str) -> bool:
-    cur = c.execute(
-        "SELECT name FROM sqlite_master WHERE type='table' AND name=?", (table,)
-    )
+    cur = c.execute("SELECT name FROM sqlite_master WHERE type='table' AND name=?", (table,))
     return cur.fetchone() is not None
 
 
-def table_cols(c: sqlite3.Connection, table: str) -> list[str]:
+def table_cols(c: sqlite3.Connection, table: str) -> List[str]:
     cur = c.execute(f"PRAGMA table_info({table})")
     return [row[1] for row in cur.fetchall()]
 
+
 def migrate_services_if_needed(c: sqlite3.Connection) -> None:
+    """If services table exists with wrong schema (e.g., id,name), rebuild correctly."""
     if not table_exists(c, "services"):
         return
     cols = set(table_cols(c, "services"))
-    # Desired schema: services(category TEXT NOT NULL, service TEXT NOT NULL, UNIQUE(category, service))
-    if {"category", "service"}.issubset(cols):
-        return  # already good
-    # Migrate: rebuild from distinct pairs in vendors
+    want = {"category", "service"}
+    if want.issubset(cols):
+        return
+    # Rebuild as services_new
     c.execute(
         """
         CREATE TABLE IF NOT EXISTS services_new (
@@ -76,13 +76,11 @@ def migrate_services_if_needed(c: sqlite3.Connection) -> None:
         )
         """
     )
-    # Populate from vendors distinct pairs (best source of truth)
+    # Populate from vendors distinct pairs
     c.execute(
         """
         INSERT OR IGNORE INTO services_new(category, service)
-        SELECT DISTINCT
-               IFNULL(category, ''),
-               IFNULL(service, '')
+        SELECT DISTINCT IFNULL(category,''), IFNULL(service,'')
         FROM vendors
         WHERE IFNULL(category,'')<>'' AND IFNULL(service,'')<>''
         """
@@ -91,8 +89,8 @@ def migrate_services_if_needed(c: sqlite3.Connection) -> None:
     c.execute("ALTER TABLE services_new RENAME TO services")
     c.commit()
 
+
 def ensure_aux_tables(c: sqlite3.Connection) -> None:
-    # Create if missing
     c.execute(
         """
         CREATE TABLE IF NOT EXISTS categories (
@@ -111,10 +109,38 @@ def ensure_aux_tables(c: sqlite3.Connection) -> None:
         )
         """
     )
-    # If a legacy services table exists with a different schema, migrate it
     migrate_services_if_needed(c)
     c.commit()
 
+
+def repair_services_table() -> Dict[str, object]:
+    """Force repair services table to expected schema; return summary."""
+    with closing(conn()) as cxn:
+        before = {"has_services": table_exists(cxn, "services"), "cols": table_cols(cxn, "services") if table_exists(cxn, "services") else []}
+        cxn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS services_new (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                category TEXT NOT NULL,
+                service  TEXT NOT NULL,
+                UNIQUE(category, service)
+            )
+            """
+        )
+        cxn.execute(
+            """
+            INSERT OR IGNORE INTO services_new(category, service)
+            SELECT DISTINCT IFNULL(category,''), IFNULL(service,'')
+            FROM vendors
+            WHERE IFNULL(category,'')<>'' AND IFNULL(service,'')<>''
+            """
+        )
+        cxn.execute("DROP TABLE IF EXISTS services")
+        cxn.execute("ALTER TABLE services_new RENAME TO services")
+        cxn.commit()
+        after = {"has_services": table_exists(cxn, "services"), "cols": table_cols(cxn, "services")}
+        rows = cxn.execute("SELECT category, COUNT(*) AS n FROM services GROUP BY category ORDER BY category").fetchall()
+        return {"before": before, "after": after, "category_counts": [{"category": r[0], "n": r[1]} for r in rows]}
 
 # -----------------------------------------------------------------------------
 # Data access
@@ -123,7 +149,6 @@ def ensure_aux_tables(c: sqlite3.Connection) -> None:
 def get_vendors_df() -> pd.DataFrame:
     with closing(conn()) as c:
         df = pd.read_sql_query("SELECT * FROM vendors", c)
-    # Ensure all required columns exist
     for col in REQUIRED_COLUMNS:
         if col not in df.columns:
             df[col] = ""
@@ -135,11 +160,8 @@ def get_categories() -> List[str]:
         if table_exists(c, "categories"):
             rows = c.execute("SELECT name FROM categories ORDER BY name").fetchall()
             return [r[0] for r in rows]
-        else:
-            rows = c.execute(
-                "SELECT DISTINCT category FROM vendors WHERE IFNULL(category,'')<>'' ORDER BY category"
-            ).fetchall()
-            return [r[0] for r in rows]
+        rows = c.execute("SELECT DISTINCT category FROM vendors WHERE IFNULL(category,'')<>'' ORDER BY category").fetchall()
+        return [r[0] for r in rows]
 
 
 def get_services_for_category(category: str) -> List[str]:
@@ -148,15 +170,13 @@ def get_services_for_category(category: str) -> List[str]:
     with closing(conn()) as c:
         try:
             if table_exists(c, "services"):
-                # ensure schema is valid (will no-op if already valid)
-                ensure_aux_tables(c)
+                ensure_aux_tables(c)  # no-op if already correct
                 rows = c.execute(
                     "SELECT service FROM services WHERE category=? ORDER BY service",
                     (category,),
                 ).fetchall()
                 return [r[0] for r in rows]
         except sqlite3.OperationalError:
-            # Fallback if services table exists but schema is unexpected: derive from vendors
             pass
         rows = c.execute(
             """
@@ -179,10 +199,7 @@ def upsert_category(name: str) -> None:
 def upsert_service(category: str, service: str) -> None:
     with closing(conn()) as c:
         ensure_aux_tables(c)
-        c.execute(
-            "INSERT OR IGNORE INTO services(category, service) VALUES(?,?)",
-            (category.strip(), service.strip()),
-        )
+        c.execute("INSERT OR IGNORE INTO services(category, service) VALUES(?,?)", (category.strip(), service.strip()))
         c.commit()
 
 
@@ -225,7 +242,6 @@ def delete_vendor(vid: int) -> None:
         c.execute("DELETE FROM vendors WHERE id=?", (vid,))
         c.commit()
 
-
 # -----------------------------------------------------------------------------
 # Validation / Normalization
 # -----------------------------------------------------------------------------
@@ -239,9 +255,7 @@ def normalize_phone(raw: str) -> str:
     s = str(raw).strip()
     if not s:
         return ""
-    # Strip all non-digits
     digits = re.sub(r"\D", "", s)
-    # If it came from a float string like '2108333141.0', strip trailing .0 artifacts
     digits = digits.rstrip("0") if s.endswith(".0") and len(digits) > 10 else digits
     if len(digits) == 11 and digits.startswith("1"):
         digits = digits[1:]
@@ -255,19 +269,16 @@ def require(text: str, label: str) -> None:
     if not text or not text.strip():
         raise ValueError(f"{label} is required")
 
-
 # -----------------------------------------------------------------------------
 # UI Helpers
 # -----------------------------------------------------------------------------
 
-def header(title: str):
+def section(title: str):
     st.markdown(f"## {title}")
 
 
 def select_with_add(label: str, options: List[str], key: str) -> Tuple[str, Optional[str]]:
-    """Show a selectbox with PLACEHOLDER and ADD_NEW option.
-    Returns (value, new_value) where new_value is non-empty if user chose ADD_NEW and provided a value.
-    """
+    """Selectbox with placeholder and + Add New…; returns (value, new_value)."""
     opts = [PLACEHOLDER] + options + [ADD_NEW]
     choice = st.selectbox(label, opts, index=0, key=key)
     new_val = None
@@ -275,13 +286,12 @@ def select_with_add(label: str, options: List[str], key: str) -> Tuple[str, Opti
         new_val = st.text_input(f"New {label}", key=f"{key}_new")
     return ("" if choice in (PLACEHOLDER, ADD_NEW) else choice, new_val)
 
-
 # -----------------------------------------------------------------------------
-# Main App
+# Pages
 # -----------------------------------------------------------------------------
 
 def page_vendors_admin():
-    header("Vendors Admin")
+    section("Vendors Admin")
 
     df = get_vendors_df()
     with st.expander("Database Status & Schema (debug)", expanded=False):
@@ -309,9 +319,9 @@ def page_vendors_admin():
                 upsert_category(cat_new)
                 cat_val = cat_new
                 st.success(f"Category '{cat_new}' added.")
+                st.rerun()
             except Exception as e:
                 st.error(str(e))
-        # Services depend on final category value
         svcs = get_services_for_category(cat_val) if cat_val else []
         svc_val, svc_new = select_with_add("Service", svcs, key="add_svc")
         if svc_new:
@@ -321,6 +331,7 @@ def page_vendors_admin():
                 upsert_service(cat_val, svc_new)
                 svc_val = svc_new
                 st.success(f"Service '{svc_new}' added to '{cat_val}'.")
+                st.rerun()
             except Exception as e:
                 st.error(str(e))
 
@@ -349,8 +360,9 @@ def page_vendors_admin():
                     "notes": notes.strip(),
                     "keywords": re.sub(r"\s*,\s*", ", ", re.sub(r"\s+", ", ", keywords.strip())).strip(", ") if keywords else "",
                 }
-                vid = insert_vendor(rec)
-                st.success(f"Added vendor #{vid} — {business_name}")
+                insert_vendor(rec)
+                st.success(f"Added — {business_name}")
+                st.rerun()
             except Exception as e:
                 st.error(str(e))
 
@@ -376,6 +388,7 @@ def page_vendors_admin():
                     upsert_category(cat_new)
                     cat_val = cat_new
                     st.success(f"Category '{cat_new}' added.")
+                    st.rerun()
                 except Exception as e:
                     st.error(str(e))
 
@@ -390,6 +403,7 @@ def page_vendors_admin():
                     upsert_service(cat_val, svc_new)
                     svc_val = svc_new
                     st.success(f"Service '{svc_new}' added to '{cat_val}'.")
+                    st.rerun()
                 except Exception as e:
                     st.error(str(e))
 
@@ -419,7 +433,8 @@ def page_vendors_admin():
                         "keywords": re.sub(r"\s*,\s*", ", ", re.sub(r"\s+", ", ", keywords.strip())).strip(", ") if keywords else "",
                     }
                     update_vendor(int(vid), rec)
-                    st.success(f"Updated vendor #{vid} — {business_name}")
+                    st.success(f"Updated — {business_name}")
+                    st.rerun()
                 except Exception as e:
                     st.error(str(e))
 
@@ -436,14 +451,27 @@ def page_vendors_admin():
             if st.button("Delete", type="secondary"):
                 delete_vendor(int(vid))
                 st.success(f"Deleted vendor #{vid}")
+                st.rerun()
 
 
 def page_cat_svc_admin():
-    header("Categories & Services Admin")
+    section("Categories & Services Admin")
     st.caption("Add new categories or services here. These feed the dropdowns in Vendors Admin.")
 
     with closing(conn()) as c:
         ensure_aux_tables(c)
+
+    # Maintenance actions
+    with st.expander("Maintenance", expanded=False):
+        st.write("If your Services table ever becomes mis-schematized (e.g., only has 'id, name'), use this repair tool. It rebuilds the table from distinct (Category, Service) pairs in vendors.")
+        if st.button("Repair Services Table", key="btn_repair_services"):
+            try:
+                info = repair_services_table()
+                st.success("Services table repaired.")
+                st.json(info)
+                st.rerun()
+            except Exception as e:
+                st.error(f"Repair failed: {e}")
 
     col1, col2 = st.columns(2)
     with col1:
@@ -454,6 +482,7 @@ def page_cat_svc_admin():
                 require(new_cat, "Category")
                 upsert_category(new_cat)
                 st.success(f"Category '{new_cat}' added.")
+                st.rerun()
             except Exception as e:
                 st.error(str(e))
 
@@ -468,6 +497,7 @@ def page_cat_svc_admin():
                 require(new_svc, "Service")
                 upsert_service(cat_val, new_svc)
                 st.success(f"Service '{new_svc}' added to '{cat_val}'.")
+                st.rerun()
             except Exception as e:
                 st.error(str(e))
 
@@ -483,15 +513,12 @@ def page_cat_svc_admin():
             rows.append({"Category": cat, "Service": svc})
     st.dataframe(pd.DataFrame(rows), hide_index=True, use_container_width=True)
 
-
 # -----------------------------------------------------------------------------
-# Router
+# Router (top-of-page Navigation, not sidebar)
 # -----------------------------------------------------------------------------
 
 def main():
     st.set_page_config(page_title="Vendors Admin", layout="wide")
-
-    # Top-of-page navigation (not sidebar)
     st.markdown("""### Navigation
 **Go to**""")
     page = st.radio(
@@ -511,4 +538,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
