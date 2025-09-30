@@ -3,6 +3,7 @@
 # Non-FTS AND search across all fields. Optional "keywords" column supported.
 # Capitalization enforced (Category, Service, Business Name, Contact Name) on Add/Edit.
 # Business Name optional. Dedicated Category/Service Library to add taxonomy WITHOUT creating a vendor row.
+# Hardened taxonomy lookups: adapts to existing categories/services schemas; falls back to vendors distincts.
 
 from __future__ import annotations
 
@@ -16,6 +17,7 @@ import pandas as pd
 import streamlit as st
 from sqlalchemy import create_engine
 from sqlalchemy.sql import text as sql_text
+from sqlalchemy.exc import OperationalError
 
 APP_TITLE = "Vendors Admin"
 st.set_page_config(page_title=APP_TITLE, layout="wide")
@@ -36,8 +38,24 @@ def has_table(engine, name: str) -> bool:
         ).fetchone()
     return row is not None
 
+def table_columns(engine, table: str) -> List[str]:
+    """Return lowercased column names for a table; [] if it doesn't exist."""
+    if not has_table(engine, table):
+        return []
+    with engine.begin() as con:
+        info = con.execute(sql_text(f"PRAGMA table_info({table})")).fetchall()
+    return [str(r[1]).lower() for r in info]
+
+def choose_column(cols: List[str], candidates: List[str]) -> Optional[str]:
+    """Pick the first candidate present in cols (case-insensitive). Return None if none found."""
+    cl = [c.lower() for c in cols]
+    for cand in candidates:
+        if cand.lower() in cl:
+            return cand  # return the requested spelling; we'll lowercase when building SQL
+    return None
+
 def ensure_vocab_tables(engine) -> None:
-    """Create categories/services library tables if they don't exist."""
+    """Create simple library tables if they don't exist."""
     with engine.begin() as con:
         con.execute(sql_text(
             "CREATE TABLE IF NOT EXISTS categories ("
@@ -53,19 +71,15 @@ def ensure_vocab_tables(engine) -> None:
         ))
 
 def seed_vocab_from_vendors_if_empty(engine) -> None:
-    """If the categories/services tables are empty, seed from vendors distincts."""
-    if not has_table(engine, "categories") or not has_table(engine, "services"):
-        ensure_vocab_tables(engine)
-
+    """If the categories/services tables are empty (or don't exist), seed from vendors distincts."""
+    ensure_vocab_tables(engine)
     with engine.begin() as con:
-        # categories empty?
         ncat = con.execute(sql_text("SELECT COUNT(*) FROM categories")).scalar_one()
         if int(ncat) == 0:
             con.execute(sql_text(
                 "INSERT OR IGNORE INTO categories(name) "
                 "SELECT DISTINCT TRIM(category) FROM vendors WHERE TRIM(IFNULL(category,'')) <> ''"
             ))
-        # services empty?
         nsvc = con.execute(sql_text("SELECT COUNT(*) FROM services")).scalar_one()
         if int(nsvc) == 0:
             con.execute(sql_text(
@@ -166,33 +180,64 @@ def normalize_keywords(sval) -> str:
     parts = sorted(set([p.strip() for p in parts if p.strip()]))
     return ", ".join(parts)
 
-# ---- Taxonomy fetch/upsert ----
+# ---- Taxonomy fetch/upsert (robust) ----
 def fetch_categories(engine) -> List[str]:
+    """
+    Try to read categories from a library table with flexible schemas.
+    Fall back to vendors distincts if table/columns not suitable.
+    """
     if has_table(engine, "categories"):
-        with engine.begin() as con:
-            rows = con.execute(sql_text(
-                "SELECT name FROM categories WHERE TRIM(IFNULL(name,''))<>'' ORDER BY name COLLATE NOCASE"
-            )).fetchall()
-        return [r[0] for r in rows]
+        cols = table_columns(engine, "categories")
+        name_col = choose_column(cols, ["name", "category", "category_name"])
+        if name_col:
+            name_col_q = name_col.lower()
+            try:
+                with engine.begin() as con:
+                    rows = con.execute(sql_text(
+                        f"SELECT {name_col_q} FROM categories "
+                        f"WHERE TRIM(IFNULL({name_col_q},''))<>'' "
+                        f"ORDER BY {name_col_q} COLLATE NOCASE"
+                    )).fetchall()
+                return [r[0] for r in rows]
+            except OperationalError:
+                pass  # fall back below
+
     # fallback to vendors distinct
     with engine.begin() as con:
         rows = con.execute(sql_text(
-            "SELECT DISTINCT category FROM vendors WHERE TRIM(IFNULL(category,''))<>'' ORDER BY category COLLATE NOCASE"
+            "SELECT DISTINCT category FROM vendors "
+            "WHERE TRIM(IFNULL(category,''))<>'' "
+            "ORDER BY category COLLATE NOCASE"
         )).fetchall()
     return [r[0] for r in rows]
 
 def fetch_services(engine, category: str) -> List[str]:
+    """
+    Try to read services from a library table with flexible schemas.
+    Expect a text category column and a text service name column.
+    Fall back to vendors distinct if not available/compatible.
+    """
     c = s(category)
     if not c:
         return []
     if has_table(engine, "services"):
-        with engine.begin() as con:
-            rows = con.execute(sql_text(
-                "SELECT service FROM services "
-                "WHERE category = :c AND TRIM(IFNULL(service,''))<>'' "
-                "ORDER BY service COLLATE NOCASE"
-            ), {"c": c}).fetchall()
-        return [r[0] for r in rows]
+        cols = table_columns(engine, "services")
+        cat_col = choose_column(cols, ["category", "cat", "category_name"])
+        svc_col = choose_column(cols, ["service", "svc", "service_name", "name"])
+        if cat_col and svc_col:
+            cat_col_q = cat_col.lower()
+            svc_col_q = svc_col.lower()
+            try:
+                with engine.begin() as con:
+                    rows = con.execute(sql_text(
+                        f"SELECT {svc_col_q} FROM services "
+                        f"WHERE {cat_col_q} = :c AND TRIM(IFNULL({svc_col_q},''))<>'' "
+                        f"ORDER BY {svc_col_q} COLLATE NOCASE"
+                    ), {"c": c}).fetchall()
+                return [r[0] for r in rows]
+            except OperationalError:
+                pass  # fall back below
+
     # fallback to vendors distinct
     with engine.begin() as con:
         rows = con.execute(sql_text(
@@ -310,9 +355,10 @@ def section_browse(engine):
 def section_add(engine):
     st.subheader("Add Vendor")
     cols = get_columns(engine)
+    # Ensure simple library is present/seeded, but we’ll still adapt to existing schemas when reading.
     seed_vocab_from_vendors_if_empty(engine)
 
-    # Category selection or new (pulled from library if present)
+    # Category selection or new
     categories = fetch_categories(engine)
     c1, c2 = st.columns([1, 2])
     with c1:
@@ -323,7 +369,7 @@ def section_add(engine):
         else:
             category = st.text_input("New Category", "", key="cat_new")
 
-    # Services depend on category, pulled from library if present
+    # Services depend on category
     cat_val = s(category)
     services = fetch_services(engine, cat_val) if cat_val else []
     s1, s2 = st.columns([1, 2])
@@ -352,7 +398,7 @@ def section_add(engine):
             if not s(svc):
                 st.error("Service is required."); st.stop()
 
-            # Keep library in sync, but this is NOT how you add taxonomy alone anymore.
+            # Keep library in sync (on our simple tables); harmless if you also have other schemas.
             upsert_service(engine, cat, svc)
 
             phone   = normalize_phone(phone_in)
@@ -408,7 +454,7 @@ def section_edit(engine):
     row = df[df["id"] == chosen_id].iloc[0].to_dict()
     cols = get_columns(engine)
 
-    # Use library lists
+    # Use library lists (robust to schema differences)
     seed_vocab_from_vendors_if_empty(engine)
     categories = fetch_categories(engine)
     c1, c2 = st.columns([1, 2])
@@ -455,7 +501,7 @@ def section_edit(engine):
             if not s(svc):
                 st.error("Service is required."); st.stop()
 
-            # Keep library in sync on edits
+            # Keep simple library in sync
             upsert_service(engine, cat, svc)
 
             phone   = normalize_phone(phone_in)
@@ -579,9 +625,11 @@ def section_debug(engine):
     info = {
         "db_source": DB_URL,
         "vendors_columns": {i: c for i, c in enumerate(cols)},
-        "has_keywords": "keywords" in cols,
         "has_categories_table": has_table(engine, "categories"),
         "has_services_table": has_table(engine, "services"),
+        "categories_columns": table_columns(engine, "categories"),
+        "services_columns": table_columns(engine, "services"),
+        "has_keywords": "keywords" in cols,
         "counts": {"vendors": vendor_count},
     }
     st.json(info)
@@ -615,7 +663,7 @@ def main():
     section_delete(engine)
 
     st.divider()
-    section_taxonomy(engine)  # <-- Add taxonomy without creating vendor records
+    section_taxonomy(engine)  # Add taxonomy without creating vendor records
 
     st.divider()
     section_debug(engine)  # Debug at bottom
