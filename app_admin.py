@@ -1,10 +1,8 @@
 # app_admin.py — Vendors Admin (Single page: Browse, Add, Edit, Delete; Taxonomy; Debug)
-# No sidebar. Immediate refresh on add/edit/delete. UI clears after actions.
-# Non-FTS AND search across all fields. Optional "keywords" column supported.
-# Capitalization enforced (Category, Service, Business Name, Contact Name) on Add/Edit.
-# Business Name REQUIRED in Add and Edit.
-# Category/Service Library uses categories_lib & services_lib (avoids legacy schema conflicts).
-# Dropdowns only for Category/Service in Add & Edit (no "Choose existing/Add new" radios).
+# Live DB via Turso (libSQL) when secrets are set; local SQLite fallback for dev
+# Immediate refresh on add/edit/delete. Dropdowns for Category/Service only.
+# Category/Service library stored in categories_lib/services_lib.
+# Business Name REQUIRED in Add/Edit. Non-FTS AND search across all fields.
 
 from __future__ import annotations
 
@@ -23,14 +21,26 @@ from sqlalchemy.exc import OperationalError
 APP_TITLE = "Vendors Admin"
 st.set_page_config(page_title=APP_TITLE, layout="wide")
 
-# ---- Database ----
+# ---- Database (Turso first; local fallback) ----
 DEFAULT_DB_PATH = Path(__file__).resolve().parent / "vendors.db"
-DB_URL = os.getenv("DB_URL") or f"sqlite:///{DEFAULT_DB_PATH}"
 
 @st.cache_resource(show_spinner=False)
 def get_engine():
-    return create_engine(DB_URL, future=True)
+    # Prefer Turso (live, remote)
+    turso_url = os.environ.get("TURSO_DATABASE_URL") or st.secrets.get("TURSO_DATABASE_URL", "")
+    turso_tok = os.environ.get("TURSO_AUTH_TOKEN")   or st.secrets.get("TURSO_AUTH_TOKEN", "")
+    if turso_url and turso_tok:
+        driver_url = turso_url.replace("libsql://", "sqlite+libsql://")
+        return create_engine(
+            f"{driver_url}?secure=true",
+            connect_args={"auth_token": turso_tok},
+            future=True,
+        )
+    # Fallback: local file (dev only)
+    db_url = os.getenv("DB_URL") or f"sqlite:///{DEFAULT_DB_PATH}"
+    return create_engine(db_url, future=True)
 
+# ---- Utility: schema helpers ----
 def has_table(engine, name: str) -> bool:
     with engine.begin() as con:
         row = con.execute(
@@ -39,13 +49,14 @@ def has_table(engine, name: str) -> bool:
         ).fetchone()
     return row is not None
 
+
 def table_columns(engine, table: str) -> List[str]:
-    """Return lowercased column names for a table; [] if it doesn't exist."""
     if not has_table(engine, table):
         return []
     with engine.begin() as con:
         info = con.execute(sql_text(f"PRAGMA table_info({table})")).fetchall()
     return [str(r[1]).lower() for r in info]
+
 
 def choose_column(cols: List[str], candidates: List[str]) -> Optional[str]:
     cl = [c.lower() for c in cols]
@@ -54,45 +65,42 @@ def choose_column(cols: List[str], candidates: List[str]) -> Optional[str]:
             return cand
     return None
 
+
+# ---- Library tables (categories_lib / services_lib) ----
 def ensure_vocab_tables(engine) -> None:
-    """Create our own library tables that won't collide with legacy schemas."""
     with engine.begin() as con:
         con.execute(sql_text(
-            "CREATE TABLE IF NOT EXISTS categories_lib ("
-            "  name TEXT PRIMARY KEY"
-            ");"
-        ))
+            "CREATE TABLE IF NOT EXISTS categories_lib (name TEXT PRIMARY KEY)"))
         con.execute(sql_text(
             "CREATE TABLE IF NOT EXISTS services_lib ("
-            "  category TEXT NOT NULL,"
-            "  service  TEXT NOT NULL,"
-            "  PRIMARY KEY(category, service)"
-            ");"
-        ))
+            " category TEXT NOT NULL,"
+            " service  TEXT NOT NULL,"
+            " PRIMARY KEY(category, service)"
+            ")"))
+
 
 def seed_vocab_from_vendors_if_empty(engine) -> None:
-    """Seed library tables from vendors distincts if empty."""
     ensure_vocab_tables(engine)
     with engine.begin() as con:
         ncat = con.execute(sql_text("SELECT COUNT(*) FROM categories_lib")).scalar_one()
         if int(ncat) == 0:
             con.execute(sql_text(
                 "INSERT OR IGNORE INTO categories_lib(name) "
-                "SELECT DISTINCT TRIM(category) FROM vendors WHERE TRIM(IFNULL(category,'')) <> ''"
-            ))
+                "SELECT DISTINCT TRIM(category) FROM vendors WHERE TRIM(IFNULL(category,''))<>''"))
         nsvc = con.execute(sql_text("SELECT COUNT(*) FROM services_lib")).scalar_one()
         if int(nsvc) == 0:
             con.execute(sql_text(
                 "INSERT OR IGNORE INTO services_lib(category, service) "
-                "SELECT DISTINCT TRIM(category), TRIM(service) "
-                "FROM vendors "
-                "WHERE TRIM(IFNULL(category,'')) <> '' AND TRIM(IFNULL(service,'')) <> ''"
-            ))
+                "SELECT DISTINCT TRIM(category), TRIM(service) FROM vendors "
+                "WHERE TRIM(IFNULL(category,''))<>'' AND TRIM(IFNULL(service,''))<>''"))
 
+
+# ---- Column discovery & load ----
 def get_columns(engine) -> List[str]:
     with engine.begin() as con:
         info = con.execute(sql_text("PRAGMA table_info(vendors)")).fetchall()
     return [r[1] for r in info]
+
 
 def load_df(engine) -> pd.DataFrame:
     cols = get_columns(engine)
@@ -101,23 +109,25 @@ def load_df(engine) -> pd.DataFrame:
         "phone","address","website","notes","keywords",
     ]
     select_cols = [c for c in ordered if c in cols]
-    sql = f"SELECT {', '.join(select_cols)} FROM vendors ORDER BY business_name COLLATE NOCASE"
+    order_col = "business_name" if "business_name" in cols else (select_cols[0] if select_cols else "id")
+    sql = f"SELECT {', '.join(select_cols)} FROM vendors ORDER BY {order_col} COLLATE NOCASE"
     with engine.begin() as con:
         df = pd.read_sql_query(sql, con)
     return df
 
+
 # ---- Safe helpers & casing ----
 def s(x) -> str:
-    """Safe string: None -> '', strings trimmed; other types -> str trimmed."""
     if x is None:
         return ""
     if isinstance(x, str):
         return x.strip()
     return str(x).strip()
 
+
 _ACRONYM = re.compile(r"^[A-Z0-9]{2,}$")
+
 def cap_words_reasonable(x: str) -> str:
-    """Title-case per word; keep ALLCAPS/digits as-is."""
     t = s(x)
     if not t:
         return ""
@@ -132,20 +142,23 @@ def cap_words_reasonable(x: str) -> str:
             out.append(p[:1].upper() + p[1:].lower())
     return "".join(out)
 
+
 def apply_casing(d: Dict[str, str]) -> Dict[str, str]:
-    """Capitalize where it makes sense."""
     for k in ("category", "service", "business_name", "contact_name"):
         if k in d:
             d[k] = cap_words_reasonable(d[k])
     return d
 
+
 def clear_keys(*keys: str) -> None:
     for k in keys:
         st.session_state.pop(k, None)
 
+
 # ---- Normalizers & validators ----
 PHONE_ERR = "Phone must be 10 digits (US) or left blank"
 URL_ERR = "Website must be a valid URL (with or without https://) or left blank"
+
 
 def normalize_phone(x) -> str:
     raw = s(x)
@@ -158,6 +171,7 @@ def normalize_phone(x) -> str:
         raise ValueError(PHONE_ERR)
     return f"({digits[0:3]}) {digits[3:6]}-{digits[6:10]}"
 
+
 def normalize_url(u) -> str:
     u = s(u)
     if not u:
@@ -169,6 +183,7 @@ def normalize_url(u) -> str:
         raise ValueError(URL_ERR)
     return parsed.geturl()
 
+
 def normalize_keywords(sval) -> str:
     sval = s(sval)
     if not sval:
@@ -177,9 +192,9 @@ def normalize_keywords(sval) -> str:
     parts = sorted(set([p.strip() for p in parts if p.strip()]))
     return ", ".join(parts)
 
-# ---- Taxonomy fetch/upsert (lib-first; robust fallbacks) ----
+
+# ---- Taxonomy fetch/upsert ----
 def fetch_categories(engine) -> List[str]:
-    """Prefer categories_lib; else try existing categories table; else vendors distinct."""
     ensure_vocab_tables(engine)
     with engine.begin() as con:
         rows = con.execute(sql_text(
@@ -197,9 +212,7 @@ def fetch_categories(engine) -> List[str]:
             try:
                 with engine.begin() as con:
                     rows = con.execute(sql_text(
-                        f"SELECT {name_col_q} FROM categories "
-                        f"WHERE TRIM(IFNULL({name_col_q},''))<>'' "
-                        f"ORDER BY {name_col_q} COLLATE NOCASE"
+                        f"SELECT {name_col_q} FROM categories WHERE TRIM(IFNULL({name_col_q},''))<>'' ORDER BY {name_col_q} COLLATE NOCASE"
                     )).fetchall()
                 cats2 = [r[0] for r in rows]
                 if cats2:
@@ -209,23 +222,19 @@ def fetch_categories(engine) -> List[str]:
 
     with engine.begin() as con:
         rows = con.execute(sql_text(
-            "SELECT DISTINCT category FROM vendors "
-            "WHERE TRIM(IFNULL(category,''))<>'' "
-            "ORDER BY category COLLATE NOCASE"
+            "SELECT DISTINCT category FROM vendors WHERE TRIM(IFNULL(category,''))<>'' ORDER BY category COLLATE NOCASE"
         )).fetchall()
     return [r[0] for r in rows]
 
+
 def fetch_services(engine, category: str) -> List[str]:
-    """Prefer services_lib; else try existing services table (schema-flex); else vendors distinct."""
     c = s(category)
     if not c:
         return []
     ensure_vocab_tables(engine)
     with engine.begin() as con:
         rows = con.execute(sql_text(
-            "SELECT service FROM services_lib "
-            "WHERE category = :c AND TRIM(IFNULL(service,''))<>'' "
-            "ORDER BY service COLLATE NOCASE"
+            "SELECT service FROM services_lib WHERE category = :c AND TRIM(IFNULL(service,''))<>'' ORDER BY service COLLATE NOCASE"
         ), {"c": c}).fetchall()
     svcs = [r[0] for r in rows]
     if svcs:
@@ -236,14 +245,11 @@ def fetch_services(engine, category: str) -> List[str]:
         cat_col = choose_column(cols, ["category", "cat", "category_name"])
         svc_col = choose_column(cols, ["service", "svc", "service_name", "name"])
         if cat_col and svc_col:
-            cat_col_q = cat_col.lower()
-            svc_col_q = svc_col.lower()
+            cat_col_q = cat_col.lower(); svc_col_q = svc_col.lower()
             try:
                 with engine.begin() as con:
                     rows = con.execute(sql_text(
-                        f"SELECT {svc_col_q} FROM services "
-                        f"WHERE {cat_col_q} = :c AND TRIM(IFNULL({svc_col_q},''))<>'' "
-                        f"ORDER BY {svc_col_q} COLLATE NOCASE"
+                        f"SELECT {svc_col_q} FROM services WHERE {cat_col_q} = :c AND TRIM(IFNULL({svc_col_q},''))<>'' ORDER BY {svc_col_q} COLLATE NOCASE"
                     ), {"c": c}).fetchall()
                 svcs2 = [r[0] for r in rows]
                 if svcs2:
@@ -253,38 +259,29 @@ def fetch_services(engine, category: str) -> List[str]:
 
     with engine.begin() as con:
         rows = con.execute(sql_text(
-            "SELECT DISTINCT service FROM vendors "
-            "WHERE TRIM(IFNULL(category,''))<>'' AND category=:c "
-            "  AND TRIM(IFNULL(service,''))<>'' "
-            "ORDER BY service COLLATE NOCASE"
+            "SELECT DISTINCT service FROM vendors WHERE TRIM(IFNULL(category,''))<>'' AND category=:c AND TRIM(IFNULL(service,''))<>'' ORDER BY service COLLATE NOCASE"
         ), {"c": c}).fetchall()
     return [r[0] for r in rows]
+
 
 def upsert_category(engine, name: str) -> None:
     ensure_vocab_tables(engine)
     with engine.begin() as con:
-        con.execute(sql_text(
-            "INSERT OR IGNORE INTO categories_lib(name) VALUES(:n)"
-        ), {"n": cap_words_reasonable(name)})
+        con.execute(sql_text("INSERT OR IGNORE INTO categories_lib(name) VALUES(:n)"), {"n": cap_words_reasonable(name)})
+
 
 def upsert_service(engine, category: str, service: str) -> None:
-    """Write only to *_lib tables to avoid legacy schema conflicts."""
     ensure_vocab_tables(engine)
-    cat = cap_words_reasonable(category)
-    svc = cap_words_reasonable(service)
+    cat = cap_words_reasonable(category); svc = cap_words_reasonable(service)
     with engine.begin() as con:
         con.execute(sql_text("INSERT OR IGNORE INTO categories_lib(name) VALUES(:n)"), {"n": cat})
-        con.execute(sql_text(
-            "INSERT OR IGNORE INTO services_lib(category, service) VALUES(:c, :s)"
-        ), {"c": cat, "s": svc})
+        con.execute(sql_text("INSERT OR IGNORE INTO services_lib(category, service) VALUES(:c, :s)"), {"c": cat, "s": svc})
+
 
 # ---- CRUD on vendors ----
 def insert_vendor(engine, row: Dict[str, str]) -> None:
     cols = get_columns(engine)
-    allowed = [
-        "category","service","business_name","contact_name",
-        "phone","address","website","notes","keywords",
-    ]
+    allowed = ["category","service","business_name","contact_name","phone","address","website","notes","keywords"]
     values = {k: s(row.get(k, "")) for k in allowed if k in cols}
     values = apply_casing(values)
     placeholders = ", ".join([f":{k}" for k in values.keys()])
@@ -292,6 +289,7 @@ def insert_vendor(engine, row: Dict[str, str]) -> None:
     sql = f"INSERT INTO vendors ({columns}) VALUES ({placeholders})"
     with engine.begin() as con:
         con.execute(sql_text(sql), values)
+
 
 def update_vendor(engine, vid: int, updates: Dict[str, str]) -> None:
     if not updates:
@@ -307,16 +305,19 @@ def update_vendor(engine, vid: int, updates: Dict[str, str]) -> None:
     with engine.begin() as con:
         con.execute(sql_text(f"UPDATE vendors SET {set_clause} WHERE id = :id"), upd)
 
+
 def delete_vendor(engine, vid: int) -> None:
     with engine.begin() as con:
         con.execute(sql_text("DELETE FROM vendors WHERE id = :id"), {"id": vid})
 
+
 def normalize_all_caps_now(engine) -> int:
-    """Normalize capitalization across all vendor rows (where it makes sense)."""
     df = load_df(engine)
     count = 0
     for _, r in df.iterrows():
-        vid = int(r["id"])
+        vid = int(r["id"]) if "id" in r else None
+        if vid is None:
+            continue
         updates = {
             "category": r.get("category"),
             "service": r.get("service"),
@@ -328,6 +329,7 @@ def normalize_all_caps_now(engine) -> int:
             update_vendor(engine, vid, cased)
             count += 1
     return count
+
 
 # ---- Search ----
 def filter_df(df: pd.DataFrame, query: str) -> pd.DataFrame:
@@ -344,6 +346,7 @@ def filter_df(df: pd.DataFrame, query: str) -> pd.DataFrame:
         tok = tok.lower()
         mask &= lower.apply(lambda ser: ser.str.contains(tok, na=False)).any(axis=1)
     return df[mask]
+
 
 # ---- UI Sections ----
 def section_browse(engine):
@@ -364,6 +367,7 @@ def section_browse(engine):
     except Exception:
         col_config = {}
     st.dataframe(filtered, use_container_width=True, hide_index=True, column_config=col_config)
+
 
 def section_add(engine):
     st.subheader("Add Vendor")
@@ -395,8 +399,6 @@ def section_add(engine):
             if not bn:
                 st.error("Business Name is required."); st.stop()
 
-            # DO NOT create taxonomy here; use Library section for that.
-
             phone   = normalize_phone(phone_in)
             website = normalize_url(website_in)
             kw_norm = normalize_keywords(keywords) if "keywords" in cols else ""
@@ -414,12 +416,11 @@ def section_add(engine):
             }
             insert_vendor(engine, row)
             st.success("Vendor added.")
-
-            clear_keys("cat_select_add","svc_select_add",
-                       "biz_add","contact_add","phone_add","addr_add","web_add","notes_add","kw_add")
+            clear_keys("cat_select_add","svc_select_add","biz_add","contact_add","phone_add","addr_add","web_add","notes_add","kw_add")
             st.rerun()
         except Exception as e:
             st.exception(e)
+
 
 def section_edit(engine):
     st.subheader("Edit Vendor")
@@ -428,8 +429,8 @@ def section_edit(engine):
         st.info("No vendors to edit.")
         return
 
-    # Picker for vendor
-    df_sorted = df.sort_values("business_name", key=lambda srs: srs.astype(str).str.lower())
+    df_sorted = df.sort_values("business_name", key=lambda srs: srs.astype(str).str.lower() if srs.dtype == 'object' else srs)
+
     def label_for_row(r):
         cat = cap_words_reasonable(r.get("category"))
         svc = cap_words_reasonable(r.get("service"))
@@ -444,7 +445,6 @@ def section_edit(engine):
     row = df[df["id"] == chosen_id].iloc[0].to_dict()
     cols = get_columns(engine)
 
-    # Dropdowns only; ensure current value is included even if not in library
     seed_vocab_from_vendors_if_empty(engine)
 
     lib_categories = fetch_categories(engine)
@@ -480,8 +480,6 @@ def section_edit(engine):
             if not bn:
                 st.error("Business Name is required."); st.stop()
 
-            # No taxonomy writes here; use Library.
-
             phone   = normalize_phone(phone_in)
             website = normalize_url(website_in)
             updates = {
@@ -500,11 +498,11 @@ def section_edit(engine):
             update_vendor(engine, int(chosen_id), updates)
             st.success("Vendor updated.")
 
-            clear_keys("edit_vendor_select","cat_select_edit","svc_select_edit",
-                       "biz_edit","contact_edit","phone_edit","addr_edit","web_edit","notes_edit","kw_edit")
+            clear_keys("edit_vendor_select","cat_select_edit","svc_select_edit","biz_edit","contact_edit","phone_edit","addr_edit","web_edit","notes_edit","kw_edit")
             st.rerun()
         except Exception as e:
             st.exception(e)
+
 
 def section_delete(engine):
     st.subheader("Delete Vendor")
@@ -513,7 +511,8 @@ def section_delete(engine):
         st.info("No vendors to delete.")
         return
 
-    df_sorted = df.sort_values("business_name", key=lambda srs: srs.astype(str).str.lower())
+    df_sorted = df.sort_values("business_name", key=lambda srs: srs.astype(str).str.lower() if srs.dtype == 'object' else srs)
+
     def label_for_row(r):
         cat = cap_words_reasonable(r.get("category"))
         svc = cap_words_reasonable(r.get("service"))
@@ -539,11 +538,11 @@ def section_delete(engine):
         except Exception as e:
             st.exception(e)
 
+
 def section_taxonomy(engine):
     st.subheader("Category/Service Library (no vendor record)")
     seed_vocab_from_vendors_if_empty(engine)
 
-    # --- Add Category Only ---
     st.markdown("**Add Category Only**")
     new_cat = st.text_input("New Category Name", "", key="lib_cat_new", placeholder="e.g., Plumbing")
     if st.button("Add Category Only", key="lib_cat_btn"):
@@ -559,7 +558,6 @@ def section_taxonomy(engine):
 
     st.write("---")
 
-    # --- Add Service Only ---
     st.markdown("**Add Service Only**")
     categories = fetch_categories(engine)
     svc_cat = st.selectbox("Category for this Service", [""] + categories, index=0, key="lib_svc_cat")
@@ -570,15 +568,24 @@ def section_taxonomy(engine):
                 st.error("Category is required."); st.stop()
             if not s(svc_name):
                 st.error("Service name is required."); st.stop()
-            upsert_service(engine, svc_cat, svc_name)  # writes to services_lib
+            upsert_service(engine, svc_cat, svc_name)
             st.success("Service added to library.")
             clear_keys("lib_svc_cat","lib_svc_name")
             st.rerun()
         except Exception as e:
             st.exception(e)
 
+
 def section_debug(engine):
     st.subheader("Database Status & Schema (debug)")
+    # Show REAL connection target derived from the SQLAlchemy engine
+    try:
+        engine_url = engine.url.render_as_string(hide_password=True)
+        driver = engine.url.drivername
+    except Exception:
+        engine_url = str(getattr(engine, 'url', 'unknown'))
+        driver = 'unknown'
+
     cols = get_columns(engine)
     try:
         vendor_count = int(load_df(engine).shape[0])
@@ -586,7 +593,8 @@ def section_debug(engine):
         vendor_count = -1
 
     info = {
-        "db_source": DB_URL,
+        "engine_url": engine_url,            # e.g., sqlite+libsql://<host>?secure=true
+        "driver": driver,                    # e.g., sqlite+libsql
         "vendors_columns": {i: c for i, c in enumerate(cols)},
         "has_categories_table": has_table(engine, "categories"),
         "has_services_table": has_table(engine, "services"),
@@ -607,30 +615,22 @@ def section_debug(engine):
         except Exception as e:
             st.exception(e)
 
+
 # ---- Main ----
 def main():
     st.title(APP_TITLE)
 
     engine = get_engine()
 
-    # Top-to-bottom layout; no sidebar.
     with st.expander("Browse (word search across all fields)", expanded=True):
         section_browse(engine)
 
-    st.divider()
-    section_add(engine)
+    st.divider(); section_add(engine)
+    st.divider(); section_edit(engine)
+    st.divider(); section_delete(engine)
+    st.divider(); section_taxonomy(engine)
+    st.divider(); section_debug(engine)
 
-    st.divider()
-    section_edit(engine)
-
-    st.divider()
-    section_delete(engine)
-
-    st.divider()
-    section_taxonomy(engine)  # Library (no vendor record)
-
-    st.divider()
-    section_debug(engine)  # Debug at bottom
 
 if __name__ == "__main__":
     main()
