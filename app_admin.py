@@ -1,11 +1,13 @@
-# app_admin.py — Vendors Admin (SQLite) with phone normalization, inline Category→Service, and maintenance tools
+# app_admin.py — Vendors Admin (SQLite) with phone normalization, inline Category→Service,
+# Browse (non-FTS search), and maintenance tools
+#
 # Features:
 # - Enforce/normalize phone to (xxx) xxx-xxxx on add/edit. Accepts raw digits (e.g., 2108333141 or 2108333141.0).
-# - Add/Edit/Delete flows; business picker sorted A→Z.
+# - Add/Edit/Delete flows; business picker sorted A→Z; immediate refresh after mutations (st.rerun()).
 # - Category → Service cascade; dropdowns show a placeholder ("— select —") and a "+ Add New…" inline path.
 # - Categories & Services Admin page to add categories/services and a one-click "Repair Services Table" button.
+# - Browse page: non-FTS, case-insensitive substring search across ALL vendor fields, with All/Any term mode.
 # - Works with only vendors table present; uses categories/services tables when available; auto-migrates legacy services schema.
-# - After successful Add/Edit/Delete/Repair, the app immediately refreshes (st.rerun).
 
 from __future__ import annotations
 
@@ -36,11 +38,21 @@ REQUIRED_COLUMNS = [
     "notes",
     "keywords",
 ]
+SEARCH_COLS_DEFAULT = [
+    "category",
+    "service",
+    "business_name",
+    "contact_name",
+    "phone",
+    "address",
+    "website",
+    "notes",
+    "keywords",
+]
 
 # -----------------------------------------------------------------------------
 # Database helpers
 # -----------------------------------------------------------------------------
-
 def conn() -> sqlite3.Connection:
     c = sqlite3.connect(DB_PATH)
     c.row_factory = sqlite3.Row
@@ -116,7 +128,10 @@ def ensure_aux_tables(c: sqlite3.Connection) -> None:
 def repair_services_table() -> Dict[str, object]:
     """Force repair services table to expected schema; return summary."""
     with closing(conn()) as cxn:
-        before = {"has_services": table_exists(cxn, "services"), "cols": table_cols(cxn, "services") if table_exists(cxn, "services") else []}
+        before = {
+            "has_services": table_exists(cxn, "services"),
+            "cols": table_cols(cxn, "services") if table_exists(cxn, "services") else [],
+        }
         cxn.execute(
             """
             CREATE TABLE IF NOT EXISTS services_new (
@@ -139,13 +154,18 @@ def repair_services_table() -> Dict[str, object]:
         cxn.execute("ALTER TABLE services_new RENAME TO services")
         cxn.commit()
         after = {"has_services": table_exists(cxn, "services"), "cols": table_cols(cxn, "services")}
-        rows = cxn.execute("SELECT category, COUNT(*) AS n FROM services GROUP BY category ORDER BY category").fetchall()
-        return {"before": before, "after": after, "category_counts": [{"category": r[0], "n": r[1]} for r in rows]}
+        rows = cxn.execute(
+            "SELECT category, COUNT(*) AS n FROM services GROUP BY category ORDER BY category"
+        ).fetchall()
+        return {
+            "before": before,
+            "after": after,
+            "category_counts": [{"category": r[0], "n": r[1]} for r in rows],
+        }
 
 # -----------------------------------------------------------------------------
 # Data access
 # -----------------------------------------------------------------------------
-
 def get_vendors_df() -> pd.DataFrame:
     with closing(conn()) as c:
         df = pd.read_sql_query("SELECT * FROM vendors", c)
@@ -160,7 +180,9 @@ def get_categories() -> List[str]:
         if table_exists(c, "categories"):
             rows = c.execute("SELECT name FROM categories ORDER BY name").fetchall()
             return [r[0] for r in rows]
-        rows = c.execute("SELECT DISTINCT category FROM vendors WHERE IFNULL(category,'')<>'' ORDER BY category").fetchall()
+        rows = c.execute(
+            "SELECT DISTINCT category FROM vendors WHERE IFNULL(category,'')<>'' ORDER BY category"
+        ).fetchall()
         return [r[0] for r in rows]
 
 
@@ -199,7 +221,10 @@ def upsert_category(name: str) -> None:
 def upsert_service(category: str, service: str) -> None:
     with closing(conn()) as c:
         ensure_aux_tables(c)
-        c.execute("INSERT OR IGNORE INTO services(category, service) VALUES(?,?)", (category.strip(), service.strip()))
+        c.execute(
+            "INSERT OR IGNORE INTO services(category, service) VALUES(?,?)",
+            (category.strip(), service.strip()),
+        )
         c.commit()
 
 
@@ -245,7 +270,6 @@ def delete_vendor(vid: int) -> None:
 # -----------------------------------------------------------------------------
 # Validation / Normalization
 # -----------------------------------------------------------------------------
-
 def normalize_phone(raw: str) -> str:
     """Return phone as (xxx) xxx-xxxx or '' if blank. Accepts 10 digits only.
     Handles float-looking inputs like '2108333141.0'.
@@ -272,7 +296,6 @@ def require(text: str, label: str) -> None:
 # -----------------------------------------------------------------------------
 # UI Helpers
 # -----------------------------------------------------------------------------
-
 def section(title: str):
     st.markdown(f"## {title}")
 
@@ -289,6 +312,50 @@ def select_with_add(label: str, options: List[str], key: str) -> Tuple[str, Opti
 # -----------------------------------------------------------------------------
 # Pages
 # -----------------------------------------------------------------------------
+def page_browse():
+    section("Browse / Search (non-FTS)")
+    df = get_vendors_df()
+
+    # Choose columns to search and show
+    avail_cols = [c for c in SEARCH_COLS_DEFAULT if c in df.columns]
+    with st.expander("Search options", expanded=True):
+        query = st.text_input("Search terms (space/comma separated; case-insensitive)", key="browse_q")
+        mode = st.radio("Match mode", options=("All terms", "Any term"), index=0, horizontal=True, key="browse_mode")
+        show_cols = st.multiselect("Columns to display", options=["category","service","business_name","contact_name","phone","address","website","notes","keywords"], default=["category","service","business_name","contact_name","phone","address","website","notes","keywords"], key="browse_cols")
+        sort_by = st.selectbox("Sort by", options=["business_name","category","service","contact_name","phone"], index=0)
+        st.button("Refresh", on_click=st.rerun, key="browse_refresh")
+
+    filtered = df
+    if query:
+        terms = [t for t in re.split(r"[,\s]+", query.strip()) if t]
+        if terms:
+            mask = None
+            for term in terms:
+                # Build per-term match across ALL searchable columns
+                termmask = None
+                for col in avail_cols:
+                    colmask = df[col].astype(str).str.contains(re.escape(term), case=False, na=False)
+                    termmask = colmask if termmask is None else (termmask | colmask)
+                if mode == "All terms":
+                    mask = termmask if mask is None else (mask & termmask)
+                else:
+                    mask = termmask if mask is None else (mask | termmask)
+            if mask is not None:
+                filtered = df[mask].copy()
+
+    # Sorting & display
+    if sort_by in filtered.columns:
+        try:
+            filtered = filtered.sort_values(sort_by, key=lambda s: s.astype(str).str.lower())
+        except Exception:
+            filtered = filtered.sort_values(sort_by)
+
+    st.caption(f"{len(filtered)} match(es) out of {len(df)} total.")
+    # Don’t show the internal id unless needed
+    display_cols = [c for c in show_cols if c in filtered.columns]
+    if not display_cols:
+        display_cols = [c for c in SEARCH_COLS_DEFAULT if c in filtered.columns]
+    st.dataframe(filtered[display_cols], hide_index=True, use_container_width=True)
 
 def page_vendors_admin():
     section("Vendors Admin")
@@ -372,7 +439,7 @@ def page_vendors_admin():
         if df.empty:
             st.info("No vendors to edit.")
         else:
-            df_sorted = df.sort_values("business_name", key=lambda s: s.str.lower())
+            df_sorted = df.sort_values("business_name", key=lambda s: s.astype(str).str.lower())
             options = [(int(r["id"]), f"{r['business_name']} — {r['category']} / {r['service']}") for _, r in df_sorted.iterrows()]
             id_to_label = {vid: label for vid, label in options}
             vid = st.selectbox("Select Vendor", options=[vid for vid, _ in options], format_func=lambda i: id_to_label[i], key="edit_pick")
@@ -444,7 +511,7 @@ def page_vendors_admin():
         if df.empty:
             st.info("No vendors to delete.")
         else:
-            df_sorted = df.sort_values("business_name", key=lambda s: s.str.lower())
+            df_sorted = df.sort_values("business_name", key=lambda s: s.astype(str).str.lower())
             options = [(int(r["id"]), f"{r['business_name']} — {r['category']} / {r['service']}") for _, r in df_sorted.iterrows()]
             id_to_label = {vid: label for vid, label in options}
             vid = st.selectbox("Select Vendor", options=[vid for vid, _ in options], format_func=lambda i: id_to_label[i], key="del_pick")
@@ -516,21 +583,22 @@ def page_cat_svc_admin():
 # -----------------------------------------------------------------------------
 # Router (top-of-page Navigation, not sidebar)
 # -----------------------------------------------------------------------------
-
 def main():
     st.set_page_config(page_title="Vendors Admin", layout="wide")
     st.markdown("""### Navigation
 **Go to**""")
     page = st.radio(
         label="",
-        options=("Vendors Admin", "Categories & Services Admin"),
+        options=("Browse", "Vendors Admin", "Categories & Services Admin"),
         index=0,
         horizontal=False,
         key="top_nav_radio",
     )
     st.divider()
 
-    if page == "Vendors Admin":
+    if page == "Browse":
+        page_browse()
+    elif page == "Vendors Admin":
         page_vendors_admin()
     else:
         page_cat_svc_admin()
