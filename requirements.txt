@@ -10,3 +10,4 @@ SQLAlchemy==2.0.30
 
 # Streamlit tends to pull protobuf; this avoids odd newest-major issues
 protobuf<5
+sqlalchemy-libsql
