@@ -1,6 +1,7 @@
 # app_admin.py — Vendors Admin (Single page: Browse, Add, Edit, Delete; Debug at bottom)
 # Lean, robust UI (no sidebar). Immediate refresh on add/edit/delete.
 # Non-FTS AND search across all fields. Optional "keywords" column supported.
+# Hardened against None from DB (NULLs) in all text fields.
 
 from __future__ import annotations
 
@@ -62,22 +63,32 @@ def get_distinct(engine, col: str, where: Tuple[str, dict] | None = None) -> Lis
         rows = con.execute(sql_text(sql), params).fetchall()
     return [r[0] for r in rows if (r[0] is not None and str(r[0]).strip() != "")]
 
+# ---- Safe helpers ----
+def s(x) -> str:
+    """Safe string: None -> '', strings trimmed; other types -> str trimmed."""
+    if x is None:
+        return ""
+    if isinstance(x, str):
+        return x.strip()
+    return str(x).strip()
+
 # ---- Normalizers & validators ----
 PHONE_ERR = "Phone must be 10 digits (US) or left blank"
 URL_ERR = "Website must be a valid URL (with or without https://) or left blank"
 
-def normalize_phone(s: str) -> str:
-    s = re.sub(r"\D", "", (s or ""))
-    if not s:
+def normalize_phone(x) -> str:
+    raw = s(x)
+    digits = re.sub(r"\D", "", raw)
+    if not digits:
         return ""
-    if len(s) == 11 and s.startswith("1"):
-        s = s[1:]
-    if len(s) != 10:
+    if len(digits) == 11 and digits.startswith("1"):
+        digits = digits[1:]
+    if len(digits) != 10:
         raise ValueError(PHONE_ERR)
-    return f"({s[0:3]}) {s[3:6]}-{s[6:10]}"
+    return f"({digits[0:3]}) {digits[3:6]}-{digits[6:10]}"
 
-def normalize_url(u: str) -> str:
-    u = (u or "").strip()
+def normalize_url(u) -> str:
+    u = s(u)
     if not u:
         return ""
     if not re.match(r"^[a-zA-Z][a-zA-Z0-9+.-]*://", u):
@@ -87,11 +98,11 @@ def normalize_url(u: str) -> str:
         raise ValueError(URL_ERR)
     return parsed.geturl()
 
-def normalize_keywords(s: str) -> str:
-    s = (s or "").strip()
-    if not s:
+def normalize_keywords(sval) -> str:
+    sval = s(sval)
+    if not sval:
         return ""
-    parts = re.split(r"[\s,]+", s)
+    parts = re.split(r"[\s,]+", sval)
     parts = sorted(set([p.strip() for p in parts if p.strip()]))
     return ", ".join(parts)
 
@@ -109,7 +120,7 @@ def insert_vendor(engine, row: Dict[str, str]) -> None:
         "notes",
         "keywords",
     ]
-    values = {k: row.get(k, "") for k in allowed if k in cols}
+    values = {k: s(row.get(k, "")) for k in allowed if k in cols}
     placeholders = ", ".join([f":{k}" for k in values.keys()])
     columns = ", ".join(values.keys())
     sql = f"INSERT INTO vendors ({columns}) VALUES ({placeholders})"
@@ -124,7 +135,7 @@ def update_vendor(engine, vid: int, updates: Dict[str, str]) -> None:
     if not allowed:
         return
     set_clause = ", ".join([f"{c} = :{c}" for c in allowed])
-    params = {c: updates[c] for c in allowed}
+    params = {c: s(updates[c]) for c in allowed}
     params["id"] = vid
     with engine.begin() as con:
         con.execute(sql_text(f"UPDATE vendors SET {set_clause} WHERE id = :id"), params)
@@ -135,17 +146,18 @@ def delete_vendor(engine, vid: int) -> None:
 
 # ---- Search ----
 def filter_df(df: pd.DataFrame, query: str) -> pd.DataFrame:
-    query = (query or "").strip()
+    query = s(query)
     if not query:
         return df
     tokens = [t for t in re.split(r"\s+", query) if t]
     if not tokens:
         return df
     search_cols = [c for c in df.columns if c != "id"]
-    lower = df[search_cols].astype(str).apply(lambda s: s.str.lower())
+    lower = df[search_cols].astype(str).apply(lambda ser: ser.str.lower())
     mask = pd.Series(True, index=df.index)
     for tok in tokens:
-        mask &= lower.apply(lambda s: s.str.contains(tok.lower(), na=False)).any(axis=1)
+        tok = tok.lower()
+        mask &= lower.apply(lambda ser: ser.str.contains(tok, na=False)).any(axis=1)
     return df[mask]
 
 # ---- UI Sections ----
@@ -184,7 +196,8 @@ def section_add(engine):
             category = st.text_input("New Category", "", key="cat_new")
 
     # Service depends on category (if present)
-    services = get_distinct(engine, "service", where=("category = :c", {"c": category})) if category else []
+    cat_val = s(category)
+    services = get_distinct(engine, "service", where=("category = :c", {"c": cat_val})) if cat_val else []
     s1, s2 = st.columns([1, 2])
     with s1:
         svc_mode = st.radio("Service", ["Choose existing", "Add new"], horizontal=True, key="svc_mode")
@@ -204,29 +217,29 @@ def section_add(engine):
 
     if st.button("Add Vendor", type="primary", use_container_width=True):
         try:
-            if not category.strip():
-                st.error("Category is required.")
-                st.stop()
-            if not service.strip():
-                st.error("Service is required.")
-                st.stop()
-            if not business_name.strip():
-                st.error("Business Name is required.")
-                st.stop()
+            cat = s(category)
+            svc = s(service)
+            bn  = s(business_name)
+            if not cat:
+                st.error("Category is required."); st.stop()
+            if not svc:
+                st.error("Service is required."); st.stop()
+            if not bn:
+                st.error("Business Name is required."); st.stop()
 
             phone   = normalize_phone(phone_in)
             website = normalize_url(website_in)
-            kw_norm = normalize_keywords(keywords) if isinstance(keywords, str) else ""
+            kw_norm = normalize_keywords(keywords) if "keywords" in cols else ""
 
             row = {
-                "category": category.strip(),
-                "service": service.strip(),
-                "business_name": business_name.strip(),
-                "contact_name": contact_name.strip(),
+                "category": cat,
+                "service": svc,
+                "business_name": bn,
+                "contact_name": s(contact_name),
                 "phone": phone,
-                "address": address.strip(),
+                "address": s(address),
                 "website": website,
-                "notes": notes.strip(),
+                "notes": s(notes),
                 "keywords": kw_norm,
             }
             insert_vendor(engine, row)
@@ -243,11 +256,11 @@ def section_edit(engine):
         return
 
     # Build sorted selection by Business Name
-    df_sorted = df.sort_values("business_name", key=lambda s: s.str.lower())
+    df_sorted = df.sort_values("business_name", key=lambda srs: srs.astype(str).str.lower())
     def label_for_row(r):
-        cat = str(r.get("category", "") or "")
-        svc = str(r.get("service", "") or "")
-        return f"{r['business_name']} — {cat} / {svc}  [#{r['id']}]"
+        cat = s(r.get("category"))
+        svc = s(r.get("service"))
+        return f"{s(r.get('business_name'))} — {cat} / {svc}  [#{r['id']}]"
 
     id_to_label = {int(r["id"]): label_for_row(r) for _, r in df_sorted.iterrows()}
     ids = list(id_to_label.keys())
@@ -267,68 +280,61 @@ def section_edit(engine):
     with c1:
         cat_mode = st.radio("Category", ["Choose existing", "Add new"], horizontal=True, key="edit_cat_mode")
     with c2:
+        current_cat = s(row.get("category"))
         if cat_mode == "Choose existing":
-            category = st.selectbox(
-                "",
-                [""] + categories,
-                index=([""] + categories).index(row.get("category") or "") if (row.get("category") or "") in ([""] + categories) else 0,
-                key="edit_cat_select",
-                label_visibility="collapsed",
-            )
+            cat_options = [""] + categories
+            cat_index = cat_options.index(current_cat) if current_cat in cat_options else 0
+            category = st.selectbox("", cat_options, index=cat_index, key="edit_cat_select", label_visibility="collapsed")
         else:
-            category = st.text_input("New Category", row.get("category", ""), key="edit_cat_new")
+            category = st.text_input("New Category", current_cat, key="edit_cat_new")
 
     # Services under selected category
-    services = get_distinct(engine, "service", where=("category = :c", {"c": category})) if category else []
+    cat_val = s(category)
+    services = get_distinct(engine, "service", where=("category = :c", {"c": cat_val})) if cat_val else []
     s1, s2 = st.columns([1, 2])
     with s1:
         svc_mode = st.radio("Service", ["Choose existing", "Add new"], horizontal=True, key="edit_svc_mode")
     with s2:
+        current_svc = s(row.get("service"))
         if svc_mode == "Choose existing":
-            default_service = row.get("service") or ""
-            svc_options = [""] + (services if services else [default_service])
-            service = st.selectbox(
-                "",
-                svc_options,
-                index=svc_options.index(default_service) if default_service in svc_options else 0,
-                key="edit_svc_select",
-                label_visibility="collapsed",
-            )
+            svc_options = [""] + (services if services else [current_svc] if current_svc else [])
+            svc_index = svc_options.index(current_svc) if current_svc in svc_options else 0
+            service = st.selectbox("", svc_options, index=svc_index, key="edit_svc_select", label_visibility="collapsed")
         else:
-            service = st.text_input("New Service", row.get("service", ""), key="edit_svc_new")
+            service = st.text_input("New Service", current_svc, key="edit_svc_new")
 
-    business_name = st.text_input("Business Name *", row.get("business_name", ""), key="edit_biz")
-    contact_name  = st.text_input("Contact Name", row.get("contact_name", ""), key="edit_contact")
-    phone_in      = st.text_input("Phone (digits only)", row.get("phone", ""), key="edit_phone")
-    address       = st.text_input("Address", row.get("address", ""), key="edit_addr")
-    website_in    = st.text_input("Website (optional)", row.get("website", ""), key="edit_web")
-    notes         = st.text_area("Notes", row.get("notes", ""), key="edit_notes", height=80)
+    business_name = st.text_input("Business Name *", s(row.get("business_name")), key="edit_biz")
+    contact_name  = st.text_input("Contact Name", s(row.get("contact_name")), key="edit_contact")
+    phone_in      = st.text_input("Phone (digits only)", s(row.get("phone")), key="edit_phone")
+    address       = st.text_input("Address", s(row.get("address")), key="edit_addr")
+    website_in    = st.text_input("Website (optional)", s(row.get("website")), key="edit_web")
+    notes         = st.text_area("Notes", s(row.get("notes")), key="edit_notes", height=80)
     kw_enabled    = "keywords" in cols
-    keywords_in   = st.text_input("Keywords (comma or space separated)", row.get("keywords", ""), key="edit_kw") if kw_enabled else ""
+    keywords_in   = st.text_input("Keywords (comma or space separated)", s(row.get("keywords")), key="edit_kw") if kw_enabled else ""
 
     if st.button("Save Changes", type="primary", use_container_width=True, key="edit_save"):
         try:
-            if not category.strip():
-                st.error("Category is required.")
-                st.stop()
-            if not service.strip():
-                st.error("Service is required.")
-                st.stop()
-            if not business_name.strip():
-                st.error("Business Name is required.")
-                st.stop()
+            cat = s(category)
+            svc = s(service)
+            bn  = s(business_name)
+            if not cat:
+                st.error("Category is required."); st.stop()
+            if not svc:
+                st.error("Service is required."); st.stop()
+            if not bn:
+                st.error("Business Name is required."); st.stop()
 
             phone   = normalize_phone(phone_in)
             website = normalize_url(website_in)
             updates = {
-                "category": category.strip(),
-                "service": service.strip(),
-                "business_name": business_name.strip(),
-                "contact_name": contact_name.strip(),
+                "category": cat,
+                "service": svc,
+                "business_name": bn,
+                "contact_name": s(contact_name),
                 "phone": phone,
-                "address": address.strip(),
+                "address": s(address),
                 "website": website,
-                "notes": notes.strip(),
+                "notes": s(notes),
             }
             if kw_enabled:
                 updates["keywords"] = normalize_keywords(keywords_in)
@@ -346,11 +352,11 @@ def section_delete(engine):
         st.info("No vendors to delete.")
         return
 
-    df_sorted = df.sort_values("business_name", key=lambda s: s.str.lower())
+    df_sorted = df.sort_values("business_name", key=lambda srs: srs.astype(str).str.lower())
     def label_for_row(r):
-        cat = str(r.get("category", "") or "")
-        svc = str(r.get("service", "") or "")
-        return f"{r['business_name']} — {cat} / {svc}  [#{r['id']}]"
+        cat = s(r.get("category"))
+        svc = s(r.get("service"))
+        return f"{s(r.get('business_name'))} — {cat} / {svc}  [#{r['id']}]"
 
     id_to_label = {int(r["id"]): label_for_row(r) for _, r in df_sorted.iterrows()}
     ids = list(id_to_label.keys())
@@ -396,7 +402,7 @@ def main():
 
     engine = get_engine()
 
-    # Lay out the page top-to-bottom. No sidebar.
+    # Top-to-bottom layout; no sidebar.
     with st.expander("Browse (word search across all fields)", expanded=True):
         section_browse(engine)
 
