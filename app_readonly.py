@@ -21,10 +21,10 @@ df = df[present]
 
 
 # Apply character clipping (except website)
-disp = df.copy()
-for col, width in CHAR_WIDTHS.items():
-if col in disp.columns and col != "website":
-disp[col] = disp[col].map(lambda v: clip_value(v, width))
+    disp = df.copy()
+    for col, width in CHAR_WIDTHS.items():
+        if col in disp.columns and col != "website":
+            disp[col] = disp[col].map(lambda v: clip_value(v, width))
 
 
 # Rename columns for friendly labels
