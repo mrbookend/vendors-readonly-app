@@ -1,10 +1,10 @@
 # app_readonly.py — Vendors Directory (Read-only, Live DB via Turso; local fallback)
 # - Uses the SAME live DB as Admin (LIBSQL_* or TURSO_* secrets)
-# - NO content clipping at all (we don't modify text values)
+# - NO content clipping (shows full strings from DB)
 # - Admin-set default column widths via secrets/env/file; end users can still drag-resize
-# - Page width knob so rightmost column is fully reachable with horizontal scroll
-# - Non-FTS AND search across all fields; website links normalized to be clickable
-# - Case-insensitive sort by Business Name (fallback to first selected col)
+# - Explicit page/table width so rightmost column is fully reachable with horizontal scroll
+# - AND search across all fields (case-insensitive)
+# - Search label text: "Search (all words in line)" at 24pt (input text also 24pt)
 # - Safe if some columns are missing
 
 from __future__ import annotations
@@ -62,13 +62,10 @@ def _int_config(key: str, default: int) -> int:
 # Page width & sizing knobs (secrets override env)
 PAGE_MAX_WIDTH_PX = _int_config("PAGE_MAX_WIDTH_PX", 2300)
 WEBSITE_WIDTH_PX  = _int_config("WEBSITE_COL_WIDTH_PX", 300)
-
-# These two now only affect initial column widths if provided via file/env;
-# we do NOT clip any values anymore.
-CHARS_TO_PX       = _int_config("CHARS_TO_PX", 10)   # heuristic for admin defaults
+CHARS_TO_PX       = _int_config("CHARS_TO_PX", 10)   # heuristic only for fallback widths
 EXTRA_COL_PADDING = _int_config("EXTRA_COL_PADDING_PX", 24)
 
-# ===== Page width CSS =====
+# ===== Page & Search CSS =====
 st.markdown(f"""
 <style>
 .block-container {{
@@ -76,6 +73,10 @@ st.markdown(f"""
   padding-left: 1rem;
   padding-right: 1rem;
 }}
+/* Big label for the search line */
+.search-label {{ font-size: 24pt; font-weight: 600; margin: 0 0 .25rem 0; }}
+/* Make the search input text big as well */
+div[data-baseweb="input"] input {{ font-size: 24pt; }}
 </style>
 """, unsafe_allow_html=True)
 
@@ -219,7 +220,7 @@ def _load_admin_widths_px(displayed_cols: List[str]) -> Dict[str, int]:
         "contact_name": 28,
         "phone": 18,
         "address": 40,
-        "website": 30,   # label is the URL; make it reasonable
+        "website": 30,
         "notes": 60,
     }
     return {
@@ -266,13 +267,15 @@ def main():
             st.json({"engine_url": str(engine.url)})
         return
 
-    # Search (AND across all fields)
+    # Search (all words in line) — large 24pt label & input
+    st.markdown('<div class="search-label">Search (all words in line)</div>', unsafe_allow_html=True)
     q = st.text_input(
-        "Search (AND across all fields)",
+        label="Search (all words in line)",    # semantic label for accessibility
         value=st.session_state.get("q", ""),
         placeholder="e.g., plumber alamo heights",
         key="q",
-        help="Type words separated by space or comma. AND logic (case-insensitive).",
+        help="Type words separated by space or comma. We match all words in one line (AND, case-insensitive).",
+        label_visibility="collapsed",          # hide Streamlit's default label (we render our own)
     )
     df = filter_df(df, q)
 
@@ -283,7 +286,7 @@ def main():
         return
     df = df[present]
 
-    # DO NOT clip values at all — show full strings from DB.
+    # Do NOT clip values — show full strings.
     disp = df.copy()
 
     # Rename to friendly labels for display
