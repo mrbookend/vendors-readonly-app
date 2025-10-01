@@ -3,10 +3,10 @@
 # - NO content clipping (shows full strings from DB)
 # - Admin-set default column widths via secrets/env/file; end users can still drag-resize
 # - Explicit page/table width so rightmost column is fully reachable with horizontal scroll
-# - AND search across ALL DB columns (case-insensitive)
+# - AND search across ALL DB columns (case-insensitive, substring match)
 # - Search label text: "Search (all partial or full word or words):" at ~16pt, not bold
 # - Display columns: Category, Business Name, Contact Name, Phone, Address, Website, Notes, Keywords
-#   (Service is not shown but IS included in search because we search all columns)
+# - Wider horizontal & vertical scrollbars on the table (WebKit + Firefox)
 
 from __future__ import annotations
 
@@ -72,18 +72,46 @@ WEBSITE_WIDTH_PX  = _int_config("WEBSITE_COL_WIDTH_PX", 300)
 CHARS_TO_PX       = _int_config("CHARS_TO_PX", 10)   # heuristic only for fallback widths
 EXTRA_COL_PADDING = _int_config("EXTRA_COL_PADDING_PX", 24)
 
-# ===== Page & Search CSS =====
+# ===== Page, Search, and SCROLLBAR CSS =====
+# - Scrollbars widened *only* inside the table’s grid to avoid affecting the whole page.
+# - WebKit (::webkit-scrollbar*) and Firefox (scrollbar-width/scrollbar-color) supported.
 st.markdown(f"""
 <style>
+/* Page width */
 .block-container {{
   max-width: {PAGE_MAX_WIDTH_PX}px;
   padding-left: 1rem;
   padding-right: 1rem;
 }}
+
 /* Search label styling: ~16pt, not bold */
 .search-label {{ font-size: 16pt; font-weight: normal; margin: 0 0 .25rem 0; }}
 /* Make the search input text also ~16pt */
 div[data-baseweb="input"] input {{ font-size: 16pt; }}
+
+/* === Wider scrollbars for the dataframe grid === */
+[data-testid="stDataFrame"] div[role="grid"] {{
+  scrollbar-width: thick;                 /* Firefox width */
+  scrollbar-color: #a3a3a3 #e7e7e7;       /* thumb color, track color */
+}}
+
+/* WebKit (Chrome, Edge, Safari) */
+[data-testid="stDataFrame"] div[role="grid"]::-webkit-scrollbar {{
+  height: 16px;   /* horizontal bar thickness */
+  width: 16px;    /* vertical bar thickness */
+}}
+[data-testid="stDataFrame"] div[role="grid"]::-webkit-scrollbar-track {{
+  background: #e7e7e7;
+  border-radius: 8px;
+}}
+[data-testid="stDataFrame"] div[role="grid"]::-webkit-scrollbar-thumb {{
+  background: #a3a3a3;
+  border-radius: 8px;
+  border: 3px solid #e7e7e7; /* increases grab area visually */
+}}
+[data-testid="stDataFrame"] div[role="grid"]::-webkit-scrollbar-thumb:hover {{
+  background: #8a8a8a;
+}}
 </style>
 """, unsafe_allow_html=True)
 
@@ -177,7 +205,7 @@ def load_df(engine) -> pd.DataFrame:
 
 def filter_df(df: pd.DataFrame, query: str) -> pd.DataFrame:
     """
-    AND search across **all non-id columns** (case-insensitive).
+    AND search across **all non-id columns** (case-insensitive, substring).
     """
     q = _s(query)
     if not q:
@@ -293,9 +321,9 @@ def main():
     q = st.text_input(
         label="Search (all partial or full word or words):",
         value=st.session_state.get("q", ""),
-        placeholder="e.g., plumber alamo heights",
+        placeholder="e.g., plumb returns any record with plumb, plumber, plumbers, plumbing, etc.",
         key="q",
-        help="Type one or more words (partial or full). Matches require all words (case-insensitive).",
+        help="Type one or more words (partial or full). Each word is matched as a substring across all columns; all words must match (AND, case-insensitive).",
         label_visibility="collapsed",
     )
 
