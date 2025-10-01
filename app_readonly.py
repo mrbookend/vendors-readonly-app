@@ -32,7 +32,7 @@ DISPLAY_COLUMNS: List[str] = [
 
 # Character clip widths by column **name** (applied before display). "website" is not clipped.
 CHAR_WIDTHS: Dict[str, int] = {
-    "business_name": 36,
+    "business_name": 0,   # 0 = no clipping
     "category": 32,
     "service": 32,
     "contact_name": 28,
@@ -292,11 +292,11 @@ def main():
         return
     df = df[present]
 
-    # Apply character clipping (except website)
-    disp = df.copy()
-    for col, width in CHAR_WIDTHS.items():
-        if col in disp.columns and col != "website":
-            disp[col] = disp[col].map(lambda v: clip_value(v, width))
+    # Apply character clipping (except website); width<=0 disables clipping
+disp = df.copy()
+for col, width in CHAR_WIDTHS.items():
+    if col in disp.columns and col != "website" and width > 0:
+        disp[col] = disp[col].map(lambda v: clip_value(v, width))
 
     # Rename to friendly labels for display
     disp = disp.rename(columns={c: LABELS.get(c, c) for c in disp.columns})
