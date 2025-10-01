@@ -1,192 +1,320 @@
-# app_readonly.py — Vendors Directory (Read-only, Live DB via Turso; local fallback for dev)
-# - Non-FTS AND search across all fields
-# - Clickable Website links
-# - Configurable character-width clipping per column (edit CHAR_WIDTHS)
-# - Case-insensitive sort by Business Name
-# - Safe if some columns are missing (only renders what exists)
+# app_readonly.py
+# Vendors Directory (READ-ONLY)
+# - Wide layout with horizontal scrolling
+# - Multi-term AND search across common fields
+# - Optional Category / Service filters
+# - Website shown as a clickable Link column, placed right after Address
+# - Simple, dependency-light (pandas + sqlalchemy + streamlit)
 
 from __future__ import annotations
 
 import os
 import re
-from pathlib import Path
-from typing import Dict, List
+from urllib.parse import urlparse
 
 import pandas as pd
 import streamlit as st
-from sqlalchemy import create_engine
-from sqlalchemy.sql import text as sql_text
+from sqlalchemy import create_engine, text as sql_text
 
-APP_TITLE = "Vendors Directory (Read-only)"
-st.set_page_config(page_title=APP_TITLE, layout="wide")
+# -------------- Page/Layout -----------------
+st.set_page_config(page_title="Vendors Directory", layout="wide")
 
-# ===== Display configuration you can change =====
-# Only columns listed here (if present in DB) will be shown, in this order.
-DISPLAY_COLUMNS: List[str] = [
-    "category", "service", "business_name", "contact_name",
-    "phone", "address", "website", "notes",
+# Expand the central container beyond Streamlit default
+st.markdown(
+    """
+<style>
+.block-container {
+  max-width: 1900px;   /* increase to 2100–2400px if you want wider */
+  padding-left: 1rem;
+  padding-right: 1rem;
+}
+</style>
+""",
+    unsafe_allow_html=True,
+)
+
+# -------------- Config -----------------
+# SQLite path used by the deployed app; keep this default.
+DEFAULT_SQLITE_PATH = "/mount/src/vendors-readonly-app/vendors.db"
+
+# Columns expected from the vendors table (text schema):
+# id | category | service | business_name | contact_name | phone | address | website | notes | keywords
+EXPECTED_COLUMNS = [
+    "id",
+    "category",
+    "service",
+    "business_name",
+    "contact_name",
+    "phone",
+    "address",
+    "website",
+    "notes",
+    "keywords",
 ]
 
-# Character clip widths by column **name** (applied before display). "website" is not clipped.
-CHAR_WIDTHS: Dict[str, int] = {
-    "business_name": 36,
-    "category": 32,
-    "service": 32,
-    "contact_name": 28,
-    "phone": 18,
-    "address": 40,
-    "notes": 60,
-    # "website": (not clipped; shown as a link labeled "Open")
+# Display column order & labels
+DISPLAY_ORDER = [
+    ("business_name", "Business Name"),
+    ("contact_name", "Contact Name"),
+    ("phone", "Phone"),
+    ("address", "Address"),
+    ("website", "Website"),  # immediately after Address
+    ("category", "Category"),
+    ("service", "Service"),
+    ("notes", "Notes"),
+    ("keywords", "Keywords"),
+]
+
+# Minimum pixel widths per display column (tune to taste)
+COLUMN_MIN_WIDTHS = {
+    "Business Name": 300,
+    "Contact Name": 220,
+    "Phone": 150,
+    "Address": 360,
+    "Website": 260,   # link column
+    "Category": 220,
+    "Service": 260,
+    "Notes": 360,
+    "Keywords": 160,
 }
 
-# Friendly display labels (optional)
-LABELS: Dict[str, str] = {
-    "category": "Category",
-    "service": "Service",
-    "business_name": "Business Name",
-    "contact_name": "Contact Name",
-    "phone": "Phone",
-    "address": "Address",
-    "website": "Website",
-    "notes": "Notes",
-}
-
-# ===== Database wiring (Turso first, then local SQLite fallback) =====
-@st.cache_resource(show_spinner=False)
+# -------------- Helpers -----------------
 def get_engine():
-    # Prefer Turso (live remote DB)
-    turso_url = os.environ.get("TURSO_DATABASE_URL") or st.secrets.get("TURSO_DATABASE_URL", "")
-    turso_tok = os.environ.get("TURSO_AUTH_TOKEN")   or st.secrets.get("TURSO_AUTH_TOKEN", "")
-    if turso_url and turso_tok:
-        # Turso gives libsql://<host>. SQLAlchemy expects sqlite+libsql://<host>
-        driver_url = turso_url.replace("libsql://", "sqlite+libsql://")
-        return create_engine(
-            f"{driver_url}?secure=true",
-            connect_args={"auth_token": turso_tok},
-            future=True,
-        )
+    """
+    Create a SQLAlchemy engine.
+    We stick to SQLite for the read-only app, since that's how the live app is wired.
+    """
+    db_path = os.getenv("SQLITE_PATH", DEFAULT_SQLITE_PATH)
+    if not db_path.startswith("sqlite:///"):
+        # support both '/path/to.db' and 'sqlite:////path/to.db'
+        if db_path.startswith("/"):
+            engine_url = f"sqlite:///{db_path}"
+        else:
+            engine_url = f"sqlite:///{os.path.abspath(db_path)}"
+    else:
+        engine_url = db_path
+    return create_engine(engine_url, future=True)
 
-    # Fallback: local SQLite file next to this script (dev only)
-    default_db = Path(__file__).resolve().parent / "vendors.db"
-    db_url = os.environ.get("DB_URL") or f"sqlite:///{default_db}"
-    return create_engine(db_url, future=True)
+def load_vendors_df(engine) -> pd.DataFrame:
+    """
+    Load the vendors table. If extra columns exist, we keep them.
+    If some expected columns are missing, we create them as empty strings for display robustness.
+    """
+    with engine.begin() as conn:
+        df = pd.read_sql(sql_text("SELECT * FROM vendors"), conn)
 
-# ===== Helpers =====
+    # Add any missing expected columns as empty strings (robustness)
+    for col in EXPECTED_COLUMNS:
+        if col not in df.columns:
+            df[col] = ""
 
-def _cols(engine) -> List[str]:
-    with engine.begin() as con:
-        info = con.execute(sql_text("PRAGMA table_info(vendors)")).fetchall()
-    return [str(r[1]) for r in info]
+    # Normalize dtypes to string where appropriate for uniform searching
+    for col in EXPECTED_COLUMNS:
+        if col in df.columns and col != "id":
+            df[col] = df[col].fillna("").astype(str)
 
-
-def load_df(engine) -> pd.DataFrame:
-    cols = _cols(engine)
-    desired = [c for c in DISPLAY_COLUMNS if c in cols]
-    # Always fetch id internally for stable ops, even if we don't display it
-    sel = ["id"] + desired if "id" in cols else desired
-    if not sel:
-        return pd.DataFrame()
-    order_col = "business_name" if "business_name" in cols else sel[0]
-    with engine.begin() as con:
-        df = pd.read_sql_query(
-            f"SELECT {', '.join(sel)} FROM vendors ORDER BY {order_col} COLLATE NOCASE",
-            con,
-        )
     return df
 
-
-def _s(x) -> str:
-    if x is None:
+def normalize_url(url: str) -> str:
+    """
+    Ensure URLs are usable: prepend https:// if missing a scheme.
+    """
+    url = (url or "").strip()
+    if not url:
         return ""
-    if isinstance(x, str):
-        return x.strip()
-    return str(x).strip()
+    parsed = urlparse(url)
+    if not parsed.scheme:
+        return "https://" + url
+    return url
 
+def to_link_label(url: str) -> str:
+    """
+    Produce a short, readable label for a URL (domain only).
+    """
+    try:
+        parsed = urlparse(url)
+        host = (parsed.netloc or "").strip()
+        if not host and url:
+            # Fallback if scheme parse failed
+            host = url.split("/")[0]
+        return host or url
+    except Exception:
+        return url
 
-def clip_value(val: object, width: int) -> str:
-    if width <= 0:
-        return _s(val)
-    t = _s(val)
-    if len(t) <= width:
-        return t
-    return t[: max(width - 1, 0)] + "…"
+def build_display_df(raw: pd.DataFrame) -> pd.DataFrame:
+    """
+    Reorder and rename columns for display. Also prepare a website link column.
+    """
+    df = raw.copy()
 
+    # Prepare Website column as actual URL string; we'll render as LinkColumn.
+    df["website"] = df["website"].apply(normalize_url)
 
-def filter_df(df: pd.DataFrame, query: str) -> pd.DataFrame:
-    q = _s(query)
+    # Reorder & rename
+    cols = []
+    rename_map = {}
+    for raw_col, label in DISPLAY_ORDER:
+        if raw_col in df.columns:
+            cols.append(raw_col)
+            rename_map[raw_col] = label
+
+    df = df[cols].rename(columns=rename_map)
+
+    return df
+
+def terms_match(row_text: str, terms: list[str]) -> bool:
+    """
+    Return True if all terms are present in row_text (case-insensitive).
+    'AND' semantics across space/comma-separated terms.
+    """
+    text = row_text.lower()
+    return all(term in text for term in terms)
+
+def apply_search(df_disp: pd.DataFrame, query: str) -> pd.DataFrame:
+    """
+    Multi-term AND search across a subset of columns.
+    Splits on commas or whitespace. Empty query returns df unchanged.
+    """
+    q = (query or "").strip()
     if not q:
-        return df
-    tokens = [t.lower() for t in re.split(r"\s+", q) if t]
+        return df_disp
+
+    # Split by commas or whitespace, keep non-empty tokens
+    tokens = [t.strip().lower() for t in re.split(r"[,\s]+", q) if t.strip()]
     if not tokens:
-        return df
-    search_cols = [c for c in df.columns if c != "id"]
-    lowered = df[search_cols].astype(str).apply(lambda s: s.str.lower())
+        return df_disp
 
-    mask = pd.Series(True, index=df.index)
-    for tok in tokens:
-        mask &= lowered.apply(lambda s: s.str.contains(tok, na=False)).any(axis=1)
-    return df[mask]
+    # Search across these display columns
+    SEARCH_COLUMNS = [
+        "Business Name",
+        "Contact Name",
+        "Phone",
+        "Address",
+        "Category",
+        "Service",
+        "Notes",
+        "Keywords",
+        "Website",
+    ]
+    cols_present = [c for c in SEARCH_COLUMNS if c in df_disp.columns]
 
-
-# ===== UI =====
-
-def main():
-    st.title(APP_TITLE)
-
-    engine = get_engine()
-    df = load_df(engine)
-
-    if df.empty:
-        st.info("No vendor data found.")
-        return
-
-    # Search (AND across all fields)
-    q = st.text_input(
-        "Search (AND across all fields)",
-        value=st.session_state.get("q", ""),
-        placeholder="e.g., plumber alamo heights",
-        key="q",
-        help="Type one or more words. We use AND logic across all fields (case-insensitive).",
+    # Precompute a combined lowercase text per row for performance
+    combined = (
+        df_disp[cols_present]
+        .astype(str)
+        .fillna("")
+        .agg(" ".join, axis=1)
+        .str.lower()
     )
 
-    df = filter_df(df, q)
+    mask = combined.apply(lambda s: all(t in s for t in tokens))
+    return df_disp[mask].reset_index(drop=True)
 
-    # Keep only the desired display columns that exist
-    present = [c for c in DISPLAY_COLUMNS if c in df.columns]
-    if not present:
-        st.info("No displayable columns found.")
-        return
-    df = df[present]
+# -------------- UI -----------------
+st.title("Vendors Directory (Read-Only)")
 
-    # Apply character clipping (except website)
-    disp = df.copy()
-    for col, width in CHAR_WIDTHS.items():
-        if col in disp.columns and col != "website":
-            disp[col] = disp[col].map(lambda v: clip_value(v, width))
+# Load data
+engine = get_engine()
+try:
+    raw_df = load_vendors_df(engine)
+except Exception as e:
+    st.error(f"Failed to load vendors: {e}")
+    st.stop()
 
-    # Rename columns for friendly labels
-    disp = disp.rename(columns={c: LABELS.get(c, c) for c in disp.columns})
+# Build display frame
+df_disp = build_display_df(raw_df)
 
-    # Configure Website as a clickable link labeled "Open"
-    col_config = {}
-    if "Website" in disp.columns:
-        try:
-            col_config["Website"] = st.column_config.LinkColumn("Website", display_text="Open")
-        except Exception:
-            # Older Streamlit versions may not have LinkColumn; leave as plain text
-            pass
+# Sidebar controls
+with st.sidebar:
+    st.subheader("Filters")
 
-    st.dataframe(disp, use_container_width=True, hide_index=True, column_config=col_config)
+    # Category filter (optional)
+    cat_vals = sorted(v for v in raw_df["category"].dropna().astype(str).unique() if v.strip())
+    selected_cat = st.selectbox("Category", options=["(All)"] + cat_vals, index=0)
 
-    with st.expander("About this directory", expanded=False):
-        st.markdown(
-            """
-            **Live data**: This page reads directly from the configured database (Turso if set, otherwise local SQLite).
-            Use the search box to filter; multiple words are combined with AND.
-            To adjust column clipping widths, edit the `CHAR_WIDTHS` dict near the top of the file.
-            """
+    # Service filter (optional)
+    svc_vals = sorted(v for v in raw_df["service"].dropna().astype(str).unique() if v.strip())
+    selected_svc = st.selectbox("Service", options=["(All)"] + svc_vals, index=0)
+
+    st.markdown("---")
+    st.subheader("Search")
+    search_q = st.text_input(
+        "Multi-term AND search (comma or space-separated)",
+        value="",
+        placeholder="plumber, water heater",
+    )
+
+    st.markdown("---")
+    st.subheader("Columns")
+    # Allow optional hiding of verbose fields without re-deploy
+    show_notes = st.checkbox("Show Notes", value=True)
+    show_keywords = st.checkbox("Show Keywords", value=True)
+
+# Apply sidebar filters to a working copy
+work = df_disp.copy()
+
+if selected_cat != "(All)" and "Category" in work.columns:
+    work = work[work["Category"].astype(str) == selected_cat]
+
+if selected_svc != "(All)" and "Service" in work.columns:
+    work = work[work["Service"].astype(str) == selected_svc]
+
+# Apply search
+work = apply_search(work, search_q)
+
+# Optionally hide columns
+cols_to_hide = []
+if not show_notes and "Notes" in work.columns:
+    cols_to_hide.append("Notes")
+if not show_keywords and "Keywords" in work.columns:
+    cols_to_hide.append("Keywords")
+
+if cols_to_hide:
+    work = work.drop(columns=cols_to_hide)
+
+# Column configuration: set widths and link rendering for Website
+col_config = {}
+for label, width in COLUMN_MIN_WIDTHS.items():
+    if label not in work.columns:
+        continue
+    if label == "Website":
+        # Render as clickable links; label is the domain for readability
+        col_config[label] = st.column_config.LinkColumn(
+            "Website",
+            help="Open vendor website",
+            display_text=lambda url: to_link_label(url or ""),
+            width=width,
+        )
+    else:
+        col_config[label] = st.column_config.Column(
+            label=label,
+            width=width,
         )
 
+# Info bar
+left, right = st.columns([1, 1])
+with left:
+    st.caption(f"Showing {len(work):,} of {len(df_disp):,} vendors after filters/search.")
+with right:
+    # Offer a CSV export of the currently shown rows
+    csv_bytes = work.to_csv(index=False).encode("utf-8")
+    st.download_button(
+        "Download CSV (filtered)",
+        data=csv_bytes,
+        file_name="vendors_filtered.csv",
+        mime="text/csv",
+    )
 
-if __name__ == "__main__":
-    main()
+# Main table
+st.dataframe(
+    work,
+    use_container_width=True,  # stretches to the widened page
+    hide_index=True,
+    height=640,                # adjust for your viewport
+    column_config=col_config,
+)
+
+st.caption(
+    "Tip: widen your browser window or increase zoom out to view more columns at once. "
+    "Use the horizontal scrollbar to reach the last column."
+)
