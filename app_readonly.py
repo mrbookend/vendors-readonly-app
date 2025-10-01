@@ -3,8 +3,8 @@
 # - Admin-set default column widths via secrets/env/file; end users can still drag-resize
 # - Page width knob so rightmost column is fully reachable with horizontal scroll
 # - Non-FTS AND search across all fields; website links normalized to be clickable
-# - Case-insensitive sort by Business Name (fallback to first selected col)
-# - Safe if some columns are missing
+# - NO clipping on Business Name (set to 0) and clip only when width > 0
+# - Everything runs inside main() to avoid NameError scope issues
 
 from __future__ import annotations
 
@@ -31,6 +31,7 @@ DISPLAY_COLUMNS: List[str] = [
 ]
 
 # Character clip widths by column **name** (applied before display). "website" is not clipped.
+# NOTE: business_name=0 means NO CLIPPING.
 CHAR_WIDTHS: Dict[str, int] = {
     "business_name": 0,   # 0 = no clipping
     "category": 32,
@@ -189,7 +190,6 @@ def filter_df(df: pd.DataFrame, query: str) -> pd.DataFrame:
         mask &= lowered.apply(lambda s: s.str.contains(tok, na=False)).any(axis=1)
     return df[mask]
 
-# ===== Admin width loading (no user UI) =====
 def _load_admin_widths_px(displayed_cols: List[str]) -> Dict[str, int]:
     """
     Load default widths (px) from:
@@ -293,10 +293,10 @@ def main():
     df = df[present]
 
     # Apply character clipping (except website); width<=0 disables clipping
-disp = df.copy()
-for col, width in CHAR_WIDTHS.items():
-    if col in disp.columns and col != "website" and width > 0:
-        disp[col] = disp[col].map(lambda v: clip_value(v, width))
+    disp = df.copy()
+    for col, width in CHAR_WIDTHS.items():
+        if col in disp.columns and col != "website" and width > 0:
+            disp[col] = disp[col].map(lambda v: clip_value(v, width))
 
     # Rename to friendly labels for display
     disp = disp.rename(columns={c: LABELS.get(c, c) for c in disp.columns})
