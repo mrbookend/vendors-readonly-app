@@ -3,8 +3,10 @@
 # - NO content clipping (shows full strings from DB)
 # - Admin-set default column widths via secrets/env/file; end users can still drag-resize
 # - Explicit page/table width so rightmost column is fully reachable with horizontal scroll
-# - AND search across all fields (case-insensitive)
-# - Search label text changed to "Search (all partial or full word or words):" at ~16pt, not bold
+# - AND search across ALL DB columns (case-insensitive)
+# - Search label text: "Search (all partial or full word or words):" at ~16pt, not bold
+# - Display columns: Category, Business Name, Contact Name, Phone, Address, Website, Notes, Keywords
+#   (Service is not shown but IS included in search because we search all columns)
 
 from __future__ import annotations
 
@@ -25,23 +27,30 @@ APP_TITLE = "Vendors Directory (Read-only)"
 st.set_page_config(page_title=APP_TITLE, layout="wide")
 
 # ===== Display configuration =====
+# Only these are SHOWN (in this order). Search will use ALL DB columns.
 DISPLAY_COLUMNS: List[str] = [
-    "category", "service", "business_name", "contact_name",
-    "phone", "address", "website", "notes",
+    "category",
+    "business_name",
+    "contact_name",
+    "phone",
+    "address",
+    "website",
+    "notes",
+    "keywords",
 ]
 
 LABELS: Dict[str, str] = {
     "category": "Category",
-    "service": "Service",
     "business_name": "Business Name",
     "contact_name": "Contact Name",
     "phone": "Phone",
     "address": "Address",
     "website": "Website",
     "notes": "Notes",
+    "keywords": "Keywords",
 }
 
-# ===== Int config helper =====
+# ===== Int config helper (reads secrets first, then env, then default) =====
 def _int_config(key: str, default: int) -> int:
     val = st.secrets.get(key, None)
     if val is not None:
@@ -57,9 +66,10 @@ def _int_config(key: str, default: int) -> int:
             pass
     return int(default)
 
+# Page width & sizing knobs (secrets override env)
 PAGE_MAX_WIDTH_PX = _int_config("PAGE_MAX_WIDTH_PX", 2300)
 WEBSITE_WIDTH_PX  = _int_config("WEBSITE_COL_WIDTH_PX", 300)
-CHARS_TO_PX       = _int_config("CHARS_TO_PX", 10)
+CHARS_TO_PX       = _int_config("CHARS_TO_PX", 10)   # heuristic only for fallback widths
 EXTRA_COL_PADDING = _int_config("EXTRA_COL_PADDING_PX", 24)
 
 # ===== Page & Search CSS =====
@@ -77,8 +87,9 @@ div[data-baseweb="input"] input {{ font-size: 16pt; }}
 </style>
 """, unsafe_allow_html=True)
 
-# ===== Database wiring =====
+# ===== Database wiring (Turso first; SQLite fallback) =====
 def _get_secret(*keys: str) -> str:
+    """Return first non-empty among env vars or st.secrets for given keys."""
     for k in keys:
         v = os.environ.get(k, "") or st.secrets.get(k, "")
         if v:
@@ -87,19 +98,22 @@ def _get_secret(*keys: str) -> str:
 
 @st.cache_resource(show_spinner=False)
 def get_engine():
+    # Accept BOTH naming styles used across your apps:
     libsql_url = _get_secret("LIBSQL_URL", "LIBSQL_DATABASE_URL")
     libsql_tok = _get_secret("LIBSQL_AUTH_TOKEN")
-    turso_url = _get_secret("TURSO_DATABASE_URL")
-    turso_tok = _get_secret("TURSO_AUTH_TOKEN")
+    turso_url  = _get_secret("TURSO_DATABASE_URL")
+    turso_tok  = _get_secret("TURSO_AUTH_TOKEN")
 
     db_url_raw = libsql_url or turso_url
-    auth_tok = libsql_tok or turso_tok
+    auth_tok   = libsql_tok or turso_tok
 
     if db_url_raw and auth_tok:
+        # SQLAlchemy needs sqlite+libsql://... (not libsql://...)
         driver_url = db_url_raw.replace("libsql://", "sqlite+libsql://")
         driver_url = f"{driver_url}?secure=true"
         return create_engine(driver_url, connect_args={"auth_token": auth_tok}, future=True)
 
+    # Fallback: local SQLite file (dev only). Supports explicit path via env/secrets.
     sqlite_path = _get_secret("SQLITE_PATH")
     if not sqlite_path:
         sqlite_path = str(Path(__file__).resolve().parent / "vendors.db")
@@ -133,45 +147,74 @@ def normalize_url(u: str) -> str:
     return s if parsed.scheme else f"https://{s}"
 
 def load_df(engine) -> pd.DataFrame:
+    """
+    Load **all columns** from vendors (plus id if present) so search can see everything.
+    Display slicing happens later using DISPLAY_COLUMNS.
+    """
     cols = _cols(engine)
-    desired = [c for c in DISPLAY_COLUMNS if c in cols]
-    sel = (["id"] + desired) if "id" in cols else desired
-    if not sel:
+    if not cols:
         return pd.DataFrame()
-    order_col = "business_name" if "business_name" in cols else sel[0]
+
+    fetch_cols = list(cols)  # all table columns
+    sel = (["id"] + [c for c in fetch_cols if c != "id"]) if "id" in fetch_cols else fetch_cols
+
+    # Choose a stable order-by if we have business_name, else first column
+    order_col = "business_name" if "business_name" in fetch_cols else fetch_cols[0]
+
     with engine.begin() as con:
         df = pd.read_sql_query(
             f"SELECT {', '.join(sel)} FROM vendors ORDER BY {order_col} COLLATE NOCASE",
             con,
         )
-    for c in desired:
-        if c in df.columns and c != "id":
+
+    # Normalize strings and website
+    for c in df.columns:
+        if c != "id":
             df[c] = df[c].fillna("").astype(str)
     if "website" in df.columns:
         df["website"] = df["website"].map(normalize_url)
     return df
 
 def filter_df(df: pd.DataFrame, query: str) -> pd.DataFrame:
+    """
+    AND search across **all non-id columns** (case-insensitive).
+    """
     q = _s(query)
     if not q:
         return df
     tokens = [t.lower() for t in re.split(r"[,\s]+", q) if t]
     if not tokens:
         return df
+
     search_cols = [c for c in df.columns if c != "id"]
+    if not search_cols:
+        return df
+
     lowered = df[search_cols].astype(str).apply(lambda s: s.str.lower())
     mask = pd.Series(True, index=df.index)
     for tok in tokens:
+        # row matches if *any* column contains tok; AND across tokens
         mask &= lowered.apply(lambda s: s.str.contains(tok, na=False)).any(axis=1)
     return df[mask]
 
+# ===== Admin width loading (no user UI) =====
 def _load_admin_widths_px(displayed_cols: List[str]) -> Dict[str, int]:
+    """
+    Load initial widths (px) from:
+      1) st.secrets["COLUMN_WIDTHS_PX"]  (table/dict: {raw_col: px})
+      2) env var COLUMN_WIDTHS_JSON      (JSON string)
+      3) ./column_widths.json            (JSON file in repo)
+    Fallback: simple heuristic (chars→px) + padding if no explicit widths provided.
+    """
+    # 1) secrets table/mapping
     try:
         cfg = st.secrets.get("COLUMN_WIDTHS_PX", None)
         if isinstance(cfg, Mapping):
             return {k: int(cfg[k]) for k in cfg if k in displayed_cols}
     except Exception:
         pass
+
+    # 2) env var JSON
     try:
         raw = os.getenv("COLUMN_WIDTHS_JSON", "")
         if raw:
@@ -180,6 +223,8 @@ def _load_admin_widths_px(displayed_cols: List[str]) -> Dict[str, int]:
                 return {k: int(data[k]) for k in data if k in displayed_cols}
     except Exception:
         pass
+
+    # 3) local JSON file
     try:
         p = Path(__file__).resolve().parent / "column_widths.json"
         if p.exists():
@@ -189,15 +234,17 @@ def _load_admin_widths_px(displayed_cols: List[str]) -> Dict[str, int]:
                 return {k: int(data[k]) for k in data if k in displayed_cols}
     except Exception:
         pass
+
+    # Fallback: provide a reasonable starting width per column (no clipping)
     approx_chars = {
         "business_name": 36,
         "category": 32,
-        "service": 32,
         "contact_name": 28,
         "phone": 18,
         "address": 40,
         "website": 30,
         "notes": 60,
+        "keywords": 40,
     }
     return {
         col: approx_chars.get(col, 24) * CHARS_TO_PX + EXTRA_COL_PADDING
@@ -205,11 +252,17 @@ def _load_admin_widths_px(displayed_cols: List[str]) -> Dict[str, int]:
     }
 
 def build_col_config(displayed_cols: List[str], default_widths_px: Dict[str, int]) -> Dict[str, st.column_config.BaseColumn]:
+    """
+    Build column_config with **admin-set** initial widths (no user controls here).
+    Users can still drag-resize in the UI; we do not expose any inputs in this app.
+    """
     col_config: Dict[str, st.column_config.BaseColumn] = {}
     label_map = {c: LABELS.get(c, c) for c in displayed_cols}
+
     for raw_col in displayed_cols:
         label = label_map[raw_col]
-        target_px = int(default_widths_px.get(raw_col, 240))
+        target_px = int(default_widths_px.get(raw_col, 240))  # guardrail
+
         if raw_col == "website":
             try:
                 col_config[label] = st.column_config.LinkColumn(
@@ -217,15 +270,17 @@ def build_col_config(displayed_cols: List[str], default_widths_px: Dict[str, int
                     width=target_px,
                 )
             except Exception:
+                # Older Streamlit may not support LinkColumn
                 col_config[label] = st.column_config.Column(label=label, width=target_px)
         else:
             col_config[label] = st.column_config.Column(label=label, width=target_px)
+
     return col_config
 
 # ===== UI =====
 def main():
     engine = get_engine()
-    df = load_df(engine)
+    df = load_df(engine)  # includes ALL columns
 
     if df.empty:
         st.info("No vendor data found.")
@@ -243,23 +298,29 @@ def main():
         help="Type one or more words (partial or full). Matches require all words (case-insensitive).",
         label_visibility="collapsed",
     )
+
+    # AND search across ALL columns
     df = filter_df(df, q)
 
+    # Slice to ONLY the display columns (in order) that actually exist
     present = [c for c in DISPLAY_COLUMNS if c in df.columns]
     if not present:
         st.info("No displayable columns found.")
         return
     df = df[present]
 
-    disp = df.copy()
-    disp = disp.rename(columns={c: LABELS.get(c, c) for c in disp.columns})
+    # Rename to friendly labels for display
+    disp = df.rename(columns={c: LABELS.get(c, c) for c in df.columns})
 
+    # Admin-defined initial widths (no UI). Users can still drag-resize in the table.
     default_widths_px = _load_admin_widths_px(displayed_cols=[c for c in df.columns])
     col_config = build_col_config(displayed_cols=[c for c in df.columns],
                                   default_widths_px=default_widths_px)
 
+    # Keep column order explicit to avoid surprises
     column_order = [LABELS.get(c, c) for c in df.columns]
 
+    # IMPORTANT: don't stretch; use explicit width so defaults "take"
     st.dataframe(
         disp,
         use_container_width=False,
