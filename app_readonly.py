@@ -2,13 +2,14 @@
 # - Uses the SAME live DB as Admin: supports LIBSQL_URL/LIBSQL_AUTH_TOKEN and TURSO_DATABASE_URL/TURSO_AUTH_TOKEN
 # - Non-FTS AND search across all fields
 # - Clickable Website links (scheme normalized)
-# - Configurable character-width clipping per column (CHAR_WIDTHS)
-# - Page width knob (PAGE_MAX_WIDTH_PX) so you can see entire last column with horizontal scroll
+# - Admin-set default column widths (no on-screen controls for end users)
+# - Page width knob to ensure last column is fully visible with horizontal scrolling
 # - Case-insensitive sort by Business Name (falls back if missing)
 # - Safe if some columns are missing
 
 from __future__ import annotations
 
+import json
 import os
 import re
 from pathlib import Path
@@ -41,6 +42,7 @@ CHAR_WIDTHS: Dict[str, int] = {
     # "website": (not clipped)
 }
 
+# Friendly labels
 LABELS: Dict[str, str] = {
     "category": "Category",
     "service": "Service",
@@ -52,13 +54,10 @@ LABELS: Dict[str, str] = {
     "notes": "Notes",
 }
 
-# Page width knob: increase if you still can't fully see the last column.
-PAGE_MAX_WIDTH_PX = int(os.getenv("PAGE_MAX_WIDTH_PX", "2300"))  # try 2400–2600 on small monitors
+# ===== Page width & sizing knobs =====
+PAGE_MAX_WIDTH_PX = int(os.getenv("PAGE_MAX_WIDTH_PX", "2300"))  # increase if needed
 WEBSITE_WIDTH_PX = int(os.getenv("WEBSITE_COL_WIDTH_PX", "300"))
-
-# Rough “characters to pixels” conversion for non-website columns in st.dataframe
-# This isn’t perfect but keeps columns readable. Tweak if needed.
-CHARS_TO_PX = int(os.getenv("CHARS_TO_PX", "10"))  # ~10 px per character as a starting point
+CHARS_TO_PX = int(os.getenv("CHARS_TO_PX", "10"))               # chars→px heuristic
 EXTRA_COL_PADDING = int(os.getenv("EXTRA_COL_PADDING_PX", "24"))
 
 # ===== Page width CSS =====
@@ -84,25 +83,19 @@ def _get_secret(*keys: str) -> str:
 @st.cache_resource(show_spinner=False)
 def get_engine():
     # Accept BOTH naming styles used across your apps:
-    # Old/Admin style:
     libsql_url = _get_secret("LIBSQL_URL", "LIBSQL_DATABASE_URL")
     libsql_tok = _get_secret("LIBSQL_AUTH_TOKEN")
-    # Turso naming:
     turso_url = _get_secret("TURSO_DATABASE_URL")
     turso_tok = _get_secret("TURSO_AUTH_TOKEN")
 
-    # Prefer Turso/libsql remote if either pair is present (Admin & Read-only share these)
     db_url_raw = libsql_url or turso_url
     auth_tok = libsql_tok or turso_tok
 
     if db_url_raw and auth_tok:
-        # SQLAlchemy needs sqlite+libsql://... (not libsql://...)
         driver_url = db_url_raw.replace("libsql://", "sqlite+libsql://")
-        # Add secure flag for remote connection
         driver_url = f"{driver_url}?secure=true"
         return create_engine(driver_url, connect_args={"auth_token": auth_tok}, future=True)
 
-    # Fallback: local SQLite file (dev only). Supports explicit path via env/secrets.
     sqlite_path = _get_secret("SQLITE_PATH")
     if not sqlite_path:
         sqlite_path = str(Path(__file__).resolve().parent / "vendors.db")
@@ -110,15 +103,10 @@ def get_engine():
         if sqlite_path.startswith("/"):
             sqlite_url = f"sqlite:///{sqlite_path}"
         else:
-            sqlite_url = f"sqlite:///{os.path.abspath(sqllite_path)}"  # noqa: F821 (typo caught below)
+            sqlite_url = f"sqlite:///{os.path.abspath(sqlite_path)}"
     else:
         sqlite_url = sqlite_path
-    # Fix potential variable typo
-    try:
-        return create_engine(sqlite_url, future=True)
-    except NameError:
-        sqlite_url = f"sqlite:///{sqlite_path}" if not sqlite_path.startswith("sqlite:///") else sqlite_path
-        return create_engine(sqlite_url, future=True)
+    return create_engine(sqlite_url, future=True)
 
 # ===== Helpers =====
 def _cols(engine) -> List[str]:
@@ -172,7 +160,6 @@ def filter_df(df: pd.DataFrame, query: str) -> pd.DataFrame:
     q = _s(query)
     if not q:
         return df
-    # split on spaces or commas; AND semantics
     tokens = [t.lower() for t in re.split(r"[,\s]+", q) if t]
     if not tokens:
         return df
@@ -183,36 +170,77 @@ def filter_df(df: pd.DataFrame, query: str) -> pd.DataFrame:
         mask &= lowered.apply(lambda s: s.str.contains(tok, na=False)).any(axis=1)
     return df[mask]
 
-def build_col_config(displayed_cols: List[str]) -> Dict[str, st.column_config.BaseColumn]:
+# ===== Admin width loading (no user UI) =====
+def _load_admin_widths_px(displayed_cols: List[str]) -> Dict[str, int]:
     """
-    Build Streamlit column_config with explicit widths.
-    Approximate char widths -> px so the last column stays visible when you scroll.
+    Load default widths (px) from:
+      1) st.secrets["COLUMN_WIDTHS_PX"]  (dict: {raw_col: px})
+      2) env var COLUMN_WIDTHS_JSON      (JSON string)
+      3) ./column_widths.json            (JSON file in repo)
+    Fallback: derive from CHAR_WIDTHS (chars→px).
+    """
+    # 1) secrets dict
+    try:
+        cfg = st.secrets.get("COLUMN_WIDTHS_PX", None)
+        if isinstance(cfg, dict):
+            return {k: int(cfg[k]) for k in cfg if k in displayed_cols}
+    except Exception:
+        pass
+
+    # 2) env var JSON
+    try:
+        raw = os.getenv("COLUMN_WIDTHS_JSON", "")
+        if raw:
+            data = json.loads(raw)
+            if isinstance(data, dict):
+                return {k: int(data[k]) for k in data if k in displayed_cols}
+    except Exception:
+        pass
+
+    # 3) local JSON file
+    try:
+        p = Path(__file__).resolve().parent / "column_widths.json"
+        if p.exists():
+            with open(p, "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+            if isinstance(data, dict):
+                return {k: int(data[k]) for k in data if k in displayed_cols}
+    except Exception:
+        pass
+
+    # Fallback: build from CHAR_WIDTHS and WEBSITE_WIDTH_PX
+    def _default_px(raw_col: str) -> int:
+        if raw_col == "website":
+            return WEBSITE_WIDTH_PX
+        w_chars = CHAR_WIDTHS.get(raw_col, 24)
+        return w_chars * CHARS_TO_PX + EXTRA_COL_PADDING
+
+    return {c: _default_px(c) for c in displayed_cols}
+
+def build_col_config(displayed_cols: List[str], default_widths_px: Dict[str, int]) -> Dict[str, st.column_config.BaseColumn]:
+    """
+    Build column_config with **admin-set** initial widths (no user controls here).
+    Users can still drag-resize in the UI; we do not expose any inputs in this app.
     """
     col_config: Dict[str, st.column_config.BaseColumn] = {}
-    # In dataframe, we’ll rename columns to user-friendly labels;
-    # create a reverse map from labels so we can assign configs by label.
     label_map = {c: LABELS.get(c, c) for c in displayed_cols}
 
     for raw_col in displayed_cols:
         label = label_map[raw_col]
+        target_px = int(default_widths_px.get(raw_col, 240))  # final guard
+
         if raw_col == "website":
             try:
                 col_config[label] = st.column_config.LinkColumn(
                     label=label,
-                    width=WEBSITE_WIDTH_PX,
+                    width=target_px,
                 )
             except Exception:
-                # older Streamlit versions may not have LinkColumn
-                pass
-            continue
+                # Older Streamlit may not support LinkColumn
+                col_config[label] = st.column_config.Column(label=label, width=target_px)
+        else:
+            col_config[label] = st.column_config.Column(label=label, width=target_px)
 
-        # For text columns, compute a width based on desired character clipping width if present.
-        w_chars = CHAR_WIDTHS.get(raw_col, 24)  # default a reasonable char width
-        width_px = w_chars * CHARS_TO_PX + EXTRA_COL_PADDING
-        col_config[label] = st.column_config.Column(
-            label=label,
-            width=width_px,
-        )
     return col_config
 
 # ===== UI =====
@@ -254,15 +282,17 @@ def main():
     # Rename to friendly labels for display
     disp = disp.rename(columns={c: LABELS.get(c, c) for c in disp.columns})
 
-    # Build explicit column widths so the last column stays fully visible when scrolling
-    col_config = build_col_config(displayed_cols=[c for c in df.columns])
+    # Admin-defined default widths (no UI). Users can still drag-resize in the table.
+    default_widths_px = _load_admin_widths_px(displayed_cols=[c for c in df.columns])
+    col_config = build_col_config(displayed_cols=[c for c in df.columns],
+                                  default_widths_px=default_widths_px)
 
     st.dataframe(
         disp,
         use_container_width=True,
         hide_index=True,
         column_config=col_config,
-        height=680,  # tweak if you want more vertical space
+        height=680,
     )
 
     with st.expander("Debug", expanded=False):
@@ -270,9 +300,8 @@ def main():
             "engine_url": str(engine.url),
             "using_remote": str(engine.url).startswith("sqlite+libsql://"),
             "page_max_width_px": PAGE_MAX_WIDTH_PX,
-            "chars_to_px": CHARS_TO_PX,
-            "extra_col_padding_px": EXTRA_COL_PADDING,
             "displayed_columns": list(disp.columns),
+            "default_widths_px": default_widths_px,
             "row_count": int(len(disp)),
         })
 
