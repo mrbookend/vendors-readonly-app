@@ -1,10 +1,11 @@
 # app_readonly.py — Vendors Directory (Read-only, Live DB via Turso; local fallback)
 # - Uses the SAME live DB as Admin (LIBSQL_* or TURSO_* secrets)
+# - NO content clipping at all (we don't modify text values)
 # - Admin-set default column widths via secrets/env/file; end users can still drag-resize
 # - Page width knob so rightmost column is fully reachable with horizontal scroll
 # - Non-FTS AND search across all fields; website links normalized to be clickable
-# - NO clipping on Business Name (set to 0) and clip only when width > 0
-# - Everything runs inside main() to avoid NameError scope issues
+# - Case-insensitive sort by Business Name (fallback to first selected col)
+# - Safe if some columns are missing
 
 from __future__ import annotations
 
@@ -24,24 +25,11 @@ from sqlalchemy.sql import text as sql_text
 APP_TITLE = "Vendors Directory (Read-only)"
 st.set_page_config(page_title=APP_TITLE, layout="wide")
 
-# ===== Display configuration (edit as needed) =====
+# ===== Display configuration =====
 DISPLAY_COLUMNS: List[str] = [
     "category", "service", "business_name", "contact_name",
     "phone", "address", "website", "notes",
 ]
-
-# Character clip widths by column **name** (applied before display). "website" is not clipped.
-# NOTE: business_name=0 means NO CLIPPING.
-CHAR_WIDTHS: Dict[str, int] = {
-    "business_name": 0,   # 0 = no clipping
-    "category": 32,
-    "service": 32,
-    "contact_name": 28,
-    "phone": 18,
-    "address": 40,
-    "notes": 60,
-    # "website": (not clipped)
-}
 
 # Friendly labels
 LABELS: Dict[str, str] = {
@@ -74,7 +62,10 @@ def _int_config(key: str, default: int) -> int:
 # Page width & sizing knobs (secrets override env)
 PAGE_MAX_WIDTH_PX = _int_config("PAGE_MAX_WIDTH_PX", 2300)
 WEBSITE_WIDTH_PX  = _int_config("WEBSITE_COL_WIDTH_PX", 300)
-CHARS_TO_PX       = _int_config("CHARS_TO_PX", 10)    # chars→px heuristic
+
+# These two now only affect initial column widths if provided via file/env;
+# we do NOT clip any values anymore.
+CHARS_TO_PX       = _int_config("CHARS_TO_PX", 10)   # heuristic for admin defaults
 EXTRA_COL_PADDING = _int_config("EXTRA_COL_PADDING_PX", 24)
 
 # ===== Page width CSS =====
@@ -167,14 +158,6 @@ def load_df(engine) -> pd.DataFrame:
         df["website"] = df["website"].map(normalize_url)
     return df
 
-def clip_value(val: object, width: int) -> str:
-    if width <= 0:
-        return _s(val)
-    t = _s(val)
-    if len(t) <= width:
-        return t
-    return t[: max(width - 1, 0)] + "…"
-
 def filter_df(df: pd.DataFrame, query: str) -> pd.DataFrame:
     q = _s(query)
     if not q:
@@ -190,13 +173,14 @@ def filter_df(df: pd.DataFrame, query: str) -> pd.DataFrame:
         mask &= lowered.apply(lambda s: s.str.contains(tok, na=False)).any(axis=1)
     return df[mask]
 
+# ===== Admin width loading (no user UI) =====
 def _load_admin_widths_px(displayed_cols: List[str]) -> Dict[str, int]:
     """
-    Load default widths (px) from:
+    Load initial widths (px) from:
       1) st.secrets["COLUMN_WIDTHS_PX"]  (table/dict: {raw_col: px})
       2) env var COLUMN_WIDTHS_JSON      (JSON string)
       3) ./column_widths.json            (JSON file in repo)
-    Fallback: derive from CHAR_WIDTHS (chars→px) and WEBSITE_WIDTH_PX.
+    Fallback: simple heuristic (chars→px) + padding if no explicit widths provided.
     """
     # 1) secrets table/mapping
     try:
@@ -227,14 +211,21 @@ def _load_admin_widths_px(displayed_cols: List[str]) -> Dict[str, int]:
     except Exception:
         pass
 
-    # Fallback: compute from CHAR_WIDTHS and WEBSITE_WIDTH_PX
-    def _default_px(raw_col: str) -> int:
-        if raw_col == "website":
-            return WEBSITE_WIDTH_PX
-        w_chars = CHAR_WIDTHS.get(raw_col, 24)
-        return w_chars * CHARS_TO_PX + EXTRA_COL_PADDING
-
-    return {c: _default_px(c) for c in displayed_cols}
+    # Fallback: provide a reasonable starting width per column (no clipping)
+    approx_chars = {
+        "business_name": 36,
+        "category": 32,
+        "service": 32,
+        "contact_name": 28,
+        "phone": 18,
+        "address": 40,
+        "website": 30,   # label is the URL; make it reasonable
+        "notes": 60,
+    }
+    return {
+        col: approx_chars.get(col, 24) * CHARS_TO_PX + EXTRA_COL_PADDING
+        for col in displayed_cols
+    }
 
 def build_col_config(displayed_cols: List[str], default_widths_px: Dict[str, int]) -> Dict[str, st.column_config.BaseColumn]:
     """
@@ -246,7 +237,7 @@ def build_col_config(displayed_cols: List[str], default_widths_px: Dict[str, int
 
     for raw_col in displayed_cols:
         label = label_map[raw_col]
-        target_px = int(default_widths_px.get(raw_col, 240))  # final guard
+        target_px = int(default_widths_px.get(raw_col, 240))  # guardrail
 
         if raw_col == "website":
             try:
@@ -292,16 +283,13 @@ def main():
         return
     df = df[present]
 
-    # Apply character clipping (except website); width<=0 disables clipping
+    # DO NOT clip values at all — show full strings from DB.
     disp = df.copy()
-    for col, width in CHAR_WIDTHS.items():
-        if col in disp.columns and col != "website" and width > 0:
-            disp[col] = disp[col].map(lambda v: clip_value(v, width))
 
     # Rename to friendly labels for display
     disp = disp.rename(columns={c: LABELS.get(c, c) for c in disp.columns})
 
-    # Admin-defined default widths (no UI). Users can still drag-resize in the table.
+    # Admin-defined initial widths (no UI). Users can still drag-resize in the table.
     default_widths_px = _load_admin_widths_px(displayed_cols=[c for c in df.columns])
     col_config = build_col_config(displayed_cols=[c for c in df.columns],
                                   default_widths_px=default_widths_px)
