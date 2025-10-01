@@ -1,10 +1,9 @@
 # app_readonly.py — Vendors Directory (Read-only, Live DB via Turso; local fallback)
-# - Uses the SAME live DB as Admin: supports LIBSQL_URL/LIBSQL_AUTH_TOKEN and TURSO_DATABASE_URL/TURSO_AUTH_TOKEN
-# - Non-FTS AND search across all fields
-# - Clickable Website links (scheme normalized)
-# - Admin-set default column widths (no on-screen controls for end users)
-# - Page width knob to ensure last column is fully visible with horizontal scrolling
-# - Case-insensitive sort by Business Name (falls back if missing)
+# - Uses the SAME live DB as Admin (LIBSQL_* or TURSO_* secrets)
+# - Admin-set default column widths via secrets/env/file; end users can still drag-resize
+# - Page width knob so rightmost column is fully reachable with horizontal scroll
+# - Non-FTS AND search across all fields; website links normalized to be clickable
+# - Case-insensitive sort by Business Name (fallback to first selected col)
 # - Safe if some columns are missing
 
 from __future__ import annotations
@@ -12,6 +11,7 @@ from __future__ import annotations
 import json
 import os
 import re
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Dict, List
 from urllib.parse import urlparse
@@ -54,11 +54,27 @@ LABELS: Dict[str, str] = {
     "notes": "Notes",
 }
 
-# ===== Page width & sizing knobs =====
-PAGE_MAX_WIDTH_PX = int(os.getenv("PAGE_MAX_WIDTH_PX", "2300"))  # increase if needed
-WEBSITE_WIDTH_PX = int(os.getenv("WEBSITE_COL_WIDTH_PX", "300"))
-CHARS_TO_PX = int(os.getenv("CHARS_TO_PX", "10"))               # chars→px heuristic
-EXTRA_COL_PADDING = int(os.getenv("EXTRA_COL_PADDING_PX", "24"))
+# ===== Int config helper (reads secrets first, then env, then default) =====
+def _int_config(key: str, default: int) -> int:
+    val = st.secrets.get(key, None)
+    if val is not None:
+        try:
+            return int(val)
+        except Exception:
+            pass
+    env = os.getenv(key, "")
+    if env:
+        try:
+            return int(env)
+        except Exception:
+            pass
+    return int(default)
+
+# Page width & sizing knobs (secrets override env)
+PAGE_MAX_WIDTH_PX = _int_config("PAGE_MAX_WIDTH_PX", 2300)
+WEBSITE_WIDTH_PX  = _int_config("WEBSITE_COL_WIDTH_PX", 300)
+CHARS_TO_PX       = _int_config("CHARS_TO_PX", 10)    # chars→px heuristic
+EXTRA_COL_PADDING = _int_config("EXTRA_COL_PADDING_PX", 24)
 
 # ===== Page width CSS =====
 st.markdown(f"""
@@ -92,10 +108,12 @@ def get_engine():
     auth_tok = libsql_tok or turso_tok
 
     if db_url_raw and auth_tok:
+        # SQLAlchemy needs sqlite+libsql://... (not libsql://...)
         driver_url = db_url_raw.replace("libsql://", "sqlite+libsql://")
         driver_url = f"{driver_url}?secure=true"
         return create_engine(driver_url, connect_args={"auth_token": auth_tok}, future=True)
 
+    # Fallback: local SQLite file (dev only). Supports explicit path via env/secrets.
     sqlite_path = _get_secret("SQLITE_PATH")
     if not sqlite_path:
         sqlite_path = str(Path(__file__).resolve().parent / "vendors.db")
@@ -160,6 +178,7 @@ def filter_df(df: pd.DataFrame, query: str) -> pd.DataFrame:
     q = _s(query)
     if not q:
         return df
+    # AND across tokens split on spaces/commas
     tokens = [t.lower() for t in re.split(r"[,\s]+", q) if t]
     if not tokens:
         return df
@@ -174,15 +193,15 @@ def filter_df(df: pd.DataFrame, query: str) -> pd.DataFrame:
 def _load_admin_widths_px(displayed_cols: List[str]) -> Dict[str, int]:
     """
     Load default widths (px) from:
-      1) st.secrets["COLUMN_WIDTHS_PX"]  (dict: {raw_col: px})
+      1) st.secrets["COLUMN_WIDTHS_PX"]  (table/dict: {raw_col: px})
       2) env var COLUMN_WIDTHS_JSON      (JSON string)
       3) ./column_widths.json            (JSON file in repo)
-    Fallback: derive from CHAR_WIDTHS (chars→px).
+    Fallback: derive from CHAR_WIDTHS (chars→px) and WEBSITE_WIDTH_PX.
     """
-    # 1) secrets dict
+    # 1) secrets table/mapping
     try:
         cfg = st.secrets.get("COLUMN_WIDTHS_PX", None)
-        if isinstance(cfg, dict):
+        if isinstance(cfg, Mapping):
             return {k: int(cfg[k]) for k in cfg if k in displayed_cols}
     except Exception:
         pass
@@ -208,7 +227,7 @@ def _load_admin_widths_px(displayed_cols: List[str]) -> Dict[str, int]:
     except Exception:
         pass
 
-    # Fallback: build from CHAR_WIDTHS and WEBSITE_WIDTH_PX
+    # Fallback: compute from CHAR_WIDTHS and WEBSITE_WIDTH_PX
     def _default_px(raw_col: str) -> int:
         if raw_col == "website":
             return WEBSITE_WIDTH_PX
@@ -287,11 +306,17 @@ def main():
     col_config = build_col_config(displayed_cols=[c for c in df.columns],
                                   default_widths_px=default_widths_px)
 
+    # Keep column order explicit to avoid surprises
+    column_order = [LABELS.get(c, c) for c in df.columns]
+
+    # IMPORTANT: don't stretch; use explicit width so defaults "take"
     st.dataframe(
         disp,
-        use_container_width=True,
+        use_container_width=False,      # stop auto-stretching
+        width=PAGE_MAX_WIDTH_PX,        # explicit table width matching page width knob
         hide_index=True,
         column_config=col_config,
+        column_order=column_order,
         height=680,
     )
 
