@@ -496,7 +496,26 @@ def load_vendor_by_id(vid: int) -> Optional[Dict]:
 
 st.title("Vendors Admin")
 
-_col_widths = _get_column_widths_px()
+def _get_column_widths_px() -> Dict[str, int]:
+    mapping: Dict[str, int] = {}
+    try:
+        block = st.secrets.get("COLUMN_WIDTHS_PX", {})
+        if isinstance(block, dict):
+            for k, v in block.items():
+                key = str(k).strip().lower()       # <-- normalize keys
+                try:
+                    # Allow "240", " 240 ", but reject "240px"
+                    mapping[key] = int(str(v).strip())
+                except Exception:
+                    pass
+    except Exception:
+        pass
+    # Back-compat override just for website if provided as env/secret scalar
+    website_w = _get_int_secret("WEBSITE_COL_WIDTH_PX", 0)
+    if website_w and "website" not in mapping:
+        mapping["website"] = website_w
+    return mapping
+
 
 # DB diagnostics
 with st.expander("Database Status & Schema (debug)", expanded=False):
@@ -531,6 +550,12 @@ with st.expander("Database Status & Schema (debug)", expanded=False):
             + "\nOn Streamlit Cloud/containers, local files may reset on redeploy/restart. "
               "For persistence, set LIBSQL_URL/TURSO_DATABASE_URL (and token) in Secrets."
         )
+# Show what widths the app actually loaded (so we stop guessing)
+try:
+    st.write("**Loaded column widths (debug)**")
+    st.json(_get_column_widths_px())
+except Exception as _e:
+    st.write("Widths debug error:", str(_e))
 
 # Tabs
 tab_view, tab_add, tab_edit, tab_delete, tab_cat, tab_svc, tab_maint = st.tabs(
