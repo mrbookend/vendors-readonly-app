@@ -8,7 +8,6 @@ numpy==1.26.4
 
 SQLAlchemy==2.0.32
 sqlalchemy-libsql==0.2.0
-libsql-client==0.3.7
+libsql-client==0.3.1
 
 protobuf<5
-typing-extensions>=4.8
