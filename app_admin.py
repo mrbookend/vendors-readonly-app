@@ -1,11 +1,13 @@
 # app_admin.py
 # Vendors Admin — Category REQUIRED, Service optional (blank display if missing)
-# - Delete flows:
-#   * Category: show usage count; require reassignment before delete (Category is required)
-#   * Service: show usage count; allow reassignment OR clear to blank, then delete
-# - Reassignment/clearing are transactional and safe; success toasts persist across reruns
+# - Clearer UX for Categories/Services Admin:
+#   * Step-by-step instructions at the top
+#   * Usage counts + preview list of impacted vendors (first N)
+#   * Explicit actions with confirm checkboxes
+#   * Category: must reassign before delete (or delete only when unused)
+#   * Service: reassign OR clear-to-blank, then delete; delete only when unused
 # - Capitalization: Title Case on save for business_name, contact_name, category, service, address
-# - Maintenance tab: one-click normalize all existing rows
+# - Maintenance tab: one-click normalize existing rows
 # - Turso/libSQL (LIBSQL_* or TURSO_* secrets). DSN normalized to sqlite+libsql://…?secure=true
 # - connect_args uses 'auth_token' (snake_case)
 # - Column width controls via secrets: [COLUMN_WIDTHS_PX], PAGE_MAX_WIDTH_PX, etc.
@@ -14,7 +16,7 @@ from __future__ import annotations
 import os
 import re
 import time
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Tuple
 
 import pandas as pd
 import streamlit as st
@@ -294,7 +296,7 @@ def invalidate_caches():
     except Exception:
         pass
 
-# Usage counters
+# Usage counters + previews
 def count_vendors_with_category(name: str) -> int:
     with engine.begin() as conn:
         return int(conn.execute(sql_text(
@@ -306,6 +308,24 @@ def count_vendors_with_service(name: str) -> int:
         return int(conn.execute(sql_text(
             "SELECT COUNT(1) FROM vendors WHERE lower(service)=lower(:n)"
         ), {"n": name}).scalar_one())
+
+def list_vendors_by_category(name: str, limit: int = 15) -> List[Tuple[int, str]]:
+    with engine.begin() as conn:
+        rows = conn.execute(sql_text(
+            "SELECT id, business_name FROM vendors "
+            "WHERE lower(category)=lower(:n) "
+            "ORDER BY lower(business_name) ASC LIMIT :lim"
+        ), {"n": name, "lim": limit}).fetchall()
+    return [(int(r[0]), r[1] or "") for r in rows]
+
+def list_vendors_by_service(name: str, limit: int = 15) -> List[Tuple[int, str]]:
+    with engine.begin() as conn:
+        rows = conn.execute(sql_text(
+            "SELECT id, business_name FROM vendors "
+            "WHERE lower(service)=lower(:n) "
+            "ORDER BY lower(business_name) ASC LIMIT :lim"
+        ), {"n": name, "lim": limit}).fetchall()
+    return [(int(r[0]), r[1] or "") for r in rows]
 
 # -----------------------------
 # Load vendors
@@ -432,10 +452,10 @@ def select_category_required(label: str, value: Optional[str], key: str) -> str:
         idx = 0
         if value and value in cats:
             idx = cats.index(value)
-        selected = st.selectbox(label + " *", options=cats, index=idx, key=key)
+        selected = st.selectbox(label + " *", options=cats, index=idx, key=key, help="Category is required.")
         return selected.strip() if selected else ""
     else:
-        typed = st.text_input(label + " * (type a category name)", value=value or "", key=key)
+        typed = st.text_input(label + " * (type a category name)", value=value or "", key=key, help="Enter a new category.")
         return typed.strip()
 
 def select_service_optional(label: str, value: Optional[str], key: str) -> Optional[str]:
@@ -444,7 +464,7 @@ def select_service_optional(label: str, value: Optional[str], key: str) -> Optio
     idx = 0
     if value and value in svcs:
         idx = options.index(value)
-    chosen = st.selectbox(label, options=options, index=idx, key=key)
+    chosen = st.selectbox(label, options=options, index=idx, key=key, help="Blank is allowed.")
     return None if (chosen is None or str(chosen).strip() == "") else chosen
 
 def load_vendor_by_id(vid: int) -> Optional[Dict]:
@@ -672,15 +692,26 @@ with tab_delete:
             del_feedback.success(st.session_state.pop("delete_success_msg"))
 
 # -----------------------------
-# Categories Admin (add + reassign + delete)
+# Categories Admin (add + reassign + delete) — with instructions & preview
 # -----------------------------
 with tab_cat:
     st.subheader("Categories Admin")
+    st.info(
+        "How this works:\n"
+        "1) Pick a category.\n"
+        "2) See how many vendors use it and preview some names.\n"
+        "3) Choose what to do:\n"
+        "   • **Reassign Vendors** to another category (existing or new), keeping the old category.\n"
+        "   • **Reassign Vendors then Delete Category** (typical clean-up).\n"
+        "   • **Delete Category (no vendors use it)** — only shown when usage is 0.\n"
+        "Notes: Category is required on vendors, so you cannot delete a category that still has vendors without reassigning them first."
+    )
+
     if not table_exists("categories") or "name" not in get_columns("categories"):
         st.info("Table 'categories(name)' not found. You can still assign Category text directly in vendors.")
 
     # Add
-    new_cat = st.text_input("New Category Name")
+    new_cat = st.text_input("Add a new Category", help="Creates it in the categories table (smart Title Case applied).")
     if st.button("Add Category", key="btn_add_cat"):
         if not new_cat.strip():
             st.error("Category name required.")
@@ -694,92 +725,143 @@ with tab_cat:
             rerun()
 
     # Manage / Delete
-    st.markdown("**Existing Categories**")
+    st.divider()
     cats = list_categories()
-    st.write(", ".join(cats) if cats else "(none)")
-
-    if cats:
-        st.divider()
-        st.markdown("**Reassign vendors and/or Delete a Category**")
-        sel_cat = st.selectbox("Select category to manage", options=cats, key="cat_manage")
+    if not cats:
+        st.write("(no categories yet)")
+    else:
+        sel_cat = st.selectbox(
+            "Step 1 — Select category to manage",
+            options=cats,
+            key="cat_manage",
+            help="Pick the category you want to rename/reassign/delete."
+        )
         if sel_cat:
             use_count = count_vendors_with_category(sel_cat)
-            st.write(f"Vendors using **{sel_cat}**: **{use_count}**")
-            # Target category for reassignment
+            preview = list_vendors_by_category(sel_cat, limit=15)
+            st.write(f"Step 2 — Impact preview: **{use_count}** vendors currently use **{sel_cat}**.")
+            if preview:
+                st.caption("First 15 impacted vendors:")
+                st.write(", ".join([f"{name} (#{vid})" for vid, name in preview]))
+
+            # Target selection
             target_options = ["(choose)"] + [c for c in cats if c != sel_cat]
-            target_sel = st.selectbox("Reassign vendors to (existing)", options=target_options, key="cat_reassign_sel")
-            target_new = st.text_input("...or type a NEW category to create and reassign to", key="cat_reassign_new")
+            cols = st.columns([1,1])
+            with cols[0]:
+                target_sel = st.selectbox(
+                    "Step 3 — Reassign vendors to (existing category)",
+                    options=target_options,
+                    key="cat_reassign_sel",
+                    help="Pick another existing category to move these vendors into."
+                )
+            with cols[1]:
+                target_new = st.text_input(
+                    "...or type a NEW category to create and reassign to",
+                    key="cat_reassign_new",
+                    help="If provided, a new category will be created and all vendors moved there."
+                )
 
+            # Actions
             act = st.empty()
+            confirm_reassign = st.checkbox("Confirm: I want to reassign these vendors.", key="cat_confirm_reassign")
 
-            # Reassign vendors (no delete)
-            if st.button("Reassign Vendors", key="btn_cat_reassign"):
-                target = None
-                if target_sel and target_sel != "(choose)":
-                    target = target_sel
-                elif target_new.strip():
-                    target = smart_title(target_new.strip())
-                if not target:
-                    act.error("Pick an existing target or type a new one.")
+            if st.button("Reassign Vendors (keep old category)", key="btn_cat_reassign"):
+                if not confirm_reassign:
+                    act.error("Tick the confirm checkbox above.")
                 else:
-                    try:
-                        with engine.begin() as conn:
-                            conn.execute(sql_text("CREATE TABLE IF NOT EXISTS categories(name TEXT PRIMARY KEY)"))
-                            conn.execute(sql_text("INSERT OR IGNORE INTO categories(name) VALUES(:n)"), {"n": target})
-                            conn.execute(sql_text(
-                                "UPDATE vendors SET category=:tgt WHERE lower(category)=lower(:old)"
-                            ), {"tgt": target, "old": sel_cat})
-                        st.success(f"Reassigned vendors from '{sel_cat}' to '{target}'.")
-                        invalidate_caches()
-                        rerun()
-                    except Exception as ex:
-                        act.error(f"Reassign failed: {ex}")
+                    target = None
+                    if target_sel and target_sel != "(choose)":
+                        target = target_sel
+                    elif target_new.strip():
+                        target = smart_title(target_new.strip())
+                    if not target:
+                        act.error("Pick an existing target or type a new one.")
+                    else:
+                        try:
+                            with engine.begin() as conn:
+                                conn.execute(sql_text("CREATE TABLE IF NOT EXISTS categories(name TEXT PRIMARY KEY)"))
+                                conn.execute(sql_text("INSERT OR IGNORE INTO categories(name) VALUES(:n)"), {"n": target})
+                                conn.execute(sql_text(
+                                    "UPDATE vendors SET category=:tgt WHERE lower(category)=lower(:old)"
+                                ), {"tgt": target, "old": sel_cat})
+                            st.success(f"Reassigned vendors from '{sel_cat}' to '{target}'. Old category kept.")
+                            invalidate_caches()
+                            rerun()
+                        except Exception as ex:
+                            act.error(f"Reassign failed: {ex}")
 
-            # Reassign + Delete
+            confirm_reassign_delete = st.checkbox(
+                "Confirm: Reassign vendors and then delete the old category.",
+                key="cat_confirm_reassign_delete"
+            )
             if st.button("Reassign Vendors then Delete Category", key="btn_cat_reassign_delete"):
-                target = None
-                if target_sel and target_sel != "(choose)":
-                    target = target_sel
-                elif target_new.strip():
-                    target = smart_title(target_new.strip())
-                if not target:
-                    act.error("Pick an existing target or type a new one.")
+                if not confirm_reassign_delete:
+                    act.error("Tick the confirm checkbox above.")
                 else:
-                    try:
-                        with engine.begin() as conn:
-                            conn.execute(sql_text("CREATE TABLE IF NOT EXISTS categories(name TEXT PRIMARY KEY)"))
-                            conn.execute(sql_text("INSERT OR IGNORE INTO categories(name) VALUES(:n)"), {"n": target})
-                            conn.execute(sql_text(
-                                "UPDATE vendors SET category=:tgt WHERE lower(category)=lower(:old)"
-                            ), {"tgt": target, "old": sel_cat})
-                            conn.execute(sql_text("DELETE FROM categories WHERE lower(name)=lower(:n)"), {"n": sel_cat})
-                        st.success(f"Reassigned to '{target}' and deleted category '{sel_cat}'.")
-                        invalidate_caches()
-                        rerun()
-                    except Exception as ex:
-                        act.error(f"Reassign+Delete failed: {ex}")
+                    target = None
+                    if target_sel and target_sel != "(choose)":
+                        target = target_sel
+                    elif target_new.strip():
+                        target = smart_title(target_new.strip())
+                    if not target:
+                        act.error("Pick an existing target or type a new one.")
+                    else:
+                        try:
+                            with engine.begin() as conn:
+                                conn.execute(sql_text("CREATE TABLE IF NOT EXISTS categories(name TEXT PRIMARY KEY)"))
+                                conn.execute(sql_text("INSERT OR IGNORE INTO categories(name) VALUES(:n)"), {"n": target})
+                                conn.execute(sql_text(
+                                    "UPDATE vendors SET category=:tgt WHERE lower(category)=lower(:old)"
+                                ), {"tgt": target, "old": sel_cat})
+                                conn.execute(sql_text("DELETE FROM categories WHERE lower(name)=lower(:n)"), {"n": sel_cat})
+                            st.success(f"Reassigned to '{target}' and deleted category '{sel_cat}'.")
+                            invalidate_caches()
+                            rerun()
+                        except Exception as ex:
+                            act.error(f"Reassign+Delete failed: {ex}")
 
-            # Delete only if unused
-            if use_count == 0 and st.button("Delete Category (no vendors use it)", key="btn_cat_delete_only"):
-                try:
-                    with engine.begin() as conn:
-                        conn.execute(sql_text("DELETE FROM categories WHERE lower(name)=lower(:n)"), {"n": sel_cat})
-                    st.success(f"Deleted category '{sel_cat}'.")
-                    invalidate_caches()
-                    rerun()
-                except Exception as ex:
-                    act.error(f"Delete failed: {ex}")
+            if use_count == 0:
+                confirm_delete_only = st.checkbox(
+                    "Confirm: Delete this unused category.",
+                    key="cat_confirm_delete_only"
+                )
+                if st.button("Delete Category (no vendors use it)", key="btn_cat_delete_only"):
+                    if not confirm_delete_only:
+                        act.error("Tick the confirm checkbox above.")
+                    else:
+                        try:
+                            with engine.begin() as conn:
+                                conn.execute(sql_text("DELETE FROM categories WHERE lower(name)=lower(:n)"), {"n": sel_cat})
+                            st.success(f"Deleted category '{sel_cat}'.")
+                            invalidate_caches()
+                            rerun()
+                        except Exception as ex:
+                            act.error(f"Delete failed: {ex}")
+            else:
+                st.caption("Delete button appears only when usage is 0.")
 
 # -----------------------------
-# Services Admin (add + reassign/clear + delete)
+# Services Admin (add + reassign/clear + delete) — with instructions & preview
 # -----------------------------
 with tab_svc:
     st.subheader("Services Admin")
+    st.info(
+        "How this works:\n"
+        "1) Pick a service.\n"
+        "2) See how many vendors use it and preview some names.\n"
+        "3) Choose what to do:\n"
+        "   • **Reassign Vendors (Service)** to another service (existing or new).\n"
+        "   • **Clear Service to blank** (since Service is optional), for all vendors using it.\n"
+        "   • **Apply (Reassign or Clear) then Delete Service**.\n"
+        "   • **Delete Service (no vendors use it)** — only shown when usage is 0.\n"
+        "You can either reassign to a different service OR clear to blank. Deleting is allowed after that."
+    )
+
     if not table_exists("services") or "name" not in get_columns("services"):
         st.info("Table 'services(name)' not found. You can still leave Service blank for vendors, or type free-form in vendors.service if you later add the column.")
 
     # Add
-    new_svc = st.text_input("New Service Name")
+    new_svc = st.text_input("Add a new Service", help="Creates it in the services table (smart Title Case applied).")
     if st.button("Add Service", key="btn_add_svc"):
         if not new_svc.strip():
             st.error("Service name required.")
@@ -793,98 +875,129 @@ with tab_svc:
             rerun()
 
     # Manage / Delete
-    st.markdown("**Existing Services**")
+    st.divider()
     svcs = list_services()
-    st.write(", ".join(svcs) if svcs else "(none)")
-
-    if svcs:
-        st.divider()
-        st.markdown("**Reassign or Clear service, then Delete**")
-        sel_svc = st.selectbox("Select service to manage", options=svcs, key="svc_manage")
+    if not svcs:
+        st.write("(no services yet)")
+    else:
+        sel_svc = st.selectbox(
+            "Step 1 — Select service to manage",
+            options=svcs,
+            key="svc_manage",
+            help="Pick the service you want to reassign/clear/delete."
+        )
         if sel_svc:
             use_count = count_vendors_with_service(sel_svc)
-            st.write(f"Vendors using **{sel_svc}**: **{use_count}**")
+            preview = list_vendors_by_service(sel_svc, limit=15)
+            st.write(f"Step 2 — Impact preview: **{use_count}** vendors currently use **{sel_svc}**.")
+            if preview:
+                st.caption("First 15 impacted vendors:")
+                st.write(", ".join([f"{name} (#{vid})" for vid, name in preview]))
 
-            target_options = ["(choose)"] + [s for s in svcs if s != sel_svc]
-            target_sel = st.selectbox("Reassign vendors to (existing service)", options=target_options, key="svc_reassign_sel")
-            target_new = st.text_input("...or type a NEW service to create and reassign to", key="svc_reassign_new")
-            clear_to_blank = st.checkbox("Or clear vendor Service to blank instead of reassigning", value=False, key="svc_clear_blank")
+            # Target or clear
+            cols = st.columns([1,1,1])
+            with cols[0]:
+                target_options = ["(choose)"] + [s for s in svcs if s != sel_svc]
+                target_sel = st.selectbox(
+                    "Step 3a — Reassign vendors to (existing service)",
+                    options=target_options,
+                    key="svc_reassign_sel",
+                    help="Pick an existing service for reassignment (optional if you choose 'clear to blank')."
+                )
+            with cols[1]:
+                target_new = st.text_input(
+                    "Step 3b — ...or type a NEW service",
+                    key="svc_reassign_new",
+                    help="If provided, a new service will be created and vendors reassigned to it."
+                )
+            with cols[2]:
+                clear_to_blank = st.checkbox(
+                    "Or clear to blank",
+                    value=False,
+                    key="svc_clear_blank",
+                    help="Sets service to blank (NULL) for all vendors using the selected service."
+                )
 
             act = st.empty()
+            confirm_apply = st.checkbox("Confirm: Apply the change (reassign or clear).", key="svc_confirm_apply")
 
-            # Reassign vendors (no delete)
-            if st.button("Reassign Vendors (Service)", key="btn_svc_reassign"):
-                if clear_to_blank:
+            # Reassign only or clear only (no delete)
+            if st.button("Reassign Vendors (Service) / Clear Only", key="btn_svc_reassign"):
+                if not confirm_apply:
+                    act.error("Tick the confirm checkbox above.")
+                else:
                     try:
                         with engine.begin() as conn:
-                            conn.execute(sql_text(
-                                "UPDATE vendors SET service=NULL WHERE lower(service)=lower(:old)"
-                            ), {"old": sel_svc})
-                        st.success(f"Cleared service for vendors previously using '{sel_svc}'.")
-                        invalidate_caches()
-                        rerun()
-                    except Exception as ex:
-                        act.error(f"Clear failed: {ex}")
-                else:
-                    target = None
-                    if target_sel and target_sel != "(choose)":
-                        target = target_sel
-                    elif target_new.strip():
-                        target = smart_title(target_new.strip())
-                    if not target:
-                        act.error("Pick an existing target or type a new one, or check 'clear to blank'.")
-                    else:
-                        try:
-                            with engine.begin() as conn:
+                            if clear_to_blank:
+                                conn.execute(sql_text(
+                                    "UPDATE vendors SET service=NULL WHERE lower(service)=lower(:old)"
+                                ), {"old": sel_svc})
+                            else:
+                                target = None
+                                if target_sel and target_sel != "(choose)":
+                                    target = target_sel
+                                elif target_new.strip():
+                                    target = smart_title(target_new.strip())
+                                if not target:
+                                    raise ValueError("Pick an existing target or type a new one, or check 'clear to blank'.")
                                 conn.execute(sql_text("CREATE TABLE IF NOT EXISTS services(name TEXT PRIMARY KEY)"))
                                 conn.execute(sql_text("INSERT OR IGNORE INTO services(name) VALUES(:n)"), {"n": target})
                                 conn.execute(sql_text(
                                     "UPDATE vendors SET service=:tgt WHERE lower(service)=lower(:old)"
                                 ), {"tgt": target, "old": sel_svc})
-                            st.success(f"Reassigned service from '{sel_svc}' to '{target}'.")
+                        st.success("Applied change. Old service retained.")
+                        invalidate_caches()
+                        rerun()
+                    except Exception as ex:
+                        act.error(f"Change failed: {ex}")
+
+            confirm_apply_delete = st.checkbox("Confirm: Apply change and then delete the old service.", key="svc_confirm_apply_delete")
+            if st.button("Apply (Reassign or Clear) then Delete Service", key="btn_svc_apply_delete"):
+                if not confirm_apply_delete:
+                    act.error("Tick the confirm checkbox above.")
+                else:
+                    try:
+                        with engine.begin() as conn:
+                            if clear_to_blank:
+                                conn.execute(sql_text(
+                                    "UPDATE vendors SET service=NULL WHERE lower(service)=lower(:old)"
+                                ), {"old": sel_svc})
+                            else:
+                                target = None
+                                if target_sel and target_sel != "(choose)":
+                                    target = target_sel
+                                elif target_new.strip():
+                                    target = smart_title(target_new.strip())
+                                if not target:
+                                    raise ValueError("Pick an existing target or type a new one, or check 'clear to blank'.")
+                                conn.execute(sql_text("CREATE TABLE IF NOT EXISTS services(name TEXT PRIMARY KEY)"))
+                                conn.execute(sql_text("INSERT OR IGNORE INTO services(name) VALUES(:n)"), {"n": target})
+                                conn.execute(sql_text(
+                                    "UPDATE vendors SET service=:tgt WHERE lower(service)=lower(:old)"
+                                ), {"tgt": target, "old": sel_svc})
+                            conn.execute(sql_text("DELETE FROM services WHERE lower(name)=lower(:n)"), {"n": sel_svc})
+                        st.success(f"Applied change and deleted service '{sel_svc}'.")
+                        invalidate_caches()
+                        rerun()
+                    except Exception as ex:
+                        act.error(f"Apply+Delete failed: {ex}")
+
+            if use_count == 0:
+                confirm_delete_only = st.checkbox("Confirm: Delete this unused service.", key="svc_confirm_delete_only")
+                if st.button("Delete Service (no vendors use it)", key="btn_svc_delete_only"):
+                    if not confirm_delete_only:
+                        act.error("Tick the confirm checkbox above.")
+                    else:
+                        try:
+                            with engine.begin() as conn:
+                                conn.execute(sql_text("DELETE FROM services WHERE lower(name)=lower(:n)"), {"n": sel_svc})
+                            st.success(f"Deleted service '{sel_svc}'.")
                             invalidate_caches()
                             rerun()
                         except Exception as ex:
-                            act.error(f"Reassign failed: {ex}")
-
-            # Reassign/Clear + Delete
-            if st.button("Apply (Reassign or Clear) then Delete Service", key="btn_svc_apply_delete"):
-                try:
-                    with engine.begin() as conn:
-                        if clear_to_blank:
-                            conn.execute(sql_text(
-                                "UPDATE vendors SET service=NULL WHERE lower(service)=lower(:old)"
-                            ), {"old": sel_svc})
-                        else:
-                            target = None
-                            if target_sel and target_sel != "(choose)":
-                                target = target_sel
-                            elif target_new.strip():
-                                target = smart_title(target_new.strip())
-                            if not target:
-                                raise ValueError("Pick an existing target or type a new one, or check 'clear to blank'.")
-                            conn.execute(sql_text("CREATE TABLE IF NOT EXISTS services(name TEXT PRIMARY KEY)"))
-                            conn.execute(sql_text("INSERT OR IGNORE INTO services(name) VALUES(:n)"), {"n": target})
-                            conn.execute(sql_text(
-                                "UPDATE vendors SET service=:tgt WHERE lower(service)=lower(:old)"
-                            ), {"tgt": target, "old": sel_svc})
-                        conn.execute(sql_text("DELETE FROM services WHERE lower(name)=lower(:n)"), {"n": sel_svc})
-                    st.success(f"Applied change and deleted service '{sel_svc}'.")
-                    invalidate_caches()
-                    rerun()
-                except Exception as ex:
-                    act.error(f"Apply+Delete failed: {ex}")
-
-            # Delete only if unused
-            if use_count == 0 and st.button("Delete Service (no vendors use it)", key="btn_svc_delete_only"):
-                try:
-                    with engine.begin() as conn:
-                        conn.execute(sql_text("DELETE FROM services WHERE lower(name)=lower(:n)"), {"n": sel_svc})
-                    st.success(f"Deleted service '{sel_svc}'.")
-                    invalidate_caches()
-                    rerun()
-                except Exception as ex:
-                    act.error(f"Delete failed: {ex}")
+                            act.error(f"Delete failed: {ex}")
+            else:
+                st.caption("Delete button appears only when usage is 0.")
 
 # -----------------------------
 # Maintenance — normalize existing rows
