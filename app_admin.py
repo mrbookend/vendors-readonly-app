@@ -217,45 +217,51 @@ def title_address(s: Optional[str]) -> Optional[str]:
 def _get_column_widths_px() -> Dict[str, int]:
     """
     Load COLUMN_WIDTHS_PX from secrets. Accepts:
-      - a dict/table (normal TOML)
+      - any Mapping (Streamlit may return an AttrDict/Secrets mapping)
       - a string containing JSON (e.g. '{"website":120}')
       - a string containing simple 'key = value' lines
+
     Maps 'small'/'medium'/'large' to sentinels (-1/-2/-3) for later conversion.
     """
     import json
+    from collections.abc import Mapping
 
     def _coerce_map(obj) -> Dict[str, int]:
         out: Dict[str, int] = {}
-        if not isinstance(obj, dict):
+        if not isinstance(obj, Mapping):
             return out
         for k, v in obj.items():
             key = str(k).strip().lower()
+            # allow "small|medium|large"
             if isinstance(v, str) and v.strip().lower() in {"small", "medium", "large"}:
                 out[key] = {"small": -1, "medium": -2, "large": -3}[v.strip().lower()]
                 continue
+            # allow ints or "120"
             try:
                 out[key] = int(str(v).strip())
             except Exception:
                 pass
         return out
 
-    raw = None
+    # 1) Read from secrets
     try:
-        raw = st.secrets["COLUMN_WIDTHS_PX"] if "COLUMN_WIDTHS_PX" in st.secrets else None
+        raw = st.secrets.get("COLUMN_WIDTHS_PX", None)
     except Exception:
         raw = None
 
-    # dict case
-    if isinstance(raw, dict):
+    # 2) Accept Mapping directly (dict, AttrDict, etc.)
+    if isinstance(raw, Mapping):
         mapping = _coerce_map(raw)
-    # string case: try JSON then naive parser
+
+    # 3) If it's a string, try JSON then naive "key = value" lines
     elif isinstance(raw, str):
         s = raw.strip()
         mapping = {}
         # JSON attempt
         try:
             obj = json.loads(s)
-            mapping = _coerce_map(obj)
+            if isinstance(obj, Mapping):
+                mapping = _coerce_map(obj)
         except Exception:
             pass
         # naive "key = value" lines
@@ -277,12 +283,13 @@ def _get_column_widths_px() -> Dict[str, int]:
     else:
         mapping = {}
 
-    # Back-compat: WEBSITE_COL_WIDTH_PX scalar
+    # 4) Back-compat: WEBSITE_COL_WIDTH_PX scalar override
     website_w = _get_int_secret("WEBSITE_COL_WIDTH_PX", 0)
     if website_w and "website" not in mapping:
         mapping["website"] = website_w
 
     return mapping
+
 
 # -----------------------------
 # Categories/Services: lists & orphans
