@@ -572,42 +572,63 @@ with tab_view:
     desired = ["business_name","category","service","contact_name",
                "phone","address","website","notes","keywords"]
     show_cols = [c for c in df.columns if c in desired]
-    # Load widths from secrets
-   def _size_from_px(v: int) -> str:
-    # Tune thresholds as you like
-    if v <= 120: 
-        return "small"
-    elif v <= 200:
-        return "medium"
-    else:
-        return "large"
 
-def _normalize_width_value(raw) -> Optional[str]:
-    """
-    Accept either:
-      - integers (px) -> map to small/medium/large
-      - strings 'small'/'medium'/'large' -> pass through
-    Anything else -> None (let Streamlit decide).
-    """
-    if raw is None:
-        return None
-    s = str(raw).strip().lower()
-    if s in {"small","medium","large"}:
-        return s
-    try:
-        px = int(s)
-        return _size_from_px(px)
-    except Exception:
-        return None
+    # ---- width helpers (sizes, not px) ----
+    def _size_from_px(v: int) -> str:
+        # Tune thresholds to your taste
+        if v <= 120:
+            return "small"
+        elif v <= 200:
+            return "medium"
+        else:
+            return "large"
 
+    def _normalize_width_value(raw) -> Optional[str]:
+        """
+        Accept either:
+          - integers (px) -> map to small/medium/large
+          - strings 'small'/'medium'/'large' -> pass through
+        Anything else -> None (let Streamlit decide).
+        """
+        if raw is None:
+            return None
+        s = str(raw).strip().lower()
+        if s in {"small", "medium", "large"}:
+            return s
+        try:
+            px = int(s)
+            return _size_from_px(px)
+        except Exception:
+            return None
+
+    # Load widths from secrets and build column_config using mapped sizes
+    _col_widths = _get_column_widths_px()
+
+    col_cfg: Dict[str, st.column_config.Column] = {}
+    cols_for_cfg = (["id"] + show_cols) if "id" in df.columns else show_cols
+    for c in cols_for_cfg:
+        label = c.replace("_", " ").title()
+        width_setting = _normalize_width_value(_col_widths.get(c))
+        if c == "id":
+            # keep id compact unless explicitly overridden
+            width_setting = width_setting or "small"
+            col_cfg[c] = st.column_config.NumberColumn(label, width=width_setting)
+        elif c == "website":
+            # nicer rendering for URLs
+            col_cfg[c] = st.column_config.LinkColumn(label, width=width_setting)
+        else:
+            col_cfg[c] = st.column_config.TextColumn(label, width=width_setting)
 
     # IMPORTANT: use data_editor (read-only), not dataframe
     st.data_editor(
         df[["id"] + show_cols] if "id" in df.columns else df[show_cols],
         use_container_width=True,
         hide_index=True,
+        column_config=col_cfg,
+        disabled=True,  # keeps it read-only like dataframe
+    )
+
         # Build column_config using your widths (mapped to S/M/L)
-_col_widths = _get_column_widths_px()
 
 col_cfg = {}
 cols_for_cfg = (["id"] + show_cols) if "id" in df.columns else show_cols
