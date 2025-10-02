@@ -1,7 +1,7 @@
 # app_admin.py
 # Vendors Admin — Category REQUIRED, Service optional (blank display if missing)
 # - Clearer UX for Categories/Services Admin:
-#   * Step-by-step instructions at the top
+#   * Instruction blocks appear just after the Add buttons
 #   * Usage counts + preview list of impacted vendors (first N)
 #   * Explicit actions with confirm checkboxes
 #   * Category: must reassign before delete (or delete only when unused)
@@ -692,21 +692,10 @@ with tab_delete:
             del_feedback.success(st.session_state.pop("delete_success_msg"))
 
 # -----------------------------
-# Categories Admin (add + reassign + delete) — with instructions & preview
+# Categories Admin (add, then instructions, then manage/delete)
 # -----------------------------
 with tab_cat:
     st.subheader("Categories Admin")
-    st.info(
-        "How this works:\n"
-        "1) Pick a category.\n"
-        "2) See how many vendors use it and preview some names.\n"
-        "3) Choose what to do:\n"
-        "   • **Reassign Vendors** to another category (existing or new), keeping the old category.\n"
-        "   • **Reassign Vendors then Delete Category** (typical clean-up).\n"
-        "   • **Delete Category (no vendors use it)** — only shown when usage is 0.\n"
-        "Notes: Category is required on vendors, so you cannot delete a category that still has vendors without reassigning them first."
-    )
-
     if not table_exists("categories") or "name" not in get_columns("categories"):
         st.info("Table 'categories(name)' not found. You can still assign Category text directly in vendors.")
 
@@ -723,6 +712,18 @@ with tab_cat:
             st.success(f"Category added/kept: {smart_title(new_cat.strip())}")
             invalidate_caches()
             rerun()
+
+    # Instruction block (moved below Add button as requested)
+    st.info(
+        "How to edit Categories:\n"
+        "1) Pick a category.\n"
+        "2) See how many vendors use it and preview some names.\n"
+        "3) Choose what to do:\n"
+        "   • **Reassign Vendors** to another category (existing or new), keeping the old category.\n"
+        "   • **Reassign Vendors then Delete Category** (typical clean-up).\n"
+        "   • **Delete Category (no vendors use it)** — only shown when usage is 0.\n"
+        "Notes: Category is required on vendors, so you cannot delete a category that still has vendors without reassigning them first."
+    )
 
     # Manage / Delete
     st.divider()
@@ -841,22 +842,10 @@ with tab_cat:
                 st.caption("Delete button appears only when usage is 0.")
 
 # -----------------------------
-# Services Admin (add + reassign/clear + delete) — with instructions & preview
+# Services Admin (add, then instructions, then manage/delete)
 # -----------------------------
 with tab_svc:
     st.subheader("Services Admin")
-    st.info(
-        "How this works:\n"
-        "1) Pick a service.\n"
-        "2) See how many vendors use it and preview some names.\n"
-        "3) Choose what to do:\n"
-        "   • **Reassign Vendors (Service)** to another service (existing or new).\n"
-        "   • **Clear Service to blank** (since Service is optional), for all vendors using it.\n"
-        "   • **Apply (Reassign or Clear) then Delete Service**.\n"
-        "   • **Delete Service (no vendors use it)** — only shown when usage is 0.\n"
-        "You can either reassign to a different service OR clear to blank. Deleting is allowed after that."
-    )
-
     if not table_exists("services") or "name" not in get_columns("services"):
         st.info("Table 'services(name)' not found. You can still leave Service blank for vendors, or type free-form in vendors.service if you later add the column.")
 
@@ -873,6 +862,19 @@ with tab_svc:
             st.success(f"Service added/kept: {smart_title(new_svc.strip())}")
             invalidate_caches()
             rerun()
+
+    # Instruction block (moved below Add button as requested)
+    st.info(
+        "How to edit Services:\n"
+        "1) Pick a service.\n"
+        "2) See how many vendors use it and preview some names.\n"
+        "3) Choose what to do:\n"
+        "   • **Reassign Vendors (Service)** to another service (existing or new).\n"
+        "   • **Clear Service to blank** (since Service is optional), for all vendors using it.\n"
+        "   • **Apply (Reassign or Clear) then Delete Service**.\n"
+        "   • **Delete Service (no vendors use it)** — only shown when usage is 0.\n"
+        "You can either reassign to a different service OR clear to blank. Deleting is allowed after that."
+    )
 
     # Manage / Delete
     st.divider()
