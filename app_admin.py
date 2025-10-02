@@ -1,15 +1,14 @@
 # app_admin.py
 # Vendors Admin — Category REQUIRED, Service optional (blank display if missing)
-# - Capitalization: force Title Case on save for business_name, contact_name, category, service, address
-#   * Preserves acronyms (LLC/INC/HVAC/USA/CPA/MD/DDS/PC/PA)
-#   * Uppercases address directionals (N, S, E, W, NE, NW, SE, SW) and "PO Box"
+# - Delete flows:
+#   * Category: show usage count; require reassignment before delete (Category is required)
+#   * Service: show usage count; allow reassignment OR clear to blank, then delete
+# - Reassignment/clearing are transactional and safe; success toasts persist across reruns
+# - Capitalization: Title Case on save for business_name, contact_name, category, service, address
 # - Maintenance tab: one-click normalize all existing rows
-# - Uses Turso/libSQL (LIBSQL_* or TURSO_* secrets). DSN normalized to sqlite+libsql://…?secure=true
+# - Turso/libSQL (LIBSQL_* or TURSO_* secrets). DSN normalized to sqlite+libsql://…?secure=true
 # - connect_args uses 'auth_token' (snake_case)
 # - Column width controls via secrets: [COLUMN_WIDTHS_PX], PAGE_MAX_WIDTH_PX, etc.
-# - Add/Edit/Delete with persistent success notices
-# - Phone & URL normalization
-# - Robust cache invalidation
 
 from __future__ import annotations
 import os
@@ -55,13 +54,11 @@ def _default_sqlite_path() -> str:
 _LIBSQL_SCHEME_RE = re.compile(r"^libsql://", re.IGNORECASE)
 
 def _normalize_libsql_url(url: str) -> str:
-    """Rewrite libsql://... to sqlite+libsql://... for SQLAlchemy."""
     if _LIBSQL_SCHEME_RE.match(url):
         return _LIBSQL_SCHEME_RE.sub("sqlite+libsql://", url, count=1)
     return url
 
 def _append_secure_param(dsn: str) -> str:
-    """Ensure ?secure=true is present for TLS; append or extend query string."""
     if "secure=" in dsn:
         return dsn
     return f"{dsn}&secure=true" if "?" in dsn else f"{dsn}?secure=true"
@@ -178,26 +175,20 @@ def normalize_url(url: str | None) -> str | None:
 ACRONYMS = {
     "LLC", "INC", "LLP", "DBA", "HVAC", "USA", "CPA", "PC", "PA", "MD", "DDS", "P.C.", "P.A."
 }
-
-DIRS = {"N", "S", "E", "W", "NE", "NW", "SE", "SW"}
-
-_word_splitter = re.compile(r"([\-'/])")  # keep delimiters
+_word_splitter = re.compile(r"([\-'/])")
 
 def _cap_token(tok: str) -> str:
     t = tok.strip()
     if not t:
         return t
-    # Preserve acronyms exactly (case-insensitive compare)
     if t.upper() in ACRONYMS:
         return t.upper()
-    # Title-case subparts around -, ', /
     parts = _word_splitter.split(t)
     out: List[str] = []
     for p in parts:
         if p in "-'/":
             out.append(p)
         else:
-            # Standard "capitalize" (first upper, rest lower)
             out.append(p[:1].upper() + p[1:].lower() if p else p)
     return "".join(out)
 
@@ -213,10 +204,7 @@ def title_address(s: Optional[str]) -> Optional[str]:
     t = smart_title(s)
     if not t:
         return t
-    # Uppercase directionals
-    def _dir_up(m): return m.group(0).upper()
-    t = re.sub(r"\b(N|S|E|W|NE|NW|SE|SW)\b", _dir_up, t, flags=re.IGNORECASE)
-    # Normalize PO Box variants
+    t = re.sub(r"\b(N|S|E|W|NE|NW|SE|SW)\b", lambda m: m.group(0).upper(), t, flags=re.IGNORECASE)
     t = re.sub(r"\bP[.\s]*O[.\s]*\s*Box\b", "PO Box", t, flags=re.IGNORECASE)
     return t
 
@@ -306,6 +294,19 @@ def invalidate_caches():
     except Exception:
         pass
 
+# Usage counters
+def count_vendors_with_category(name: str) -> int:
+    with engine.begin() as conn:
+        return int(conn.execute(sql_text(
+            "SELECT COUNT(1) FROM vendors WHERE lower(category)=lower(:n)"
+        ), {"n": name}).scalar_one())
+
+def count_vendors_with_service(name: str) -> int:
+    with engine.begin() as conn:
+        return int(conn.execute(sql_text(
+            "SELECT COUNT(1) FROM vendors WHERE lower(service)=lower(:n)"
+        ), {"n": name}).scalar_one())
+
 # -----------------------------
 # Load vendors
 # -----------------------------
@@ -361,10 +362,10 @@ def insert_vendor(
         "phone": normalize_phone(phone),
         "address": title_address(address) if address else None,
         "website": normalize_url(website),
-        "notes": (notes.strip() if notes else None),      # keep original case for notes
+        "notes": (notes.strip() if notes else None),
     }
     if has_kw:
-        params["keywords"] = (keywords or None)           # keep original case for keywords
+        params["keywords"] = (keywords or None)
     with engine.begin() as conn:
         conn.execute(sql_text(sql), params)
 
@@ -405,10 +406,10 @@ def update_vendor(
         "phone": normalize_phone(phone),
         "address": title_address(address) if address else None,
         "website": normalize_url(website),
-        "notes": (notes.strip() if notes else None),          # keep original case for notes
+        "notes": (notes.strip() if notes else None),
     }
     if has_kw:
-        params["keywords"] = (keywords or None)               # keep original case for keywords
+        params["keywords"] = (keywords or None)
     with engine.begin() as conn:
         conn.execute(sql_text(sql), params)
 
@@ -671,12 +672,14 @@ with tab_delete:
             del_feedback.success(st.session_state.pop("delete_success_msg"))
 
 # -----------------------------
-# Categories Admin
+# Categories Admin (add + reassign + delete)
 # -----------------------------
 with tab_cat:
     st.subheader("Categories Admin")
     if not table_exists("categories") or "name" not in get_columns("categories"):
         st.info("Table 'categories(name)' not found. You can still assign Category text directly in vendors.")
+
+    # Add
     new_cat = st.text_input("New Category Name")
     if st.button("Add Category", key="btn_add_cat"):
         if not new_cat.strip():
@@ -684,24 +687,98 @@ with tab_cat:
         else:
             with engine.begin() as conn:
                 conn.execute(sql_text("CREATE TABLE IF NOT EXISTS categories(name TEXT PRIMARY KEY)"))
-            with engine.begin() as conn:
-                conn.execute(sql_text("INSERT OR IGNORE INTO categories(name) VALUES(:n)"), {"n": smart_title(new_cat.strip())})
+                conn.execute(sql_text("INSERT OR IGNORE INTO categories(name) VALUES(:n)"),
+                             {"n": smart_title(new_cat.strip())})
             st.success(f"Category added/kept: {smart_title(new_cat.strip())}")
             invalidate_caches()
             rerun()
 
+    # Manage / Delete
     st.markdown("**Existing Categories**")
     cats = list_categories()
     st.write(", ".join(cats) if cats else "(none)")
 
+    if cats:
+        st.divider()
+        st.markdown("**Reassign vendors and/or Delete a Category**")
+        sel_cat = st.selectbox("Select category to manage", options=cats, key="cat_manage")
+        if sel_cat:
+            use_count = count_vendors_with_category(sel_cat)
+            st.write(f"Vendors using **{sel_cat}**: **{use_count}**")
+            # Target category for reassignment
+            target_options = ["(choose)"] + [c for c in cats if c != sel_cat]
+            target_sel = st.selectbox("Reassign vendors to (existing)", options=target_options, key="cat_reassign_sel")
+            target_new = st.text_input("...or type a NEW category to create and reassign to", key="cat_reassign_new")
+
+            act = st.empty()
+
+            # Reassign vendors (no delete)
+            if st.button("Reassign Vendors", key="btn_cat_reassign"):
+                target = None
+                if target_sel and target_sel != "(choose)":
+                    target = target_sel
+                elif target_new.strip():
+                    target = smart_title(target_new.strip())
+                if not target:
+                    act.error("Pick an existing target or type a new one.")
+                else:
+                    try:
+                        with engine.begin() as conn:
+                            conn.execute(sql_text("CREATE TABLE IF NOT EXISTS categories(name TEXT PRIMARY KEY)"))
+                            conn.execute(sql_text("INSERT OR IGNORE INTO categories(name) VALUES(:n)"), {"n": target})
+                            conn.execute(sql_text(
+                                "UPDATE vendors SET category=:tgt WHERE lower(category)=lower(:old)"
+                            ), {"tgt": target, "old": sel_cat})
+                        st.success(f"Reassigned vendors from '{sel_cat}' to '{target}'.")
+                        invalidate_caches()
+                        rerun()
+                    except Exception as ex:
+                        act.error(f"Reassign failed: {ex}")
+
+            # Reassign + Delete
+            if st.button("Reassign Vendors then Delete Category", key="btn_cat_reassign_delete"):
+                target = None
+                if target_sel and target_sel != "(choose)":
+                    target = target_sel
+                elif target_new.strip():
+                    target = smart_title(target_new.strip())
+                if not target:
+                    act.error("Pick an existing target or type a new one.")
+                else:
+                    try:
+                        with engine.begin() as conn:
+                            conn.execute(sql_text("CREATE TABLE IF NOT EXISTS categories(name TEXT PRIMARY KEY)"))
+                            conn.execute(sql_text("INSERT OR IGNORE INTO categories(name) VALUES(:n)"), {"n": target})
+                            conn.execute(sql_text(
+                                "UPDATE vendors SET category=:tgt WHERE lower(category)=lower(:old)"
+                            ), {"tgt": target, "old": sel_cat})
+                            conn.execute(sql_text("DELETE FROM categories WHERE lower(name)=lower(:n)"), {"n": sel_cat})
+                        st.success(f"Reassigned to '{target}' and deleted category '{sel_cat}'.")
+                        invalidate_caches()
+                        rerun()
+                    except Exception as ex:
+                        act.error(f"Reassign+Delete failed: {ex}")
+
+            # Delete only if unused
+            if use_count == 0 and st.button("Delete Category (no vendors use it)", key="btn_cat_delete_only"):
+                try:
+                    with engine.begin() as conn:
+                        conn.execute(sql_text("DELETE FROM categories WHERE lower(name)=lower(:n)"), {"n": sel_cat})
+                    st.success(f"Deleted category '{sel_cat}'.")
+                    invalidate_caches()
+                    rerun()
+                except Exception as ex:
+                    act.error(f"Delete failed: {ex}")
+
 # -----------------------------
-# Services Admin
+# Services Admin (add + reassign/clear + delete)
 # -----------------------------
 with tab_svc:
     st.subheader("Services Admin")
     if not table_exists("services") or "name" not in get_columns("services"):
         st.info("Table 'services(name)' not found. You can still leave Service blank for vendors, or type free-form in vendors.service if you later add the column.")
 
+    # Add
     new_svc = st.text_input("New Service Name")
     if st.button("Add Service", key="btn_add_svc"):
         if not new_svc.strip():
@@ -709,15 +786,105 @@ with tab_svc:
         else:
             with engine.begin() as conn:
                 conn.execute(sql_text("CREATE TABLE IF NOT EXISTS services(name TEXT PRIMARY KEY)"))
-            with engine.begin() as conn:
-                conn.execute(sql_text("INSERT OR IGNORE INTO services(name) VALUES(:n)"), {"n": smart_title(new_svc.strip())})
+                conn.execute(sql_text("INSERT OR IGNORE INTO services(name) VALUES(:n)"),
+                             {"n": smart_title(new_svc.strip())})
             st.success(f"Service added/kept: {smart_title(new_svc.strip())}")
             invalidate_caches()
             rerun()
 
-    svcs = list_services()
+    # Manage / Delete
     st.markdown("**Existing Services**")
+    svcs = list_services()
     st.write(", ".join(svcs) if svcs else "(none)")
+
+    if svcs:
+        st.divider()
+        st.markdown("**Reassign or Clear service, then Delete**")
+        sel_svc = st.selectbox("Select service to manage", options=svcs, key="svc_manage")
+        if sel_svc:
+            use_count = count_vendors_with_service(sel_svc)
+            st.write(f"Vendors using **{sel_svc}**: **{use_count}**")
+
+            target_options = ["(choose)"] + [s for s in svcs if s != sel_svc]
+            target_sel = st.selectbox("Reassign vendors to (existing service)", options=target_options, key="svc_reassign_sel")
+            target_new = st.text_input("...or type a NEW service to create and reassign to", key="svc_reassign_new")
+            clear_to_blank = st.checkbox("Or clear vendor Service to blank instead of reassigning", value=False, key="svc_clear_blank")
+
+            act = st.empty()
+
+            # Reassign vendors (no delete)
+            if st.button("Reassign Vendors (Service)", key="btn_svc_reassign"):
+                if clear_to_blank:
+                    try:
+                        with engine.begin() as conn:
+                            conn.execute(sql_text(
+                                "UPDATE vendors SET service=NULL WHERE lower(service)=lower(:old)"
+                            ), {"old": sel_svc})
+                        st.success(f"Cleared service for vendors previously using '{sel_svc}'.")
+                        invalidate_caches()
+                        rerun()
+                    except Exception as ex:
+                        act.error(f"Clear failed: {ex}")
+                else:
+                    target = None
+                    if target_sel and target_sel != "(choose)":
+                        target = target_sel
+                    elif target_new.strip():
+                        target = smart_title(target_new.strip())
+                    if not target:
+                        act.error("Pick an existing target or type a new one, or check 'clear to blank'.")
+                    else:
+                        try:
+                            with engine.begin() as conn:
+                                conn.execute(sql_text("CREATE TABLE IF NOT EXISTS services(name TEXT PRIMARY KEY)"))
+                                conn.execute(sql_text("INSERT OR IGNORE INTO services(name) VALUES(:n)"), {"n": target})
+                                conn.execute(sql_text(
+                                    "UPDATE vendors SET service=:tgt WHERE lower(service)=lower(:old)"
+                                ), {"tgt": target, "old": sel_svc})
+                            st.success(f"Reassigned service from '{sel_svc}' to '{target}'.")
+                            invalidate_caches()
+                            rerun()
+                        except Exception as ex:
+                            act.error(f"Reassign failed: {ex}")
+
+            # Reassign/Clear + Delete
+            if st.button("Apply (Reassign or Clear) then Delete Service", key="btn_svc_apply_delete"):
+                try:
+                    with engine.begin() as conn:
+                        if clear_to_blank:
+                            conn.execute(sql_text(
+                                "UPDATE vendors SET service=NULL WHERE lower(service)=lower(:old)"
+                            ), {"old": sel_svc})
+                        else:
+                            target = None
+                            if target_sel and target_sel != "(choose)":
+                                target = target_sel
+                            elif target_new.strip():
+                                target = smart_title(target_new.strip())
+                            if not target:
+                                raise ValueError("Pick an existing target or type a new one, or check 'clear to blank'.")
+                            conn.execute(sql_text("CREATE TABLE IF NOT EXISTS services(name TEXT PRIMARY KEY)"))
+                            conn.execute(sql_text("INSERT OR IGNORE INTO services(name) VALUES(:n)"), {"n": target})
+                            conn.execute(sql_text(
+                                "UPDATE vendors SET service=:tgt WHERE lower(service)=lower(:old)"
+                            ), {"tgt": target, "old": sel_svc})
+                        conn.execute(sql_text("DELETE FROM services WHERE lower(name)=lower(:n)"), {"n": sel_svc})
+                    st.success(f"Applied change and deleted service '{sel_svc}'.")
+                    invalidate_caches()
+                    rerun()
+                except Exception as ex:
+                    act.error(f"Apply+Delete failed: {ex}")
+
+            # Delete only if unused
+            if use_count == 0 and st.button("Delete Service (no vendors use it)", key="btn_svc_delete_only"):
+                try:
+                    with engine.begin() as conn:
+                        conn.execute(sql_text("DELETE FROM services WHERE lower(name)=lower(:n)"), {"n": sel_svc})
+                    st.success(f"Deleted service '{sel_svc}'.")
+                    invalidate_caches()
+                    rerun()
+                except Exception as ex:
+                    act.error(f"Delete failed: {ex}")
 
 # -----------------------------
 # Maintenance — normalize existing rows
@@ -744,7 +911,6 @@ with tab_maint:
                     notes = r.get("notes") or None
                     kw    = r.get("keywords") if "keywords" in r and pd.notna(r.get("keywords")) else None
 
-                    # Only write if anything would change
                     if any([
                         bn != r.get("business_name"),
                         (cn or "") != (r.get("contact_name") or ""),
