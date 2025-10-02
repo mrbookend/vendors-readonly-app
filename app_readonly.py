@@ -1,3 +1,5 @@
+from layout_header import apply_layout
+apply_layout()
 # app_readonly.py — Vendors Directory (Read-only, Live DB via Turso or local fallback)
 return
 
