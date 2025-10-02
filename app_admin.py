@@ -1,13 +1,13 @@
-from layout_header import apply_layout
-apply_layout()
 # app_admin.py
 # Vendors Admin — Category REQUIRED, Service optional (blank display if missing)
-# - Categories/Services Admin now surfaces **orphans** (values used by vendors but missing from the ref tables).
+# - Categories/Services Admin surfaces **orphans** (values used by vendors but missing from the ref tables).
 # - All comparisons use lower(trim(...)).
 # - Clear success notices on Add/Edit/Delete.
 # - Capitalization & trimming on save; Maintenance tab to normalize historical rows.
 # - Turso/libSQL via sqlite+libsql://…?secure=true with connect_args={"auth_token": ...}
-# - Column widths via secrets: [COLUMN_WIDTHS_PX], PAGE_MAX_WIDTH_PX, etc.
+# - Column widths via secrets: [COLUMN_WIDTHS_PX], page_max_width_px, etc.
+
+from __future__ import annotations
 
 import os
 import re
@@ -18,6 +18,13 @@ import pandas as pd
 import streamlit as st
 from sqlalchemy import create_engine, text as sql_text
 from sqlalchemy.engine import Engine
+
+# Optional page layout helper (safe if missing)
+try:
+    from layout_header import apply_layout
+    apply_layout()
+except Exception:
+    pass
 
 # -----------------------------
 # Secrets helpers
@@ -210,34 +217,35 @@ def title_address(s: Optional[str]) -> Optional[str]:
 # Column width configuration
 # -----------------------------
 def _get_column_widths_px() -> Dict[str, int]:
-    mapping = {}
+    """
+    Load COLUMN_WIDTHS_PX from secrets.
+    - Keys normalized to lower-case to match df columns.
+    - Values may be ints (px) or 'small'/'medium'/'large' (encoded as sentinels).
+    """
+    mapping: Dict[str, int] = {}
     try:
-        block = st.secrets.get("COLUMN_WIDTHS_PX", {})
+        block = st.secrets["COLUMN_WIDTHS_PX"] if "COLUMN_WIDTHS_PX" in st.secrets else {}
         if isinstance(block, dict):
             for k, v in block.items():
+                key = str(k).strip().lower()
+                # try int first
                 try:
-                    mapping[str(k)] = int(v)
+                    mapping[key] = int(str(v).strip())
+                    continue
                 except Exception:
                     pass
+                # allow explicit sizes via sentinel ints
+                s = str(v).strip().lower()
+                if s in {"small", "medium", "large"}:
+                    mapping[key] = {"small": -1, "medium": -2, "large": -3}[s]
     except Exception:
         pass
+
     website_w = _get_int_secret("WEBSITE_COL_WIDTH_PX", 0)
     if website_w and "website" not in mapping:
         mapping["website"] = website_w
-    return mapping
 
-def _build_column_config(show_cols: List[str], widths: Dict[str, int]) -> Dict[str, st.column_config.Column]:
-    cfg: Dict[str, st.column_config.Column] = {}
-    for c in show_cols:
-        w = widths.get(c, 0)
-        if c == "id":
-            cfg[c] = st.column_config.NumberColumn("id", width=70 if w <= 0 else w)
-        else:
-            if w > 0:
-                cfg[c] = st.column_config.TextColumn(c.replace("_", " ").title(), width=w)
-            else:
-                cfg[c] = st.column_config.TextColumn(c.replace("_", " ").title())
-    return cfg
+    return mapping
 
 # -----------------------------
 # Categories/Services: lists & orphans
@@ -252,7 +260,6 @@ def list_categories_table() -> List[str]:
 
 @st.cache_data(show_spinner=False, ttl=30)
 def list_categories_from_vendors() -> List[str]:
-    # Trim to avoid “X ” vs “X”
     with engine.begin() as conn:
         rows = conn.execute(sql_text(
             "SELECT DISTINCT trim(category) AS c "
@@ -266,8 +273,7 @@ def list_services_table() -> List[str]:
     if table_exists("services") and "name" in get_columns("services"):
         with engine.begin() as conn:
             rows = conn.execute(sql_text("SELECT name FROM services ORDER BY lower(name) ASC")).fetchall()
-        return [r[0] for r in rows if r[0]]
-    return []
+        return [r[0] for r[0] in rows]
 
 @st.cache_data(show_spinner=False, ttl=30)
 def list_services_from_vendors() -> List[str]:
@@ -280,7 +286,6 @@ def list_services_from_vendors() -> List[str]:
     return [r[0] for r in rows if r[0]]
 
 def list_categories() -> List[str]:
-    # For general pickers (not admin), keep table values if present, else fallback to vendor distincts
     cats_tbl = list_categories_table()
     if cats_tbl:
         return cats_tbl
@@ -493,29 +498,7 @@ def load_vendor_by_id(vid: int) -> Optional[Dict]:
 # -----------------------------
 # App layout
 # -----------------------------
-
 st.title("Vendors Admin")
-
-def _get_column_widths_px() -> Dict[str, int]:
-    mapping: Dict[str, int] = {}
-    try:
-        block = st.secrets.get("COLUMN_WIDTHS_PX", {})
-        if isinstance(block, dict):
-            for k, v in block.items():
-                key = str(k).strip().lower()       # <-- normalize keys
-                try:
-                    # Allow "240", " 240 ", but reject "240px"
-                    mapping[key] = int(str(v).strip())
-                except Exception:
-                    pass
-    except Exception:
-        pass
-    # Back-compat override just for website if provided as env/secret scalar
-    website_w = _get_int_secret("WEBSITE_COL_WIDTH_PX", 0)
-    if website_w and "website" not in mapping:
-        mapping["website"] = website_w
-    return mapping
-
 
 # DB diagnostics
 with st.expander("Database Status & Schema (debug)", expanded=False):
@@ -543,19 +526,19 @@ with st.expander("Database Status & Schema (debug)", expanded=False):
         status["error"] = str(e)
     st.write("**Schema**")
     st.json(status)
-    if info["backend"] == "sqlite":
-        st.warning(
-            "Using local SQLite at: "
-            + str(info["sqlite_path"])
-            + "\nOn Streamlit Cloud/containers, local files may reset on redeploy/restart. "
-              "For persistence, set LIBSQL_URL/TURSO_DATABASE_URL (and token) in Secrets."
-        )
-# Show what widths the app actually loaded (so we stop guessing)
-try:
-    st.write("**Loaded column widths (debug)**")
-    st.json(_get_column_widths_px())
-except Exception as _e:
-    st.write("Widths debug error:", str(_e))
+
+    # Secrets debug — keep until satisfied; remove later if you wish
+    try:
+        st.write("**Secrets keys (debug)**", sorted(list(st.secrets.keys())))
+        if "COLUMN_WIDTHS_PX" in st.secrets:
+            st.write("**Raw COLUMN_WIDTHS_PX (debug)**")
+            st.json(st.secrets["COLUMN_WIDTHS_PX"])
+        else:
+            st.warning("COLUMN_WIDTHS_PX not found in st.secrets")
+        st.write("**Loaded column widths (debug)**")
+        st.json(_get_column_widths_px())
+    except Exception as _e:
+        st.write("Secrets debug error:", str(_e))
 
 # Tabs
 tab_view, tab_add, tab_edit, tab_delete, tab_cat, tab_svc, tab_maint = st.tabs(
@@ -575,7 +558,7 @@ with tab_view:
 
     # ---- width helpers (sizes, not px) ----
     def _size_from_px(v: int) -> str:
-        # Tune thresholds to your taste
+        # Tune thresholds as you like
         if v <= 120:
             return "small"
         elif v <= 200:
@@ -588,10 +571,13 @@ with tab_view:
         Accept either:
           - integers (px) -> map to small/medium/large
           - strings 'small'/'medium'/'large' -> pass through
+          - sentinel ints (-1/-2/-3) set by _get_column_widths_px()
         Anything else -> None (let Streamlit decide).
         """
         if raw is None:
             return None
+        if isinstance(raw, int) and raw in {-1, -2, -3}:
+            return {-1: "small", -2: "medium", -3: "large"}[raw]
         s = str(raw).strip().lower()
         if s in {"small", "medium", "large"}:
             return s
@@ -601,7 +587,6 @@ with tab_view:
         except Exception:
             return None
 
-    # Load widths from secrets and build column_config using mapped sizes
     _col_widths = _get_column_widths_px()
 
     col_cfg: Dict[str, st.column_config.Column] = {}
@@ -610,41 +595,20 @@ with tab_view:
         label = c.replace("_", " ").title()
         width_setting = _normalize_width_value(_col_widths.get(c))
         if c == "id":
-            # keep id compact unless explicitly overridden
             width_setting = width_setting or "small"
             col_cfg[c] = st.column_config.NumberColumn(label, width=width_setting)
         elif c == "website":
-            # nicer rendering for URLs
             col_cfg[c] = st.column_config.LinkColumn(label, width=width_setting)
         else:
             col_cfg[c] = st.column_config.TextColumn(label, width=width_setting)
 
-    # IMPORTANT: use data_editor (read-only), not dataframe
     st.data_editor(
         df[["id"] + show_cols] if "id" in df.columns else df[show_cols],
         use_container_width=True,
         hide_index=True,
         column_config=col_cfg,
-        disabled=True,  # keeps it read-only like dataframe
+        disabled=True,  # read-only
     )
-
-        # Build column_config using your widths (mapped to S/M/L)
-
-col_cfg = {}
-cols_for_cfg = (["id"] + show_cols) if "id" in df.columns else show_cols
-for c in cols_for_cfg:
-    label = c.replace("_", " ").title()
-    width_setting = _normalize_width_value(_col_widths.get(c))
-    if c == "id":
-        # force small for id unless you override explicitly
-        width_setting = width_setting or "small"
-        col_cfg[c] = st.column_config.NumberColumn(label, width=width_setting)
-    elif c == "website":
-        # Make it a proper link column (optional)
-        col_cfg[c] = st.column_config.LinkColumn(label, width=width_setting)
-    else:
-        col_cfg[c] = st.column_config.TextColumn(label, width=width_setting)
-
 
 # -----------------------------
 # Add tab — persistent success
@@ -792,7 +756,7 @@ with tab_delete:
             del_feedback.success(st.session_state.pop("delete_success_msg"))
 
 # -----------------------------
-# Categories Admin (add + instructions + manage/delete with ORPHANS)
+# Categories Admin (add + orphans)
 # -----------------------------
 with tab_cat:
     st.subheader("Categories Admin")
@@ -813,7 +777,6 @@ with tab_cat:
             invalidate_caches()
             rerun()
 
-    # Instruction block
     st.info(
         "How to edit Categories:\n"
         "1) Pick a category (regular or **[orphan]**).\n"
@@ -830,10 +793,8 @@ with tab_cat:
     cats_tbl = list_categories_table()
     cats_vendors = list_categories_from_vendors()
     tbl_set = {c for c in cats_tbl}
-    # Orphans are vendor categories not present in the table
     orphans = [c for c in cats_vendors if c not in tbl_set]
 
-    # Build labeled options
     options_labels: List[str] = []
     label_to_value: Dict[str, Tuple[str, bool]] = {}
     for c in cats_tbl:
@@ -864,7 +825,7 @@ with tab_cat:
             st.write(", ".join([f"{name} (#{vid})" for vid, name in preview]))
 
         # Target selection
-        target_options = ["(choose)"] + cats_tbl  # reassign to an existing table category
+        target_options = ["(choose)"] + cats_tbl
         cols = st.columns([1,1])
         with cols[0]:
             target_sel = st.selectbox(
@@ -931,7 +892,6 @@ with tab_cat:
                             conn.execute(sql_text(
                                 "UPDATE vendors SET category=:tgt WHERE lower(trim(category)) = lower(trim(:old))"
                             ), {"tgt": target, "old": sel_cat})
-                            # Safe even for orphans; will delete 0 rows if not present
                             conn.execute(sql_text("DELETE FROM categories WHERE lower(name)=lower(:n)"), {"n": sel_cat})
                         st.success(f"Reassigned to '{target}' and deleted category entry for '{sel_cat}' (if it existed).")
                         invalidate_caches()
@@ -945,7 +905,7 @@ with tab_cat:
                 "Confirm: Delete this unused category entry (if present).",
                 key="cat_confirm_delete_only"
             )
-            if st.button("Delete Category (no vendors use it)", key="btn_cat_delete_only"):
+            if st.button("Delete Category (no vendors use it)", key="cat_delete_only"):
                 if not confirm_delete_only:
                     act.error("Tick the confirm checkbox above.")
                 else:
@@ -961,7 +921,7 @@ with tab_cat:
             st.caption("Delete button appears only when usage is 0.")
 
 # -----------------------------
-# Services Admin (add + instructions + manage/delete with ORPHANS)
+# Services Admin (add + orphans)
 # -----------------------------
 with tab_svc:
     st.subheader("Services Admin")
@@ -982,7 +942,6 @@ with tab_svc:
             invalidate_caches()
             rerun()
 
-    # Instruction block
     st.info(
         "How to edit Services:\n"
         "1) Pick a service (regular or **[orphan]**).\n"
