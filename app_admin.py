@@ -9,6 +9,7 @@
 # - Auto-detects presence of vendors.keywords
 # - Phone normalization and Website normalization (lightweight)
 # - Robust cache invalidation compatible with multiple Streamlit versions
+# - NEW: Persistent success message shown directly under the Add button after adding a vendor
 
 from __future__ import annotations
 import os
@@ -362,15 +363,15 @@ with tab_view:
     df = load_vendors_df()
     desired = ["business_name", "category", "service", "contact_name",
                "phone", "address", "website", "notes", "keywords"]
-    show_cols = [c for c in desired if c in df.columns]
+    show_cols = [c for c in df.columns if c in desired]
     st.dataframe(
-        df[["id"] + show_cols],
+        df[["id"] + show_cols] if "id" in df.columns else df[show_cols],
         use_container_width=True,
         hide_index=True
     )
 
 # -----------------------------
-# Add Tab (Category REQUIRED, Service optional)
+# Add Tab (Category REQUIRED, Service optional) — with persistent success notice
 # -----------------------------
 with tab_add:
     st.subheader("Add Vendor")
@@ -390,7 +391,11 @@ with tab_add:
 
     colA, _ = st.columns([1,1])
     with colA:
-        if st.button("Add Vendor", type="primary"):
+        # placeholder ensures the success shows directly under the button
+        add_feedback = st.empty()
+        add_clicked = st.button("Add Vendor", type="primary", key="btn_add_vendor")
+
+        if add_clicked:
             errs = []
             if not business_name.strip():
                 errs.append("Business Name is required.")
@@ -398,7 +403,7 @@ with tab_add:
                 errs.append("Category is required.")
             if errs:
                 for e in errs:
-                    st.error(e)
+                    add_feedback.error(e)
             else:
                 try:
                     insert_vendor(
@@ -412,11 +417,16 @@ with tab_add:
                         notes=notes.strip() if notes else None,
                         keywords=keywords_val.strip() if vendors_has_keywords() and keywords_val else None,
                     )
-                    st.success(f"Added: {business_name.strip()}")
+                    # Persist message across rerun so it remains visible under the button
+                    st.session_state["add_success_msg"] = f"Vendor successfully added: {business_name.strip()}"
                     invalidate_caches()
                     rerun()
                 except Exception as ex:
-                    st.error(f"Failed to add vendor: {ex}")
+                    add_feedback.error(f"Failed to add vendor: {ex}")
+
+        # After rerun, show success right under the button
+        if "add_success_msg" in st.session_state:
+            add_feedback.success(st.session_state.pop("add_success_msg"))
 
 # -----------------------------
 # Edit Tab (Category REQUIRED, Service optional, blank render)
@@ -495,11 +505,15 @@ with tab_delete:
         id_to_label = {int(r["id"]): f'{r.get("business_name","(no name)")} — #{int(r["id"])}' for _, r in df_all.iterrows()}
         sort_ids = sorted(id_to_label.keys(), key=lambda i: id_to_label[i].lower())
         del_id = st.selectbox("Select Vendor to Delete", options=sort_ids, format_func=lambda i: id_to_label[i], key="del_sel")
+        del_feedback = st.empty()
         if del_id and st.button("Delete", type="secondary"):
-            delete_vendor(int(del_id))
-            st.success(f"Deleted #{int(del_id)}")
-            invalidate_caches()
-            rerun()
+            try:
+                delete_vendor(int(del_id))
+                del_feedback.success(f"Deleted #{int(del_id)}")
+                invalidate_caches()
+                rerun()
+            except Exception as ex:
+                del_feedback.error(f"Failed to delete vendor: {ex}")
 
 # -----------------------------
 # Categories Admin (no service required)
