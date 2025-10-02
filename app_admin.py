@@ -1,16 +1,14 @@
 # app_admin.py
 # Vendors Admin — Category REQUIRED, Service optional (blank display if missing)
-# - Clearer UX for Categories/Services Admin:
-#   * Instruction blocks appear just after the Add buttons
+# - Robust Categories/Services Admin:
+#   * All comparisons use lower(trim(...)) to ignore stray whitespace + case
+#   * Clearer instructions placed right after Add buttons
 #   * Usage counts + preview list of impacted vendors (first N)
-#   * Explicit actions with confirm checkboxes
-#   * Category: must reassign before delete (or delete only when unused)
-#   * Service: reassign OR clear-to-blank, then delete; delete only when unused
-# - Capitalization: Title Case on save for business_name, contact_name, category, service, address
-# - Maintenance tab: one-click normalize existing rows
-# - Turso/libSQL (LIBSQL_* or TURSO_* secrets). DSN normalized to sqlite+libsql://…?secure=true
-# - connect_args uses 'auth_token' (snake_case)
-# - Column width controls via secrets: [COLUMN_WIDTHS_PX], PAGE_MAX_WIDTH_PX, etc.
+#   * Confirm checkboxes before destructive actions
+# - Capitalization/cleanup on save: Title Case + strip (business_name, contact_name, category, service, address)
+# - Maintenance tab: normalize existing rows (Title Case + trim), fixes legacy whitespace like your #157 case
+# - Turso/libSQL via sqlite+libsql://…?secure=true with connect_args={"auth_token": ...}
+# - Column widths via secrets: [COLUMN_WIDTHS_PX], PAGE_MAX_WIDTH_PX, etc.
 
 from __future__ import annotations
 import os
@@ -92,7 +90,7 @@ def get_engine() -> Engine:
         connect_args = {}
         token = (_get_secret("LIBSQL_AUTH_TOKEN") or _get_secret("TURSO_AUTH_TOKEN"))
         if token:
-            connect_args["auth_token"] = token  # IMPORTANT: snake_case
+            connect_args["auth_token"] = token  # snake_case required by sqlalchemy-libsql
         return create_engine(info["dsn"], connect_args=connect_args, pool_pre_ping=True, future=True)
     return create_engine(info["dsn"], future=True)
 
@@ -296,24 +294,24 @@ def invalidate_caches():
     except Exception:
         pass
 
-# Usage counters + previews
+# ---- Usage counters + previews (TRIM-aware!) ----
 def count_vendors_with_category(name: str) -> int:
     with engine.begin() as conn:
         return int(conn.execute(sql_text(
-            "SELECT COUNT(1) FROM vendors WHERE lower(category)=lower(:n)"
+            "SELECT COUNT(1) FROM vendors WHERE lower(trim(category)) = lower(trim(:n))"
         ), {"n": name}).scalar_one())
 
 def count_vendors_with_service(name: str) -> int:
     with engine.begin() as conn:
         return int(conn.execute(sql_text(
-            "SELECT COUNT(1) FROM vendors WHERE lower(service)=lower(:n)"
+            "SELECT COUNT(1) FROM vendors WHERE lower(trim(service)) = lower(trim(:n))"
         ), {"n": name}).scalar_one())
 
 def list_vendors_by_category(name: str, limit: int = 15) -> List[Tuple[int, str]]:
     with engine.begin() as conn:
         rows = conn.execute(sql_text(
             "SELECT id, business_name FROM vendors "
-            "WHERE lower(category)=lower(:n) "
+            "WHERE lower(trim(category)) = lower(trim(:n)) "
             "ORDER BY lower(business_name) ASC LIMIT :lim"
         ), {"n": name, "lim": limit}).fetchall()
     return [(int(r[0]), r[1] or "") for r in rows]
@@ -322,7 +320,7 @@ def list_vendors_by_service(name: str, limit: int = 15) -> List[Tuple[int, str]]
     with engine.begin() as conn:
         rows = conn.execute(sql_text(
             "SELECT id, business_name FROM vendors "
-            "WHERE lower(service)=lower(:n) "
+            "WHERE lower(trim(service)) = lower(trim(:n)) "
             "ORDER BY lower(business_name) ASC LIMIT :lim"
         ), {"n": name, "lim": limit}).fetchall()
     return [(int(r[0]), r[1] or "") for r in rows]
@@ -346,14 +344,18 @@ def load_vendors_df() -> pd.DataFrame:
     if not sel_cols:
         return pd.DataFrame()
     df = load_vendors_df_cached(sel_cols)
+    # Clean display (service blank when missing)
     if "service" in df.columns:
         df["service"] = df["service"].apply(lambda v: v if (isinstance(v, str) and v.strip()) else "")
+    # Optional: strip display of category so you don't see trailing spaces in the grid
+    if "category" in df.columns:
+        df["category"] = df["category"].apply(lambda v: v.strip() if isinstance(v, str) else v)
     if "business_name" in df.columns:
         df = df.sort_values("business_name", key=lambda s: s.str.lower()).reset_index(drop=True)
     return df
 
 # -----------------------------
-# Upserts & deletes (with forced capitalization)
+# Upserts & deletes (forced capitalization/trim)
 # -----------------------------
 def insert_vendor(
     category: str,
@@ -713,7 +715,7 @@ with tab_cat:
             invalidate_caches()
             rerun()
 
-    # Instruction block (moved below Add button as requested)
+    # Instruction block (below Add, per request)
     st.info(
         "How to edit Categories:\n"
         "1) Pick a category.\n"
@@ -735,7 +737,7 @@ with tab_cat:
             "Step 1 — Select category to manage",
             options=cats,
             key="cat_manage",
-            help="Pick the category you want to rename/reassign/delete."
+            help="Pick the category you want to reassign/delete."
         )
         if sel_cat:
             use_count = count_vendors_with_category(sel_cat)
@@ -783,7 +785,7 @@ with tab_cat:
                                 conn.execute(sql_text("CREATE TABLE IF NOT EXISTS categories(name TEXT PRIMARY KEY)"))
                                 conn.execute(sql_text("INSERT OR IGNORE INTO categories(name) VALUES(:n)"), {"n": target})
                                 conn.execute(sql_text(
-                                    "UPDATE vendors SET category=:tgt WHERE lower(category)=lower(:old)"
+                                    "UPDATE vendors SET category=:tgt WHERE lower(trim(category)) = lower(trim(:old))"
                                 ), {"tgt": target, "old": sel_cat})
                             st.success(f"Reassigned vendors from '{sel_cat}' to '{target}'. Old category kept.")
                             invalidate_caches()
@@ -812,7 +814,7 @@ with tab_cat:
                                 conn.execute(sql_text("CREATE TABLE IF NOT EXISTS categories(name TEXT PRIMARY KEY)"))
                                 conn.execute(sql_text("INSERT OR IGNORE INTO categories(name) VALUES(:n)"), {"n": target})
                                 conn.execute(sql_text(
-                                    "UPDATE vendors SET category=:tgt WHERE lower(category)=lower(:old)"
+                                    "UPDATE vendors SET category=:tgt WHERE lower(trim(category)) = lower(trim(:old))"
                                 ), {"tgt": target, "old": sel_cat})
                                 conn.execute(sql_text("DELETE FROM categories WHERE lower(name)=lower(:n)"), {"n": sel_cat})
                             st.success(f"Reassigned to '{target}' and deleted category '{sel_cat}'.")
@@ -863,7 +865,7 @@ with tab_svc:
             invalidate_caches()
             rerun()
 
-    # Instruction block (moved below Add button as requested)
+    # Instruction block (below Add, per request)
     st.info(
         "How to edit Services:\n"
         "1) Pick a service.\n"
@@ -932,7 +934,7 @@ with tab_svc:
                         with engine.begin() as conn:
                             if clear_to_blank:
                                 conn.execute(sql_text(
-                                    "UPDATE vendors SET service=NULL WHERE lower(service)=lower(:old)"
+                                    "UPDATE vendors SET service=NULL WHERE lower(trim(service)) = lower(trim(:old))"
                                 ), {"old": sel_svc})
                             else:
                                 target = None
@@ -945,7 +947,7 @@ with tab_svc:
                                 conn.execute(sql_text("CREATE TABLE IF NOT EXISTS services(name TEXT PRIMARY KEY)"))
                                 conn.execute(sql_text("INSERT OR IGNORE INTO services(name) VALUES(:n)"), {"n": target})
                                 conn.execute(sql_text(
-                                    "UPDATE vendors SET service=:tgt WHERE lower(service)=lower(:old)"
+                                    "UPDATE vendors SET service=:tgt WHERE lower(trim(service)) = lower(trim(:old))"
                                 ), {"tgt": target, "old": sel_svc})
                         st.success("Applied change. Old service retained.")
                         invalidate_caches()
@@ -962,7 +964,7 @@ with tab_svc:
                         with engine.begin() as conn:
                             if clear_to_blank:
                                 conn.execute(sql_text(
-                                    "UPDATE vendors SET service=NULL WHERE lower(service)=lower(:old)"
+                                    "UPDATE vendors SET service=NULL WHERE lower(trim(service)) = lower(trim(:old))"
                                 ), {"old": sel_svc})
                             else:
                                 target = None
@@ -975,7 +977,7 @@ with tab_svc:
                                 conn.execute(sql_text("CREATE TABLE IF NOT EXISTS services(name TEXT PRIMARY KEY)"))
                                 conn.execute(sql_text("INSERT OR IGNORE INTO services(name) VALUES(:n)"), {"n": target})
                                 conn.execute(sql_text(
-                                    "UPDATE vendors SET service=:tgt WHERE lower(service)=lower(:old)"
+                                    "UPDATE vendors SET service=:tgt WHERE lower(trim(service)) = lower(trim(:old))"
                                 ), {"tgt": target, "old": sel_svc})
                             conn.execute(sql_text("DELETE FROM services WHERE lower(name)=lower(:n)"), {"n": sel_svc})
                         st.success(f"Applied change and deleted service '{sel_svc}'.")
@@ -1006,7 +1008,7 @@ with tab_svc:
 # -----------------------------
 with tab_maint:
     st.subheader("Maintenance")
-    st.write("Normalize ALL vendors to Title Case (business_name, contact_name, category, service, address).")
+    st.write("Normalize ALL vendors to Title Case **and trim whitespace** (business_name, contact_name, category, service, address). Use this once to clean legacy rows.")
     if st.button("Normalize existing records now", type="primary", key="btn_norm_all"):
         try:
             df_all = load_vendors_df()
@@ -1018,18 +1020,19 @@ with tab_maint:
                     vid = int(r["id"])
                     bn  = smart_title(r.get("business_name") or "")
                     cn  = smart_title(r.get("contact_name") or None) if r.get("contact_name") else None
-                    cat = smart_title(r.get("category") or "")
-                    svc = smart_title(r.get("service") or None) if (r.get("service") and str(r.get("service")).strip()) else None
-                    addr= title_address(r.get("address") or None) if r.get("address") else None
-                    web = normalize_url(r.get("website") or None) if r.get("website") else None
-                    ph  = normalize_phone(r.get("phone") or None) if r.get("phone") else None
-                    notes = r.get("notes") or None
+                    cat = smart_title((r.get("category") or "").strip())
+                    svc_raw = r.get("service")
+                    svc = smart_title((svc_raw or "").strip()) if (svc_raw and str(svc_raw).strip()) else None
+                    addr= title_address((r.get("address") or "").strip()) if r.get("address") else None
+                    web = normalize_url((r.get("website") or "").strip()) if r.get("website") else None
+                    ph  = normalize_phone((r.get("phone") or "").strip()) if r.get("phone") else None
+                    notes = (r.get("notes") or None)
                     kw    = r.get("keywords") if "keywords" in r and pd.notna(r.get("keywords")) else None
 
                     if any([
                         bn != r.get("business_name"),
                         (cn or "") != (r.get("contact_name") or ""),
-                        cat != r.get("category"),
+                        cat != (r.get("category") or ""),
                         (svc or "") != (r.get("service") or ""),
                         (addr or "") != (r.get("address") or ""),
                         (web or "") != (r.get("website") or ""),
