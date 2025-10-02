@@ -9,7 +9,7 @@
 # - Auto-detects presence of vendors.keywords
 # - Phone normalization and Website normalization (lightweight)
 # - Robust cache invalidation compatible with multiple Streamlit versions
-# - NEW: Persistent success message shown directly under the Add button after adding a vendor
+# - Success notices persist across reruns for Add, Edit, and Delete
 
 from __future__ import annotations
 import os
@@ -139,13 +139,11 @@ def list_services() -> List[str]:
 
 def invalidate_caches():
     """Best-effort cache invalidation that works across Streamlit versions."""
-    # Try per-function clears if available
     for f in (list_categories, list_services, get_columns, table_exists, vendors_has_keywords):
         try:
             f.clear()  # type: ignore[attr-defined]
         except Exception:
             pass
-    # Global cache_data nuke as fallback
     try:
         st.cache_data.clear()
     except Exception:
@@ -170,10 +168,8 @@ def load_vendors_df() -> pd.DataFrame:
     if not sel_cols:
         return pd.DataFrame()
     df = load_vendors_df_cached(sel_cols)
-    # Clean display: blank Service when missing
     if "service" in df.columns:
         df["service"] = df["service"].apply(lambda v: v if (isinstance(v, str) and v.strip()) else "")
-    # Sort by business_name for sanity in grids
     if "business_name" in df.columns:
         df = df.sort_values("business_name", key=lambda s: s.str.lower()).reset_index(drop=True)
     return df
@@ -192,7 +188,6 @@ def insert_vendor(
     notes: Optional[str],
     keywords: Optional[str],
 ):
-    # Category must be non-blank here
     if not category or not str(category).strip():
         raise ValueError("Category is required and cannot be blank.")
     cols = get_columns("vendors")
@@ -203,7 +198,7 @@ def insert_vendor(
     """.format(kwc=", keywords" if has_kw else "", kwv=", :keywords" if has_kw else "")
     params = {
         "category": category.strip(),
-        "service": service or None,  # optional
+        "service": service or None,
         "business_name": business_name,
         "contact_name": contact_name or None,
         "phone": normalize_phone(phone),
@@ -228,7 +223,6 @@ def update_vendor(
     notes: Optional[str],
     keywords: Optional[str],
 ):
-    # Category must be non-blank here
     if not category or not str(category).strip():
         raise ValueError("Category is required and cannot be blank.")
     cols = get_columns("vendors")
@@ -248,7 +242,7 @@ def update_vendor(
     params = {
         "id": int(vid),
         "category": category.strip(),
-        "service": service or None,  # optional
+        "service": service or None,
         "business_name": business_name,
         "contact_name": contact_name or None,
         "phone": normalize_phone(phone),
@@ -315,7 +309,6 @@ def select_service_optional(label: str, value: Optional[str], key: str) -> Optio
     if value and value in svcs:
         idx = options.index(value)
     chosen = st.selectbox(label, options=options, index=idx, key=key)
-    # Return None if blank so DB stores NULL; grid will render blank
     return None if (chosen is None or str(chosen).strip() == "") else chosen
 
 def load_vendor_by_id(vid: int) -> Optional[Dict]:
@@ -324,7 +317,6 @@ def load_vendor_by_id(vid: int) -> Optional[Dict]:
     if df.empty:
         return None
     row = df.iloc[0].to_dict()
-    # Clean service for display: blank if None/empty
     if not row.get("service"):
         row["service"] = ""
     return row
@@ -371,7 +363,7 @@ with tab_view:
     )
 
 # -----------------------------
-# Add Tab (Category REQUIRED, Service optional) — with persistent success notice
+# Add Tab — persistent success
 # -----------------------------
 with tab_add:
     st.subheader("Add Vendor")
@@ -383,7 +375,7 @@ with tab_add:
     with col2:
         address       = st.text_input("Address", key="add_addr")
         website       = st.text_input("Website (URL)", key="add_url")
-        category      = select_category_required("Category", value=None, key="add_cat")  # REQUIRED
+        category      = select_category_required("Category", value=None, key="add_cat")
     with col3:
         service       = select_service_optional("Service (optional)", value=None, key="add_svc")
         notes         = st.text_area("Notes", key="add_notes", height=100)
@@ -391,10 +383,8 @@ with tab_add:
 
     colA, _ = st.columns([1,1])
     with colA:
-        # placeholder ensures the success shows directly under the button
         add_feedback = st.empty()
         add_clicked = st.button("Add Vendor", type="primary", key="btn_add_vendor")
-
         if add_clicked:
             errs = []
             if not business_name.strip():
@@ -408,7 +398,7 @@ with tab_add:
                 try:
                     insert_vendor(
                         category=category,
-                        service=service,  # may be None
+                        service=service,
                         business_name=business_name.strip(),
                         contact_name=contact_name.strip() if contact_name else None,
                         phone=phone.strip() if phone else None,
@@ -417,19 +407,16 @@ with tab_add:
                         notes=notes.strip() if notes else None,
                         keywords=keywords_val.strip() if vendors_has_keywords() and keywords_val else None,
                     )
-                    # Persist message across rerun so it remains visible under the button
                     st.session_state["add_success_msg"] = f"Vendor successfully added: {business_name.strip()}"
                     invalidate_caches()
                     rerun()
                 except Exception as ex:
                     add_feedback.error(f"Failed to add vendor: {ex}")
-
-        # After rerun, show success right under the button
         if "add_success_msg" in st.session_state:
             add_feedback.success(st.session_state.pop("add_success_msg"))
 
 # -----------------------------
-# Edit Tab (Category REQUIRED, Service optional, blank render)
+# Edit Tab — persistent success
 # -----------------------------
 with tab_edit:
     st.subheader("Edit Vendor")
@@ -454,7 +441,7 @@ with tab_edit:
                 with col2:
                     address_e       = text_input_w("Address", row.get("address"), key="e_addr")
                     website_e       = text_input_w("Website (URL)", row.get("website"), key="e_url")
-                    category_e      = select_category_required("Category", row.get("category"), key="e_cat")  # REQUIRED
+                    category_e      = select_category_required("Category", row.get("category"), key="e_cat")
                 with col3:
                     service_val = row.get("service") or ""
                     service_e   = select_service_optional("Service (optional)", value=service_val if service_val else None, key="e_svc")
@@ -464,7 +451,8 @@ with tab_edit:
                     else:
                         keywords_e = None
 
-                if st.button("Save Changes", type="primary"):
+                save_feedback = st.empty()
+                if st.button("Save Changes", type="primary", key="btn_save_vendor"):
                     errs = []
                     if not business_name_e.strip():
                         errs.append("Business Name is required.")
@@ -472,13 +460,13 @@ with tab_edit:
                         errs.append("Category is required.")
                     if errs:
                         for e in errs:
-                            st.error(e)
+                            save_feedback.error(e)
                     else:
                         try:
                             update_vendor(
                                 vid=int(chosen_id),
                                 category=category_e,
-                                service=service_e,  # may be None
+                                service=service_e,
                                 business_name=business_name_e.strip(),
                                 contact_name=contact_name_e.strip() if contact_name_e else None,
                                 phone=phone_e.strip() if phone_e else None,
@@ -487,14 +475,16 @@ with tab_edit:
                                 notes=notes_e.strip() if notes_e else None,
                                 keywords=keywords_e.strip() if (vendors_has_keywords() and keywords_e) else None,
                             )
-                            st.success("Saved.")
+                            st.session_state["edit_success_msg"] = "Changes successfully applied."
                             invalidate_caches()
                             rerun()
                         except Exception as ex:
-                            st.error(f"Failed to save changes: {ex}")
+                            save_feedback.error(f"Failed to save changes: {ex}")
+                if "edit_success_msg" in st.session_state:
+                    save_feedback.success(st.session_state.pop("edit_success_msg"))
 
 # -----------------------------
-# Delete Tab
+# Delete Tab — persistent success
 # -----------------------------
 with tab_delete:
     st.subheader("Delete Vendor")
@@ -506,14 +496,16 @@ with tab_delete:
         sort_ids = sorted(id_to_label.keys(), key=lambda i: id_to_label[i].lower())
         del_id = st.selectbox("Select Vendor to Delete", options=sort_ids, format_func=lambda i: id_to_label[i], key="del_sel")
         del_feedback = st.empty()
-        if del_id and st.button("Delete", type="secondary"):
+        if del_id and st.button("Delete", type="secondary", key="btn_delete_vendor"):
             try:
                 delete_vendor(int(del_id))
-                del_feedback.success(f"Deleted #{int(del_id)}")
+                st.session_state["delete_success_msg"] = f"Vendor successfully deleted: {id_to_label[int(del_id)]}"
                 invalidate_caches()
                 rerun()
             except Exception as ex:
                 del_feedback.error(f"Failed to delete vendor: {ex}")
+        if "delete_success_msg" in st.session_state:
+            del_feedback.success(st.session_state.pop("delete_success_msg"))
 
 # -----------------------------
 # Categories Admin (no service required)
@@ -523,7 +515,7 @@ with tab_cat:
     if not table_exists("categories") or "name" not in get_columns("categories"):
         st.info("Table 'categories(name)' not found. You can still assign Category text directly in vendors.")
     new_cat = st.text_input("New Category Name")
-    if st.button("Add Category"):
+    if st.button("Add Category", key="btn_add_cat"):
         if not new_cat.strip():
             st.error("Category name required.")
         else:
@@ -548,7 +540,7 @@ with tab_svc:
         st.info("Table 'services(name)' not found. You can still leave Service blank for vendors, or type free-form in vendors.service if you later add the column.")
 
     new_svc = st.text_input("New Service Name")
-    if st.button("Add Service"):
+    if st.button("Add Service", key="btn_add_svc"):
         if not new_svc.strip():
             st.error("Service name required.")
         else:
