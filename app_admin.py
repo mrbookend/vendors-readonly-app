@@ -9,7 +9,6 @@ apply_layout()
 # - Turso/libSQL via sqlite+libsql://…?secure=true with connect_args={"auth_token": ...}
 # - Column widths via secrets: [COLUMN_WIDTHS_PX], PAGE_MAX_WIDTH_PX, etc.
 
-from __future__ import annotations
 import os
 import re
 import time
