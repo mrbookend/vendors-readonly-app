@@ -218,45 +218,88 @@ def title_address(s: Optional[str]) -> Optional[str]:
 # -----------------------------
 def _get_column_widths_px() -> Dict[str, int]:
     """
-    Load COLUMN_WIDTHS_PX from secrets.
-    - Keys normalized to lower-case to match df columns.
-    - Values may be ints (px) or 'small'/'medium'/'large' (encoded as sentinels).
+    Load COLUMN_WIDTHS_PX from secrets. Accepts:
+      - a dict/table (normal TOML)
+      - a string containing JSON (e.g. '{"website":120}')
+      - a string containing simple 'key = value' lines (TOML-ish)
+    Maps 'small'/'medium'/'large' to sentinels (-1/-2/-3) for later conversion.
     """
-    mapping: Dict[str, int] = {}
-    try:
-        block = st.secrets["COLUMN_WIDTHS_PX"] if "COLUMN_WIDTHS_PX" in st.secrets else {}
-        if isinstance(block, dict):
-            for k, v in block.items():
-                key = str(k).strip().lower()
-                # try int first
-                try:
-                    mapping[key] = int(str(v).strip())
-                    continue
-                except Exception:
-                    pass
-                # allow explicit sizes via sentinel ints
-                s = str(v).strip().lower()
-                if s in {"small", "medium", "large"}:
-                    mapping[key] = {"small": -1, "medium": -2, "large": -3}[s]
-    except Exception:
-        pass
+    import json
 
+    def _coerce_map(obj) -> Dict[str, int]:
+        out: Dict[str, int] = {}
+        if not isinstance(obj, dict):
+            return out
+        for k, v in obj.items():
+            key = str(k).strip().lower()
+            # size keywords
+            if isinstance(v, str) and v.strip().lower() in {"small", "medium", "large"}:
+                out[key] = {"small": -1, "medium": -2, "large": -3}[v.strip().lower()]
+                continue
+            # ints (allow "120" as str)
+            try:
+                out[key] = int(str(v).strip())
+            except Exception:
+                pass
+        return out
+
+    raw = None
+    try:
+        raw = st.secrets["COLUMN_WIDTHS_PX"] if "COLUMN_WIDTHS_PX" in st.secrets else None
+    except Exception:
+        raw = None
+
+    # Case 1: already a dict/table
+    if isinstance(raw, dict):
+        mapping = _coerce_map(raw)
+    # Case 2: string — try JSON, then naive line parser
+    elif isinstance(raw, str):
+        s = raw.strip()
+        mapping = {}
+        # Try JSON first
+        try:
+            obj = json.loads(s)
+            mapping = _coerce_map(obj)
+        except Exception:
+            pass
+        # Try naive "key = value" lines
+        if not mapping:
+            for line in s.splitlines():
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                k, v = line.split("=", 1)
+                key = k.strip().strip('"').strip("'").lower()
+                val = v.strip().strip('"').strip("'")
+                if val.lower() in {"small", "medium", "large"}:
+                    mapping[key] = {"small": -1, "medium": -2, "large": -3}[val.lower()]
+                else:
+                    try:
+                        mapping[key] = int(val)
+                    except Exception:
+                        pass
+    else:
+        mapping = {}
+
+    # Back-compat scalar just for website if provided
     website_w = _get_int_secret("WEBSITE_COL_WIDTH_PX", 0)
     if website_w and "website" not in mapping:
         mapping["website"] = website_w
 
     return mapping
 
+
 # -----------------------------
 # Categories/Services: lists & orphans
 # -----------------------------
 @st.cache_data(show_spinner=False, ttl=30)
-def list_categories_table() -> List[str]:
-    if table_exists("categories") and "name" in get_columns("categories"):
+def list_services_table() -> List[str]:
+    if table_exists("services") and "name" in get_columns("services"):
         with engine.begin() as conn:
-            rows = conn.execute(sql_text("SELECT name FROM categories ORDER BY lower(name) ASC")).fetchall()
+            rows = conn.execute(sql_text("SELECT name FROM services ORDER BY lower(name) ASC")).fetchall()
         return [r[0] for r in rows if r[0]]
     return []
+
 
 @st.cache_data(show_spinner=False, ttl=30)
 def list_categories_from_vendors() -> List[str]:
