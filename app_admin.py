@@ -1,19 +1,21 @@
 # app_admin.py
 # Vendors Admin — Category REQUIRED, Service optional (blank display if missing)
+# - DB diagnostics: shows exact DB target and write test (detects non-persistent SQLite)
+# - Supports Turso/libSQL secrets under either:
+#       LIBSQL_URL / LIBSQL_AUTH_TOKEN  (generic)
+#       TURSO_DATABASE_URL / TURSO_AUTH_TOKEN  (Turso naming)
 # - Safe SQL with SQLAlchemy
-# - Works with Turso/libSQL or local SQLite
-# - Categories and Services admin split (no cross-requirements)
-# - Add/Edit/Delete Vendor flows
-# - Category is REQUIRED (non-blank) on Add + Edit
-# - Service is optional in all places; blank when missing
+# - Categories and Services admin split
+# - Add/Edit/Delete Vendor flows with persistent success notices
+# - Category is REQUIRED; Service optional (blank shown if missing)
 # - Auto-detects presence of vendors.keywords
-# - Phone normalization and Website normalization (lightweight)
-# - Robust cache invalidation compatible with multiple Streamlit versions
-# - Success notices persist across reruns for Add, Edit, and Delete
+# - Phone & Website normalization
+# - Robust cache invalidation across Streamlit versions
 
 from __future__ import annotations
 import os
 import re
+import time
 from typing import List, Dict, Optional
 
 import pandas as pd
@@ -22,25 +24,79 @@ from sqlalchemy import create_engine, text as sql_text
 from sqlalchemy.engine import Engine
 
 # -----------------------------
-# Engine setup
+# Configuration & DB selection
 # -----------------------------
+def _get_secret(name: str, default: Optional[str] = None) -> Optional[str]:
+    # Prefer st.secrets, then env, then default
+    try:
+        if name in st.secrets:
+            return st.secrets[name]
+    except Exception:
+        pass
+    return os.environ.get(name, default)
+
+def _get_libsql_creds() -> Dict[str, Optional[str]]:
+    """
+    Accept both generic libSQL names and Turso's names.
+    Order of precedence: LIBSQL_* first, then TURSO_* (or env vars).
+    """
+    url = (_get_secret("LIBSQL_URL")
+           or _get_secret("TURSO_DATABASE_URL"))
+    token = (_get_secret("LIBSQL_AUTH_TOKEN")
+             or _get_secret("TURSO_AUTH_TOKEN"))
+    return {"url": url, "token": token}
+
+def _default_sqlite_path() -> str:
+    # A file next to this script (often non-persistent on cloud redeploy/restart)
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    return os.path.join(base_dir, "vendors.db")
+
+def current_db_info() -> Dict[str, Optional[str]]:
+    creds = _get_libsql_creds()
+    sqlite_path = _get_secret("SQLITE_PATH") or _default_sqlite_path()
+    if creds["url"]:
+        return {
+            "backend": "libsql",
+            "dsn": creds["url"],
+            "auth": "token_set" if creds["token"] else "no_token",
+            "sqlite_path": None,
+            "note": "Remote DB (persistent).",
+        }
+    return {
+        "backend": "sqlite",
+        "dsn": f"sqlite:///{sqlite_path}",
+        "auth": None,
+        "sqlite_path": sqlite_path,
+        "note": "Local file; may be ephemeral on cloud. Prefer LIBSQL_URL/TURSO_DATABASE_URL.",
+    }
+
 def get_engine() -> Engine:
-    # Prefer Turso/libSQL if provided, else SQLite vendors.db in repo root.
-    libsql_url = os.environ.get("LIBSQL_URL") or st.secrets.get("LIBSQL_URL", None)
-    libsql_token = os.environ.get("LIBSQL_AUTH_TOKEN") or st.secrets.get("LIBSQL_AUTH_TOKEN", None)
-
-    if libsql_url:
-        # Example: libsql://<host-or-db>
+    info = current_db_info()
+    if info["backend"] == "libsql":
         connect_args = {}
-        if libsql_token:
-            connect_args["authToken"] = libsql_token
-        return create_engine(libsql_url, connect_args=connect_args, pool_pre_ping=True, future=True)
-
-    # Fallback local sqlite
-    db_path = os.environ.get("SQLITE_PATH", "/mount/src/vendors-readonly-app/vendors.db")
-    return create_engine(f"sqlite:///{db_path}", future=True)
+        token = (_get_secret("LIBSQL_AUTH_TOKEN")
+                 or _get_secret("TURSO_AUTH_TOKEN"))
+        if token:
+            connect_args["authToken"] = token
+        return create_engine(info["dsn"], connect_args=connect_args, pool_pre_ping=True, future=True)
+    # SQLite
+    return create_engine(info["dsn"], future=True)
 
 engine = get_engine()
+
+def _db_write_probe() -> Dict[str, str]:
+    """Tiny write/keep test to detect non-writable targets."""
+    result = {"status": "unknown", "detail": ""}
+    try:
+        with engine.begin() as conn:
+            conn.execute(sql_text("CREATE TABLE IF NOT EXISTS app_admin_probe (ts TEXT)"))
+            conn.execute(sql_text("INSERT INTO app_admin_probe(ts) VALUES(:ts)"), {"ts": str(time.time())})
+        result["status"] = "ok"
+        result["detail"] = "Write succeeded."
+    except Exception as e:
+        result["status"] = "error"
+        result["detail"] = f"{e}"
+    return result
 
 # -----------------------------
 # Introspection & helpers
@@ -59,7 +115,6 @@ def table_exists(name: str) -> bool:
             r = conn.execute(q, {"n": name}).first()
         return bool(r)
     except Exception:
-        # libSQL may not support sqlite_master; use ANSI fallback
         try:
             with engine.begin() as conn:
                 conn.execute(sql_text(f"SELECT 1 FROM {name} WHERE 1=0"))
@@ -69,14 +124,11 @@ def table_exists(name: str) -> bool:
 
 @st.cache_data(show_spinner=False, ttl=60)
 def get_columns(table: str) -> List[str]:
-    # SQLite/LibSQL pragma works on both
     try:
         with engine.begin() as conn:
             rows = conn.execute(sql_text(f"PRAGMA table_info({table})")).fetchall()
-            cols = [r[1] for r in rows]  # second field is 'name'
-            return cols
+            return [r[1] for r in rows]
     except Exception:
-        # Fallback naive select
         try:
             with engine.begin() as conn:
                 df = pd.read_sql_query(sql_text(f"SELECT * FROM {table} LIMIT 1"), conn)
@@ -93,7 +145,6 @@ def normalize_phone(raw: str | None) -> str | None:
         return None
     digits = re.sub(r"\D+", "", raw)
     if len(digits) != 10:
-        # leave as-is; UI should not block save—admin can correct later
         return raw.strip()
     return f"({digits[0:3]}) {digits[3:6]}-{digits[6:10]}"
 
@@ -104,7 +155,6 @@ def normalize_url(url: str | None) -> str | None:
     if not u:
         return None
     if not re.match(r"^[a-zA-Z][a-zA-Z0-9+\-.]*://", u):
-        # add scheme if missing
         u = "https://" + u
     return u
 
@@ -113,32 +163,25 @@ def normalize_url(url: str | None) -> str | None:
 # -----------------------------
 @st.cache_data(show_spinner=False, ttl=30)
 def list_categories() -> List[str]:
-    # Prefer categories table, else distinct from vendors
     if table_exists("categories") and "name" in get_columns("categories"):
         with engine.begin() as conn:
             rows = conn.execute(sql_text("SELECT name FROM categories ORDER BY lower(name) ASC")).fetchall()
         return [r[0] for r in rows if r[0]]
-    # fallback
     with engine.begin() as conn:
         rows = conn.execute(sql_text("SELECT DISTINCT category FROM vendors WHERE IFNULL(category,'')<>''")).fetchall()
-    cats = sorted([r[0] for r in rows if r[0]], key=lambda x: x.lower())
-    return cats
+    return sorted([r[0] for r in rows if r[0]], key=lambda x: x.lower())
 
 @st.cache_data(show_spinner=False, ttl=30)
 def list_services() -> List[str]:
-    # Prefer services table, else distinct from vendors
     if table_exists("services") and "name" in get_columns("services"):
         with engine.begin() as conn:
             rows = conn.execute(sql_text("SELECT name FROM services ORDER BY lower(name) ASC")).fetchall()
         return [r[0] for r in rows if r[0]]
-    # fallback
     with engine.begin() as conn:
         rows = conn.execute(sql_text("SELECT DISTINCT service FROM vendors WHERE IFNULL(service,'')<>''")).fetchall()
-    svcs = sorted([r[0] for r in rows if r[0]], key=lambda x: x.lower())
-    return svcs
+    return sorted([r[0] for r in rows if r[0]], key=lambda x: x.lower())
 
 def invalidate_caches():
-    """Best-effort cache invalidation that works across Streamlit versions."""
     for f in (list_categories, list_services, get_columns, table_exists, vendors_has_keywords):
         try:
             f.clear()  # type: ignore[attr-defined]
@@ -286,11 +329,6 @@ def text_input_w(label: str, value: Optional[str], key: str) -> str:
     return st.text_input(label, value=value or "", key=key)
 
 def select_category_required(label: str, value: Optional[str], key: str) -> str:
-    """
-    Required category selector.
-    If categories list exists, force a selection from it (no blank option).
-    If no categories are available (no table/rows), fall back to a required text input.
-    """
     cats = list_categories()
     if cats:
         idx = 0
@@ -304,7 +342,7 @@ def select_category_required(label: str, value: Optional[str], key: str) -> str:
 
 def select_service_optional(label: str, value: Optional[str], key: str) -> Optional[str]:
     svcs = list_services()
-    options = [""] + svcs  # "" means none/blank; display blank
+    options = [""] + svcs  # "" = blank -> store NULL
     idx = 0
     if value and value in svcs:
         idx = options.index(value)
@@ -327,7 +365,18 @@ def load_vendor_by_id(vid: int) -> Optional[Dict]:
 st.set_page_config(page_title="Vendors Admin", layout="wide")
 st.title("Vendors Admin")
 
-with st.expander("Database Status & Schema (debug)", expanded=False):
+# DB diagnostics panel
+with st.expander("Database Status & Schema (debug)", expanded=True):
+    info = current_db_info()
+    st.write("**DB Target**")
+    st.json(info)
+
+    probe = _db_write_probe()
+    if probe["status"] != "ok":
+        st.error(f"DB write probe failed: {probe['detail']}")
+    else:
+        st.success("DB write probe: OK (this usually means persistence is configured correctly).")
+
     status = {}
     try:
         cols = get_columns("vendors")
@@ -340,7 +389,15 @@ with st.expander("Database Status & Schema (debug)", expanded=False):
         status["counts"] = {"vendors": int(cnt)}
     except Exception as e:
         status["error"] = str(e)
+    st.write("**Schema**")
     st.json(status)
+    if info["backend"] == "sqlite":
+        st.warning(
+            "Using local SQLite at: "
+            + str(info["sqlite_path"])
+            + "\nOn Streamlit Cloud/containers, local files may reset on redeploy/restart. "
+              "For persistence, set LIBSQL_URL/TURSO_DATABASE_URL (and token) in Secrets."
+        )
 
 # Tabs
 tab_view, tab_add, tab_edit, tab_delete, tab_cat, tab_svc = st.tabs(
@@ -508,7 +565,7 @@ with tab_delete:
             del_feedback.success(st.session_state.pop("delete_success_msg"))
 
 # -----------------------------
-# Categories Admin (no service required)
+# Categories Admin
 # -----------------------------
 with tab_cat:
     st.subheader("Categories Admin")
@@ -526,13 +583,10 @@ with tab_cat:
 
     st.markdown("**Existing Categories**")
     cats = list_categories()
-    if cats:
-        st.write(", ".join(cats))
-    else:
-        st.write("(none)")
+    st.write(", ".join(cats) if cats else "(none)")
 
 # -----------------------------
-# Services Admin (standalone, optional association not enforced here)
+# Services Admin
 # -----------------------------
 with tab_svc:
     st.subheader("Services Admin")
@@ -549,9 +603,6 @@ with tab_svc:
             invalidate_caches()
             rerun()
 
-    st.markdown("**Existing Services**")
     svcs = list_services()
-    if svcs:
-        st.write(", ".join(svcs))
-    else:
-        st.write("(none)")
+    st.markdown("**Existing Services**")
+    st.write(", ".join(svcs) if svcs else "(none)")
