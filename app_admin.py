@@ -226,25 +226,6 @@ def _get_column_widths_px() -> Dict[str, int]:
         mapping["website"] = website_w
     return mapping
 
-def _page_layout_from_secrets() -> Dict[str, int]:
-    return {
-        "PAGE_MAX_WIDTH_PX": _get_int_secret("PAGE_MAX_WIDTH_PX", 1600),
-        "CHARS_TO_PX": _get_int_secret("CHARS_TO_PX", 10),
-        "EXTRA_COL_PADDING_PX": _get_int_secret("EXTRA_COL_PADDING_PX", 24),
-    }
-
-def _apply_page_width_css(max_width_px: int):
-    st.markdown(
-        f"""
-        <style>
-        .block-container {{
-            max-width: {max_width_px}px;
-        }}
-        </style>
-        """,
-        unsafe_allow_html=True,
-    )
-
 def _build_column_config(show_cols: List[str], widths: Dict[str, int]) -> Dict[str, st.column_config.Column]:
     cfg: Dict[str, st.column_config.Column] = {}
     for c in show_cols:
@@ -515,8 +496,6 @@ def load_vendor_by_id(vid: int) -> Optional[Dict]:
 
 st.title("Vendors Admin")
 
-_page = _page_layout_from_secrets()
-_apply_page_width_css(_page["PAGE_MAX_WIDTH_PX"])
 _col_widths = _get_column_widths_px()
 
 # DB diagnostics
@@ -564,18 +543,32 @@ tab_view, tab_add, tab_edit, tab_delete, tab_cat, tab_svc, tab_maint = st.tabs(
 with tab_view:
     st.subheader("Browse Vendors")
     df = load_vendors_df()
-    desired = ["business_name", "category", "service", "contact_name",
-               "phone", "address", "website", "notes", "keywords"]
-    show_cols = [c for c in df.columns if c in desired]
-    col_cfg = _build_column_config(show_cols=(["id"] + show_cols) if "id" in df.columns else show_cols,
-                                   widths=_col_widths)
 
-    st.dataframe(
+    desired = ["business_name","category","service","contact_name",
+               "phone","address","website","notes","keywords"]
+    show_cols = [c for c in df.columns if c in desired]
+    # Load widths from secrets
+    _col_widths = _get_column_widths_px()
+
+    # Build column_config using your widths
+    col_cfg = {}
+    for c in (["id"] + show_cols) if "id" in df.columns else show_cols:
+        label = c.replace("_", " ").title()
+        w = _col_widths.get(c)
+        if c == "id":
+            col_cfg[c] = st.column_config.NumberColumn(label, width=w if w else 70)
+        else:
+            col_cfg[c] = st.column_config.TextColumn(label, width=w if w else None)
+
+    # IMPORTANT: use data_editor (read-only), not dataframe
+    st.data_editor(
         df[["id"] + show_cols] if "id" in df.columns else df[show_cols],
         use_container_width=True,
         hide_index=True,
-        column_config=col_cfg
+        column_config=col_cfg,
+        disabled=True,              # keeps it read-only like dataframe
     )
+
 
 # -----------------------------
 # Add tab — persistent success
