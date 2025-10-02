@@ -1,15 +1,10 @@
 # app_admin.py
 # Vendors Admin — Category REQUIRED, Service optional (blank display if missing)
-# - DB diagnostics: shows exact DB target and write test (detects non-persistent SQLite)
-# - Supports Turso/libSQL secrets under either:
-#       LIBSQL_URL / LIBSQL_AUTH_TOKEN  (generic)
-#       TURSO_DATABASE_URL / TURSO_AUTH_TOKEN  (Turso naming)
-# - Safe SQL with SQLAlchemy
-# - Categories and Services admin split
-# - Add/Edit/Delete Vendor flows with persistent success notices
-# - Category is REQUIRED; Service optional (blank shown if missing)
-# - Auto-detects presence of vendors.keywords
-# - Phone & Website normalization
+# - DB diagnostics; supports LIBSQL_* or TURSO_* secrets
+# - Column width controls via secrets: [COLUMN_WIDTHS_PX] and PAGE_MAX_WIDTH_PX, etc.
+# - Add/Edit/Delete flows with persistent success notices
+# - Category required; Service optional (stored NULL, shown blank)
+# - Phone & URL normalization
 # - Robust cache invalidation across Streamlit versions
 
 from __future__ import annotations
@@ -24,22 +19,24 @@ from sqlalchemy import create_engine, text as sql_text
 from sqlalchemy.engine import Engine
 
 # -----------------------------
-# Configuration & DB selection
+# Secrets helpers
 # -----------------------------
-def _get_secret(name: str, default: Optional[str] = None) -> Optional[str]:
-    # Prefer st.secrets, then env, then default
+def _get_secret(name: str, default: Optional[str | int] = None):
     try:
         if name in st.secrets:
             return st.secrets[name]
     except Exception:
         pass
-    return os.environ.get(name, default)
+    return os.environ.get(name, default if default is None else str(default))
+
+def _get_int_secret(name: str, default: int) -> int:
+    val = _get_secret(name, None)
+    try:
+        return int(val) if val is not None else default
+    except Exception:
+        return default
 
 def _get_libsql_creds() -> Dict[str, Optional[str]]:
-    """
-    Accept both generic libSQL names and Turso's names.
-    Order of precedence: LIBSQL_* first, then TURSO_* (or env vars).
-    """
     url = (_get_secret("LIBSQL_URL")
            or _get_secret("TURSO_DATABASE_URL"))
     token = (_get_secret("LIBSQL_AUTH_TOKEN")
@@ -47,10 +44,12 @@ def _get_libsql_creds() -> Dict[str, Optional[str]]:
     return {"url": url, "token": token}
 
 def _default_sqlite_path() -> str:
-    # A file next to this script (often non-persistent on cloud redeploy/restart)
     base_dir = os.path.dirname(os.path.abspath(__file__))
     return os.path.join(base_dir, "vendors.db")
 
+# -----------------------------
+# DB selection & engine
+# -----------------------------
 def current_db_info() -> Dict[str, Optional[str]]:
     creds = _get_libsql_creds()
     sqlite_path = _get_secret("SQLITE_PATH") or _default_sqlite_path()
@@ -79,13 +78,11 @@ def get_engine() -> Engine:
         if token:
             connect_args["authToken"] = token
         return create_engine(info["dsn"], connect_args=connect_args, pool_pre_ping=True, future=True)
-    # SQLite
     return create_engine(info["dsn"], future=True)
 
 engine = get_engine()
 
 def _db_write_probe() -> Dict[str, str]:
-    """Tiny write/keep test to detect non-writable targets."""
     result = {"status": "unknown", "detail": ""}
     try:
         with engine.begin() as conn:
@@ -157,6 +154,61 @@ def normalize_url(url: str | None) -> str | None:
     if not re.match(r"^[a-zA-Z][a-zA-Z0-9+\-.]*://", u):
         u = "https://" + u
     return u
+
+# -----------------------------
+# Column width configuration
+# -----------------------------
+def _get_column_widths_px() -> Dict[str, int]:
+    # Secrets supports nested dicts; env vars won’t for the block, so we only read st.secrets here.
+    mapping = {}
+    try:
+        block = st.secrets.get("COLUMN_WIDTHS_PX", {})
+        if isinstance(block, dict):
+            for k, v in block.items():
+                try:
+                    mapping[str(k)] = int(v)
+                except Exception:
+                    pass
+    except Exception:
+        pass
+    # Back-compat: optional single WEBSITE_COL_WIDTH_PX if not in the block
+    website_w = _get_int_secret("WEBSITE_COL_WIDTH_PX", 0)
+    if website_w and "website" not in mapping:
+        mapping["website"] = website_w
+    return mapping
+
+def _page_layout_from_secrets() -> Dict[str, int]:
+    return {
+        "PAGE_MAX_WIDTH_PX": _get_int_secret("PAGE_MAX_WIDTH_PX", 1600),
+        "CHARS_TO_PX": _get_int_secret("CHARS_TO_PX", 10),
+        "EXTRA_COL_PADDING_PX": _get_int_secret("EXTRA_COL_PADDING_PX", 24),
+    }
+
+def _apply_page_width_css(max_width_px: int):
+    st.markdown(
+        f"""
+        <style>
+        .block-container {{
+            max-width: {max_width_px}px;
+        }}
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+def _build_column_config(show_cols: List[str], widths: Dict[str, int]) -> Dict[str, st.column_config.Column]:
+    cfg: Dict[str, st.column_config.Column] = {}
+    for c in show_cols:
+        w = widths.get(c, 0)
+        # Pick a sensible default if not provided; let Streamlit auto-size if w<=0
+        if c == "id":
+            cfg[c] = st.column_config.NumberColumn("id", width=70 if w <= 0 else w)
+        else:
+            if w > 0:
+                cfg[c] = st.column_config.TextColumn(c.replace("_", " ").title(), width=w)
+            else:
+                cfg[c] = st.column_config.TextColumn(c.replace("_", " ").title())
+    return cfg
 
 # -----------------------------
 # Reference data (categories/services)
@@ -303,24 +355,7 @@ def delete_vendor(vid: int):
         conn.execute(sql_text("DELETE FROM vendors WHERE id = :id"), {"id": int(vid)})
 
 # -----------------------------
-# Category / Service admin
-# -----------------------------
-def add_category(name: str):
-    if not name.strip():
-        return
-    if table_exists("categories") and "name" in get_columns("categories"):
-        with engine.begin() as conn:
-            conn.execute(sql_text("INSERT OR IGNORE INTO categories(name) VALUES(:n)"), {"n": name.strip()})
-
-def add_service(name: str):
-    if not name.strip():
-        return
-    if table_exists("services") and "name" in get_columns("services"):
-        with engine.begin() as conn:
-            conn.execute(sql_text("INSERT OR IGNORE INTO services(name) VALUES(:n)"), {"n": name.strip()})
-
-# -----------------------------
-# UI Helpers
+# UI helpers
 # -----------------------------
 def rerun():
     st.rerun()
@@ -342,7 +377,7 @@ def select_category_required(label: str, value: Optional[str], key: str) -> str:
 
 def select_service_optional(label: str, value: Optional[str], key: str) -> Optional[str]:
     svcs = list_services()
-    options = [""] + svcs  # "" = blank -> store NULL
+    options = [""] + svcs
     idx = 0
     if value and value in svcs:
         idx = options.index(value)
@@ -360,12 +395,17 @@ def load_vendor_by_id(vid: int) -> Optional[Dict]:
     return row
 
 # -----------------------------
-# App Layout
+# App layout
 # -----------------------------
 st.set_page_config(page_title="Vendors Admin", layout="wide")
 st.title("Vendors Admin")
 
-# DB diagnostics panel
+# Apply page width CSS from secrets
+_page = _page_layout_from_secrets()
+_apply_page_width_css(_page["PAGE_MAX_WIDTH_PX"])
+_col_widths = _get_column_widths_px()
+
+# DB diagnostics
 with st.expander("Database Status & Schema (debug)", expanded=True):
     info = current_db_info()
     st.write("**DB Target**")
@@ -405,7 +445,7 @@ tab_view, tab_add, tab_edit, tab_delete, tab_cat, tab_svc = st.tabs(
 )
 
 # -----------------------------
-# View Tab
+# View tab (uses per-column widths)
 # -----------------------------
 with tab_view:
     st.subheader("Browse Vendors")
@@ -413,14 +453,19 @@ with tab_view:
     desired = ["business_name", "category", "service", "contact_name",
                "phone", "address", "website", "notes", "keywords"]
     show_cols = [c for c in df.columns if c in desired]
+    # Build column_config with pixel widths from secrets (if provided)
+    col_cfg = _build_column_config(show_cols=(["id"] + show_cols) if "id" in df.columns else show_cols,
+                                   widths=_col_widths)
+
     st.dataframe(
         df[["id"] + show_cols] if "id" in df.columns else df[show_cols],
         use_container_width=True,
-        hide_index=True
+        hide_index=True,
+        column_config=col_cfg
     )
 
 # -----------------------------
-# Add Tab — persistent success
+# Add tab — persistent success
 # -----------------------------
 with tab_add:
     st.subheader("Add Vendor")
@@ -473,7 +518,7 @@ with tab_add:
             add_feedback.success(st.session_state.pop("add_success_msg"))
 
 # -----------------------------
-# Edit Tab — persistent success
+# Edit tab — persistent success
 # -----------------------------
 with tab_edit:
     st.subheader("Edit Vendor")
@@ -541,7 +586,7 @@ with tab_edit:
                     save_feedback.success(st.session_state.pop("edit_success_msg"))
 
 # -----------------------------
-# Delete Tab — persistent success
+# Delete tab — persistent success
 # -----------------------------
 with tab_delete:
     st.subheader("Delete Vendor")
