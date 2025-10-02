@@ -1,11 +1,11 @@
 # app_admin.py
 # Vendors Admin — Category REQUIRED, Service optional (blank display if missing)
-# - Categories/Services Admin surfaces **orphans** (values used by vendors but missing from the ref tables).
-# - All comparisons use lower(trim(...)).
-# - Clear success notices on Add/Edit/Delete.
-# - Capitalization & trimming on save; Maintenance tab to normalize historical rows.
+# - Categories/Services Admin surfaces **orphans** (values used by vendors but missing from ref tables)
+# - All comparisons use lower(trim(...))
+# - Clear success notices on Add/Edit/Delete
+# - Capitalization & trimming on save; Maintenance tab to normalize
 # - Turso/libSQL via sqlite+libsql://…?secure=true with connect_args={"auth_token": ...}
-# - Column widths via secrets: [COLUMN_WIDTHS_PX], page_max_width_px, etc.
+# - Column widths via secrets: [COLUMN_WIDTHS_PX] as px or "small|medium|large"
 
 from __future__ import annotations
 
@@ -19,7 +19,7 @@ import streamlit as st
 from sqlalchemy import create_engine, text as sql_text
 from sqlalchemy.engine import Engine
 
-# Optional page layout helper (safe if missing)
+# Optional layout helper
 try:
     from layout_header import apply_layout
     apply_layout()
@@ -177,9 +177,7 @@ def normalize_url(url: str | None) -> str | None:
 # -----------------------------
 # Capitalization helpers
 # -----------------------------
-ACRONYMS = {
-    "LLC", "INC", "LLP", "DBA", "HVAC", "USA", "CPA", "PC", "PA", "MD", "DDS", "P.C.", "P.A."
-}
+ACRONYMS = {"LLC", "INC", "LLP", "DBA", "HVAC", "USA", "CPA", "PC", "PA", "MD", "DDS", "P.C.", "P.A."}
 _word_splitter = re.compile(r"([\-'/])")
 
 def _cap_token(tok: str) -> str:
@@ -214,14 +212,14 @@ def title_address(s: Optional[str]) -> Optional[str]:
     return t
 
 # -----------------------------
-# Column width configuration
+# Column width configuration (robust)
 # -----------------------------
 def _get_column_widths_px() -> Dict[str, int]:
     """
     Load COLUMN_WIDTHS_PX from secrets. Accepts:
       - a dict/table (normal TOML)
       - a string containing JSON (e.g. '{"website":120}')
-      - a string containing simple 'key = value' lines (TOML-ish)
+      - a string containing simple 'key = value' lines
     Maps 'small'/'medium'/'large' to sentinels (-1/-2/-3) for later conversion.
     """
     import json
@@ -232,11 +230,9 @@ def _get_column_widths_px() -> Dict[str, int]:
             return out
         for k, v in obj.items():
             key = str(k).strip().lower()
-            # size keywords
             if isinstance(v, str) and v.strip().lower() in {"small", "medium", "large"}:
                 out[key] = {"small": -1, "medium": -2, "large": -3}[v.strip().lower()]
                 continue
-            # ints (allow "120" as str)
             try:
                 out[key] = int(str(v).strip())
             except Exception:
@@ -249,20 +245,20 @@ def _get_column_widths_px() -> Dict[str, int]:
     except Exception:
         raw = None
 
-    # Case 1: already a dict/table
+    # dict case
     if isinstance(raw, dict):
         mapping = _coerce_map(raw)
-    # Case 2: string — try JSON, then naive line parser
+    # string case: try JSON then naive parser
     elif isinstance(raw, str):
         s = raw.strip()
         mapping = {}
-        # Try JSON first
+        # JSON attempt
         try:
             obj = json.loads(s)
             mapping = _coerce_map(obj)
         except Exception:
             pass
-        # Try naive "key = value" lines
+        # naive "key = value" lines
         if not mapping:
             for line in s.splitlines():
                 line = line.strip()
@@ -281,25 +277,23 @@ def _get_column_widths_px() -> Dict[str, int]:
     else:
         mapping = {}
 
-    # Back-compat scalar just for website if provided
+    # Back-compat: WEBSITE_COL_WIDTH_PX scalar
     website_w = _get_int_secret("WEBSITE_COL_WIDTH_PX", 0)
     if website_w and "website" not in mapping:
         mapping["website"] = website_w
 
     return mapping
 
-
 # -----------------------------
 # Categories/Services: lists & orphans
 # -----------------------------
 @st.cache_data(show_spinner=False, ttl=30)
-def list_services_table() -> List[str]:
-    if table_exists("services") and "name" in get_columns("services"):
+def list_categories_table() -> List[str]:
+    if table_exists("categories") and "name" in get_columns("categories"):
         with engine.begin() as conn:
-            rows = conn.execute(sql_text("SELECT name FROM services ORDER BY lower(name) ASC")).fetchall()
+            rows = conn.execute(sql_text("SELECT name FROM categories ORDER BY lower(name) ASC")).fetchall()
         return [r[0] for r in rows if r[0]]
     return []
-
 
 @st.cache_data(show_spinner=False, ttl=30)
 def list_categories_from_vendors() -> List[str]:
@@ -316,7 +310,8 @@ def list_services_table() -> List[str]:
     if table_exists("services") and "name" in get_columns("services"):
         with engine.begin() as conn:
             rows = conn.execute(sql_text("SELECT name FROM services ORDER BY lower(name) ASC")).fetchall()
-        return [r[0] for r[0] in rows]
+        return [r[0] for r in rows if r[0]]
+    return []
 
 @st.cache_data(show_spinner=False, ttl=30)
 def list_services_from_vendors() -> List[str]:
@@ -355,7 +350,7 @@ def invalidate_caches():
     except Exception:
         pass
 
-# ---- Usage counters + previews (TRIM-aware!) ----
+# ---- Usage counters + previews (TRIM-aware) ----
 def count_vendors_with_category(name: str) -> int:
     with engine.begin() as conn:
         return int(conn.execute(sql_text(
@@ -543,7 +538,7 @@ def load_vendor_by_id(vid: int) -> Optional[Dict]:
 # -----------------------------
 st.title("Vendors Admin")
 
-# DB diagnostics
+# DB diagnostics + Secrets debug
 with st.expander("Database Status & Schema (debug)", expanded=False):
     info = current_db_info()
     st.write("**DB Target**")
@@ -567,38 +562,24 @@ with st.expander("Database Status & Schema (debug)", expanded=False):
         status["counts"] = {"vendors": int(cnt)}
     except Exception as e:
         status["error"] = str(e)
+
     st.write("**Schema**")
     st.json(status)
 
-    # Secrets debug — keep until satisfied; remove later if you wish
+    # -------- Secrets debug (safe & self-contained) --------
     try:
         st.write("**Secrets keys (debug)**", sorted(list(st.secrets.keys())))
         if "COLUMN_WIDTHS_PX" in st.secrets:
             st.write("**Raw COLUMN_WIDTHS_PX (debug)**")
-            st.json(st.secrets["COLUMN_WIDTHS_PX"])
-            # Secrets debug — keep until satisfied; remove later if you wish
-try:
-    st.write("**Secrets keys (debug)**", sorted(list(st.secrets.keys())))
-    if "COLUMN_WIDTHS_PX" in st.secrets:
-        st.write("**Raw COLUMN_WIDTHS_PX (debug)**")
-        st.json(st.secrets["COLUMN_WIDTHS_PX"])
-
-        # ↓↓↓ TEMP DEBUG: paste these lines ↓↓↓
-        raw = st.secrets.get("COLUMN_WIDTHS_PX", None)
-        st.write("**type(COLUMN_WIDTHS_PX)**", type(raw).__name__)
-        st.write("**repr(COLUMN_WIDTHS_PX)**")
-        st.code(repr(raw))
-        # ↑↑↑ remove after troubleshooting ↑↑↑
-
-    else:
-        st.warning("COLUMN_WIDTHS_PX not found in st.secrets")
-    st.write("**Loaded column widths (debug)**")
-    st.json(_get_column_widths_px())
-except Exception as _e:
-    st.write("Secrets debug error:", str(_e))
-
+            raw = st.secrets.get("COLUMN_WIDTHS_PX", None)
+            st.write("type:", type(raw).__name__)
+            if isinstance(raw, dict):
+                st.json(raw)
+            else:
+                st.code(repr(raw))
         else:
             st.warning("COLUMN_WIDTHS_PX not found in st.secrets")
+
         st.write("**Loaded column widths (debug)**")
         st.json(_get_column_widths_px())
     except Exception as _e:
@@ -620,23 +601,17 @@ with tab_view:
                "phone","address","website","notes","keywords"]
     show_cols = [c for c in df.columns if c in desired]
 
-    # ---- width helpers (sizes, not px) ----
+    # px -> size mapping
     def _size_from_px(v: int) -> str:
-        # Tune thresholds as you like
         if v <= 120:
             return "small"
         elif v <= 200:
             return "medium"
-        else:
-            return "large"
+        return "large"
 
     def _normalize_width_value(raw) -> Optional[str]:
         """
-        Accept either:
-          - integers (px) -> map to small/medium/large
-          - strings 'small'/'medium'/'large' -> pass through
-          - sentinel ints (-1/-2/-3) set by _get_column_widths_px()
-        Anything else -> None (let Streamlit decide).
+        Accept ints (px) -> S/M/L, 'small'/'medium'/'large', or sentinels -1/-2/-3.
         """
         if raw is None:
             return None
@@ -646,8 +621,7 @@ with tab_view:
         if s in {"small", "medium", "large"}:
             return s
         try:
-            px = int(s)
-            return _size_from_px(px)
+            return _size_from_px(int(s))
         except Exception:
             return None
 
@@ -849,7 +823,7 @@ with tab_cat:
         "   • **Reassign Vendors** to another category (existing or new), keeping the old category.\n"
         "   • **Reassign Vendors then Delete Category**.\n"
         "   • **Delete Category (no vendors use it)** — only shown when usage is 0.\n"
-        "Notes: Categories marked **[orphan]** exist only on vendor rows (no categories-table entry). Delete is a no-op for orphans."
+        "Notes: Categories marked **[orphan]** exist only on vendor rows (no categories-table entry)."
     )
 
     # Manage / Delete with orphans
