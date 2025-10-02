@@ -419,7 +419,7 @@ _apply_page_width_css(_page["PAGE_MAX_WIDTH_PX"])
 _col_widths = _get_column_widths_px()
 
 # DB diagnostics
-with st.expander("Database Status & Schema (debug)", expanded=True):
+with st.expander("Database Status & Schema (debug)", expanded=False):
     info = current_db_info()
     st.write("**DB Target**")
     st.json(info)
