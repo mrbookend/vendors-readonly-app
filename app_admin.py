@@ -1,9 +1,10 @@
 # app_admin.py
-# Vendors Admin (Service optional, blank display if missing)
+# Vendors Admin — Category REQUIRED, Service optional (blank display if missing)
 # - Safe SQL with SQLAlchemy
 # - Works with Turso/libSQL or local SQLite
 # - Categories and Services admin split (no cross-requirements)
 # - Add/Edit/Delete Vendor flows
+# - Category is REQUIRED (non-blank) on Add + Edit
 # - Service is optional in all places; blank when missing
 # - Auto-detects presence of vendors.keywords
 # - Phone normalization and Website normalization (lightweight)
@@ -163,7 +164,7 @@ def load_vendors_df() -> pd.DataFrame:
 # Upserts & deletes
 # -----------------------------
 def insert_vendor(
-    category: str | None,
+    category: str,
     service: Optional[str],
     business_name: str,
     contact_name: Optional[str],
@@ -173,6 +174,9 @@ def insert_vendor(
     notes: Optional[str],
     keywords: Optional[str],
 ):
+    # Category must be non-blank here
+    if not category or not str(category).strip():
+        raise ValueError("Category is required and cannot be blank.")
     cols = get_columns("vendors")
     has_kw = "keywords" in cols
     sql = """
@@ -180,7 +184,7 @@ def insert_vendor(
         VALUES (:category, :service, :business_name, :contact_name, :phone, :address, :website, :notes{kwv})
     """.format(kwc=", keywords" if has_kw else "", kwv=", :keywords" if has_kw else "")
     params = {
-        "category": category or None,
+        "category": category.strip(),
         "service": service or None,  # optional
         "business_name": business_name,
         "contact_name": contact_name or None,
@@ -196,7 +200,7 @@ def insert_vendor(
 
 def update_vendor(
     vid: int,
-    category: str | None,
+    category: str,
     service: Optional[str],
     business_name: str,
     contact_name: Optional[str],
@@ -206,6 +210,9 @@ def update_vendor(
     notes: Optional[str],
     keywords: Optional[str],
 ):
+    # Category must be non-blank here
+    if not category or not str(category).strip():
+        raise ValueError("Category is required and cannot be blank.")
     cols = get_columns("vendors")
     has_kw = "keywords" in cols
     sql = """
@@ -222,7 +229,7 @@ def update_vendor(
     """.format(kwset=", keywords = :keywords" if has_kw else "")
     params = {
         "id": int(vid),
-        "category": category or None,
+        "category": category.strip(),
         "service": service or None,  # optional
         "business_name": business_name,
         "contact_name": contact_name or None,
@@ -267,13 +274,24 @@ def rerun():
 def text_input_w(label: str, value: Optional[str], key: str) -> str:
     return st.text_input(label, value=value or "", key=key)
 
-def select_category(label: str, value: Optional[str], key: str) -> Optional[str]:
+def select_category_required(label: str, value: Optional[str], key: str) -> str:
+    """
+    Required category selector.
+    If categories list exists, force a selection from it (no blank option).
+    If no categories are available (no table/rows), fall back to a required text input.
+    """
     cats = list_categories()
-    options = [""] + cats  # blank allowed
-    idx = 0
-    if value and value in cats:
-        idx = options.index(value)
-    return st.selectbox(label, options=options, index=idx, key=key)
+    if cats:
+        # Ensure current value maps to an existing option
+        idx = 0
+        if value and value in cats:
+            idx = cats.index(value)
+        selected = st.selectbox(label + " *", options=cats, index=idx, key=key)
+        return selected.strip() if selected else ""
+    else:
+        # No categories table/list—require free-text category
+        typed = st.text_input(label + " * (type a category name)", value=value or "", key=key)
+        return typed.strip()
 
 def select_service_optional(label: str, value: Optional[str], key: str) -> Optional[str]:
     svcs = list_services()
@@ -340,7 +358,7 @@ with tab_view:
     )
 
 # -----------------------------
-# Add Tab (Service optional)
+# Add Tab (Category REQUIRED, Service optional)
 # -----------------------------
 with tab_add:
     st.subheader("Add Vendor")
@@ -352,37 +370,46 @@ with tab_add:
     with col2:
         address       = st.text_input("Address", key="add_addr")
         website       = st.text_input("Website (URL)", key="add_url")
-        category      = select_category("Category (optional)", value=None, key="add_cat")
+        category      = select_category_required("Category", value=None, key="add_cat")  # REQUIRED
     with col3:
         # Service OPTIONAL; UI renders blank if none
         service       = select_service_optional("Service (optional)", value=None, key="add_svc")
         notes         = st.text_area("Notes", key="add_notes", height=100)
         keywords_val  = st.text_input("Keywords (comma/space OK)" if vendors_has_keywords() else "Keywords (not in DB)", key="add_kw")
 
-    colA, colB = st.columns([1,1])
+    colA, _ = st.columns([1,1])
     with colA:
         if st.button("Add Vendor", type="primary"):
+            errs = []
             if not business_name.strip():
-                st.error("Business Name is required.")
+                errs.append("Business Name is required.")
+            if not category.strip():
+                errs.append("Category is required.")
+            if errs:
+                for e in errs:
+                    st.error(e)
             else:
-                insert_vendor(
-                    category=category,
-                    service=service,  # may be None
-                    business_name=business_name.strip(),
-                    contact_name=contact_name.strip() if contact_name else None,
-                    phone=phone.strip() if phone else None,
-                    address=address.strip() if address else None,
-                    website=website.strip() if website else None,
-                    notes=notes.strip() if notes else None,
-                    keywords=keywords_val.strip() if vendors_has_keywords() and keywords_val else None,
-                )
-                st.success(f"Added: {business_name.strip()}")
-                invalidate_refs()
-                load_vendors_df.clear()
-                rerun()
+                try:
+                    insert_vendor(
+                        category=category,
+                        service=service,  # may be None
+                        business_name=business_name.strip(),
+                        contact_name=contact_name.strip() if contact_name else None,
+                        phone=phone.strip() if phone else None,
+                        address=address.strip() if address else None,
+                        website=website.strip() if website else None,
+                        notes=notes.strip() if notes else None,
+                        keywords=keywords_val.strip() if vendors_has_keywords() and keywords_val else None,
+                    )
+                    st.success(f"Added: {business_name.strip()}")
+                    invalidate_refs()
+                    load_vendors_df.clear()
+                    rerun()
+                except Exception as ex:
+                    st.error(f"Failed to add vendor: {ex}")
 
 # -----------------------------
-# Edit Tab (Service optional, blank render)
+# Edit Tab (Category REQUIRED, Service optional, blank render)
 # -----------------------------
 with tab_edit:
     st.subheader("Edit Vendor")
@@ -408,7 +435,7 @@ with tab_edit:
                 with col2:
                     address_e       = text_input_w("Address", row.get("address"), key="e_addr")
                     website_e       = text_input_w("Website (URL)", row.get("website"), key="e_url")
-                    category_e      = select_category("Category (optional)", row.get("category"), key="e_cat")
+                    category_e      = select_category_required("Category", row.get("category"), key="e_cat")  # REQUIRED
                 with col3:
                     # Service optional; show blank if missing
                     service_val = row.get("service") or ""
@@ -420,25 +447,34 @@ with tab_edit:
                         keywords_e = None
 
                 if st.button("Save Changes", type="primary"):
+                    errs = []
                     if not business_name_e.strip():
-                        st.error("Business Name is required.")
+                        errs.append("Business Name is required.")
+                    if not category_e.strip():
+                        errs.append("Category is required.")
+                    if errs:
+                        for e in errs:
+                            st.error(e)
                     else:
-                        update_vendor(
-                            vid=int(chosen_id),
-                            category=category_e,
-                            service=service_e,  # may be None
-                            business_name=business_name_e.strip(),
-                            contact_name=contact_name_e.strip() if contact_name_e else None,
-                            phone=phone_e.strip() if phone_e else None,
-                            address=address_e.strip() if address_e else None,
-                            website=website_e.strip() if website_e else None,
-                            notes=notes_e.strip() if notes_e else None,
-                            keywords=keywords_e.strip() if (vendors_has_keywords() and keywords_e) else None,
-                        )
-                        st.success("Saved.")
-                        invalidate_refs()
-                        load_vendors_df.clear()
-                        rerun()
+                        try:
+                            update_vendor(
+                                vid=int(chosen_id),
+                                category=category_e,
+                                service=service_e,  # may be None
+                                business_name=business_name_e.strip(),
+                                contact_name=contact_name_e.strip() if contact_name_e else None,
+                                phone=phone_e.strip() if phone_e else None,
+                                address=address_e.strip() if address_e else None,
+                                website=website_e.strip() if website_e else None,
+                                notes=notes_e.strip() if notes_e else None,
+                                keywords=keywords_e.strip() if (vendors_has_keywords() and keywords_e) else None,
+                            )
+                            st.success("Saved.")
+                            invalidate_refs()
+                            load_vendors_df.clear()
+                            rerun()
+                        except Exception as ex:
+                            st.error(f"Failed to save changes: {ex}")
 
 # -----------------------------
 # Delete Tab
