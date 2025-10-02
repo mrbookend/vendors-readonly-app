@@ -573,26 +573,56 @@ with tab_view:
                "phone","address","website","notes","keywords"]
     show_cols = [c for c in df.columns if c in desired]
     # Load widths from secrets
-    _col_widths = _get_column_widths_px()
+   def _size_from_px(v: int) -> str:
+    # Tune thresholds as you like
+    if v <= 120: 
+        return "small"
+    elif v <= 200:
+        return "medium"
+    else:
+        return "large"
 
-    # Build column_config using your widths
-    col_cfg = {}
-    for c in (["id"] + show_cols) if "id" in df.columns else show_cols:
-        label = c.replace("_", " ").title()
-        w = _col_widths.get(c)
-        if c == "id":
-            col_cfg[c] = st.column_config.NumberColumn(label, width=w if w else 70)
-        else:
-            col_cfg[c] = st.column_config.TextColumn(label, width=w if w else None)
+def _normalize_width_value(raw) -> Optional[str]:
+    """
+    Accept either:
+      - integers (px) -> map to small/medium/large
+      - strings 'small'/'medium'/'large' -> pass through
+    Anything else -> None (let Streamlit decide).
+    """
+    if raw is None:
+        return None
+    s = str(raw).strip().lower()
+    if s in {"small","medium","large"}:
+        return s
+    try:
+        px = int(s)
+        return _size_from_px(px)
+    except Exception:
+        return None
+
 
     # IMPORTANT: use data_editor (read-only), not dataframe
     st.data_editor(
         df[["id"] + show_cols] if "id" in df.columns else df[show_cols],
         use_container_width=True,
         hide_index=True,
-        column_config=col_cfg,
-        disabled=True,              # keeps it read-only like dataframe
-    )
+        # Build column_config using your widths (mapped to S/M/L)
+_col_widths = _get_column_widths_px()
+
+col_cfg = {}
+cols_for_cfg = (["id"] + show_cols) if "id" in df.columns else show_cols
+for c in cols_for_cfg:
+    label = c.replace("_", " ").title()
+    width_setting = _normalize_width_value(_col_widths.get(c))
+    if c == "id":
+        # force small for id unless you override explicitly
+        width_setting = width_setting or "small"
+        col_cfg[c] = st.column_config.NumberColumn(label, width=width_setting)
+    elif c == "website":
+        # Make it a proper link column (optional)
+        col_cfg[c] = st.column_config.LinkColumn(label, width=width_setting)
+    else:
+        col_cfg[c] = st.column_config.TextColumn(label, width=width_setting)
 
 
 # -----------------------------
