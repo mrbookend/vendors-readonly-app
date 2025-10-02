@@ -1,8 +1,11 @@
 # app_admin.py
 # Vendors Admin — Category REQUIRED, Service optional (blank display if missing)
-# - FIX: use connect_args={"auth_token": ...} for libSQL (not "authToken")
-# - Also append ?secure=true to sqlite+libsql DSN to ensure TLS
-# - Works with LIBSQL_* or TURSO_* secrets
+# - Capitalization: force Title Case on save for business_name, contact_name, category, service, address
+#   * Preserves acronyms (LLC/INC/HVAC/USA/CPA/MD/DDS/PC/PA)
+#   * Uppercases address directionals (N, S, E, W, NE, NW, SE, SW) and "PO Box"
+# - Maintenance tab: one-click normalize all existing rows
+# - Uses Turso/libSQL (LIBSQL_* or TURSO_* secrets). DSN normalized to sqlite+libsql://…?secure=true
+# - connect_args uses 'auth_token' (snake_case)
 # - Column width controls via secrets: [COLUMN_WIDTHS_PX], PAGE_MAX_WIDTH_PX, etc.
 # - Add/Edit/Delete with persistent success notices
 # - Phone & URL normalization
@@ -38,7 +41,6 @@ def _get_int_secret(name: str, default: int) -> int:
         return default
 
 def _get_libsql_creds() -> Dict[str, Optional[str]]:
-    # Accept either generic libSQL names or Turso names
     url = (_get_secret("LIBSQL_URL") or _get_secret("TURSO_DATABASE_URL"))
     token = (_get_secret("LIBSQL_AUTH_TOKEN") or _get_secret("TURSO_AUTH_TOKEN"))
     return {"url": url, "token": token}
@@ -91,8 +93,7 @@ def get_engine() -> Engine:
         connect_args = {}
         token = (_get_secret("LIBSQL_AUTH_TOKEN") or _get_secret("TURSO_AUTH_TOKEN"))
         if token:
-            # sqlalchemy-libsql expects snake_case 'auth_token'
-            connect_args["auth_token"] = token
+            connect_args["auth_token"] = token  # IMPORTANT: snake_case
         return create_engine(info["dsn"], connect_args=connect_args, pool_pre_ping=True, future=True)
     return create_engine(info["dsn"], future=True)
 
@@ -170,6 +171,54 @@ def normalize_url(url: str | None) -> str | None:
     if not re.match(r"^[a-zA-Z][a-zA-Z0-9+\-.]*://", u):
         u = "https://" + u
     return u
+
+# -----------------------------
+# Capitalization helpers
+# -----------------------------
+ACRONYMS = {
+    "LLC", "INC", "LLP", "DBA", "HVAC", "USA", "CPA", "PC", "PA", "MD", "DDS", "P.C.", "P.A."
+}
+
+DIRS = {"N", "S", "E", "W", "NE", "NW", "SE", "SW"}
+
+_word_splitter = re.compile(r"([\-'/])")  # keep delimiters
+
+def _cap_token(tok: str) -> str:
+    t = tok.strip()
+    if not t:
+        return t
+    # Preserve acronyms exactly (case-insensitive compare)
+    if t.upper() in ACRONYMS:
+        return t.upper()
+    # Title-case subparts around -, ', /
+    parts = _word_splitter.split(t)
+    out: List[str] = []
+    for p in parts:
+        if p in "-'/":
+            out.append(p)
+        else:
+            # Standard "capitalize" (first upper, rest lower)
+            out.append(p[:1].upper() + p[1:].lower() if p else p)
+    return "".join(out)
+
+def smart_title(s: Optional[str]) -> Optional[str]:
+    if s is None:
+        return None
+    t = re.sub(r"\s+", " ", s.strip())
+    if not t:
+        return ""
+    return " ".join(_cap_token(w) for w in t.split(" "))
+
+def title_address(s: Optional[str]) -> Optional[str]:
+    t = smart_title(s)
+    if not t:
+        return t
+    # Uppercase directionals
+    def _dir_up(m): return m.group(0).upper()
+    t = re.sub(r"\b(N|S|E|W|NE|NW|SE|SW)\b", _dir_up, t, flags=re.IGNORECASE)
+    # Normalize PO Box variants
+    t = re.sub(r"\bP[.\s]*O[.\s]*\s*Box\b", "PO Box", t, flags=re.IGNORECASE)
+    return t
 
 # -----------------------------
 # Column width configuration
@@ -283,7 +332,7 @@ def load_vendors_df() -> pd.DataFrame:
     return df
 
 # -----------------------------
-# Upserts & deletes
+# Upserts & deletes (with forced capitalization)
 # -----------------------------
 def insert_vendor(
     category: str,
@@ -305,17 +354,17 @@ def insert_vendor(
         VALUES (:category, :service, :business_name, :contact_name, :phone, :address, :website, :notes{kwv})
     """.format(kwc=", keywords" if has_kw else "", kwv=", :keywords" if has_kw else "")
     params = {
-        "category": category.strip(),
-        "service": service or None,
-        "business_name": business_name,
-        "contact_name": contact_name or None,
+        "category": smart_title(category).strip(),
+        "service": smart_title(service) if service else None,
+        "business_name": smart_title(business_name),
+        "contact_name": smart_title(contact_name) if contact_name else None,
         "phone": normalize_phone(phone),
-        "address": address or None,
+        "address": title_address(address) if address else None,
         "website": normalize_url(website),
-        "notes": notes or None,
+        "notes": (notes.strip() if notes else None),      # keep original case for notes
     }
     if has_kw:
-        params["keywords"] = (keywords or None)
+        params["keywords"] = (keywords or None)           # keep original case for keywords
     with engine.begin() as conn:
         conn.execute(sql_text(sql), params)
 
@@ -349,17 +398,17 @@ def update_vendor(
     """.format(kwset=", keywords = :keywords" if has_kw else "")
     params = {
         "id": int(vid),
-        "category": category.strip(),
-        "service": service or None,
-        "business_name": business_name,
-        "contact_name": contact_name or None,
+        "category": smart_title(category).strip(),
+        "service": smart_title(service) if service else None,
+        "business_name": smart_title(business_name),
+        "contact_name": smart_title(contact_name) if contact_name else None,
         "phone": normalize_phone(phone),
-        "address": address or None,
+        "address": title_address(address) if address else None,
         "website": normalize_url(website),
-        "notes": notes or None,
+        "notes": (notes.strip() if notes else None),          # keep original case for notes
     }
     if has_kw:
-        params["keywords"] = (keywords or None)
+        params["keywords"] = (keywords or None)               # keep original case for keywords
     with engine.begin() as conn:
         conn.execute(sql_text(sql), params)
 
@@ -453,8 +502,8 @@ with st.expander("Database Status & Schema (debug)", expanded=False):
         )
 
 # Tabs
-tab_view, tab_add, tab_edit, tab_delete, tab_cat, tab_svc = st.tabs(
-    ["View", "Add", "Edit", "Delete", "Categories Admin", "Services Admin"]
+tab_view, tab_add, tab_edit, tab_delete, tab_cat, tab_svc, tab_maint = st.tabs(
+    ["View", "Add", "Edit", "Delete", "Categories Admin", "Services Admin", "Maintenance"]
 )
 
 # -----------------------------
@@ -521,7 +570,7 @@ with tab_add:
                         notes=notes.strip() if notes else None,
                         keywords=keywords_val.strip() if vendors_has_keywords() and keywords_val else None,
                     )
-                    st.session_state["add_success_msg"] = f"Vendor successfully added: {business_name.strip()}"
+                    st.session_state["add_success_msg"] = f"Vendor successfully added: {smart_title(business_name.strip())}"
                     invalidate_caches()
                     rerun()
                 except Exception as ex:
@@ -619,7 +668,7 @@ with tab_delete:
             except Exception as ex:
                 del_feedback.error(f"Failed to delete vendor: {ex}")
         if "delete_success_msg" in st.session_state:
-            del_feedback.success(st.session_state.pop("delete_success_msg"))  # type: ignore[name-defined]
+            del_feedback.success(st.session_state.pop("delete_success_msg"))
 
 # -----------------------------
 # Categories Admin
@@ -636,8 +685,8 @@ with tab_cat:
             with engine.begin() as conn:
                 conn.execute(sql_text("CREATE TABLE IF NOT EXISTS categories(name TEXT PRIMARY KEY)"))
             with engine.begin() as conn:
-                conn.execute(sql_text("INSERT OR IGNORE INTO categories(name) VALUES(:n)"), {"n": new_cat.strip()})
-            st.success(f"Category added/kept: {new_cat.strip()}")
+                conn.execute(sql_text("INSERT OR IGNORE INTO categories(name) VALUES(:n)"), {"n": smart_title(new_cat.strip())})
+            st.success(f"Category added/kept: {smart_title(new_cat.strip())}")
             invalidate_caches()
             rerun()
 
@@ -661,11 +710,65 @@ with tab_svc:
             with engine.begin() as conn:
                 conn.execute(sql_text("CREATE TABLE IF NOT EXISTS services(name TEXT PRIMARY KEY)"))
             with engine.begin() as conn:
-                conn.execute(sql_text("INSERT OR IGNORE INTO services(name) VALUES(:n)"), {"n": new_svc.strip()})
-            st.success(f"Service added/kept: {new_svc.strip()}")
+                conn.execute(sql_text("INSERT OR IGNORE INTO services(name) VALUES(:n)"), {"n": smart_title(new_svc.strip())})
+            st.success(f"Service added/kept: {smart_title(new_svc.strip())}")
             invalidate_caches()
             rerun()
 
     svcs = list_services()
     st.markdown("**Existing Services**")
     st.write(", ".join(svcs) if svcs else "(none)")
+
+# -----------------------------
+# Maintenance — normalize existing rows
+# -----------------------------
+with tab_maint:
+    st.subheader("Maintenance")
+    st.write("Normalize ALL vendors to Title Case (business_name, contact_name, category, service, address).")
+    if st.button("Normalize existing records now", type="primary", key="btn_norm_all"):
+        try:
+            df_all = load_vendors_df()
+            if df_all.empty:
+                st.info("No vendors to normalize.")
+            else:
+                updated = 0
+                for _, r in df_all.iterrows():
+                    vid = int(r["id"])
+                    bn  = smart_title(r.get("business_name") or "")
+                    cn  = smart_title(r.get("contact_name") or None) if r.get("contact_name") else None
+                    cat = smart_title(r.get("category") or "")
+                    svc = smart_title(r.get("service") or None) if (r.get("service") and str(r.get("service")).strip()) else None
+                    addr= title_address(r.get("address") or None) if r.get("address") else None
+                    web = normalize_url(r.get("website") or None) if r.get("website") else None
+                    ph  = normalize_phone(r.get("phone") or None) if r.get("phone") else None
+                    notes = r.get("notes") or None
+                    kw    = r.get("keywords") if "keywords" in r and pd.notna(r.get("keywords")) else None
+
+                    # Only write if anything would change
+                    if any([
+                        bn != r.get("business_name"),
+                        (cn or "") != (r.get("contact_name") or ""),
+                        cat != r.get("category"),
+                        (svc or "") != (r.get("service") or ""),
+                        (addr or "") != (r.get("address") or ""),
+                        (web or "") != (r.get("website") or ""),
+                        (ph or "") != (r.get("phone") or ""),
+                    ]):
+                        update_vendor(
+                            vid=vid,
+                            category=cat,
+                            service=svc,
+                            business_name=bn,
+                            contact_name=cn,
+                            phone=ph,
+                            address=addr,
+                            website=web,
+                            notes=notes,
+                            keywords=kw,
+                        )
+                        updated += 1
+                st.success(f"Normalization complete. Rows updated: {updated}.")
+                invalidate_caches()
+                rerun()
+        except Exception as ex:
+            st.error(f"Normalization failed: {ex}")
