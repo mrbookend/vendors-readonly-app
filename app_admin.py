@@ -8,11 +8,12 @@
 # - Service is optional in all places; blank when missing
 # - Auto-detects presence of vendors.keywords
 # - Phone normalization and Website normalization (lightweight)
+# - Robust cache invalidation compatible with multiple Streamlit versions
 
 from __future__ import annotations
 import os
 import re
-from typing import List, Dict, Optional, Tuple
+from typing import List, Dict, Optional
 
 import pandas as pd
 import streamlit as st
@@ -135,13 +136,28 @@ def list_services() -> List[str]:
     svcs = sorted([r[0] for r in rows if r[0]], key=lambda x: x.lower())
     return svcs
 
-def invalidate_refs():
-    list_categories.clear()
-    list_services.clear()
+def invalidate_caches():
+    """Best-effort cache invalidation that works across Streamlit versions."""
+    # Try per-function clears if available
+    for f in (list_categories, list_services, get_columns, table_exists, vendors_has_keywords):
+        try:
+            f.clear()  # type: ignore[attr-defined]
+        except Exception:
+            pass
+    # Global cache_data nuke as fallback
+    try:
+        st.cache_data.clear()
+    except Exception:
+        pass
 
 # -----------------------------
 # Load vendors
 # -----------------------------
+@st.cache_data(show_spinner=False, ttl=30)
+def load_vendors_df_cached(sel_cols: List[str]) -> pd.DataFrame:
+    with engine.begin() as conn:
+        return pd.read_sql_query(sql_text(f"SELECT {', '.join(sel_cols)} FROM vendors"), conn)
+
 def load_vendors_df() -> pd.DataFrame:
     cols = get_columns("vendors")
     base_cols = ["id", "category", "service", "business_name", "contact_name",
@@ -150,8 +166,9 @@ def load_vendors_df() -> pd.DataFrame:
     if "keywords" in cols:
         optional.append("keywords")
     sel_cols = [c for c in base_cols + optional if c in cols]
-    with engine.begin() as conn:
-        df = pd.read_sql_query(sql_text(f"SELECT {', '.join(sel_cols)} FROM vendors"), conn)
+    if not sel_cols:
+        return pd.DataFrame()
+    df = load_vendors_df_cached(sel_cols)
     # Clean display: blank Service when missing
     if "service" in df.columns:
         df["service"] = df["service"].apply(lambda v: v if (isinstance(v, str) and v.strip()) else "")
@@ -268,7 +285,6 @@ def add_service(name: str):
 # UI Helpers
 # -----------------------------
 def rerun():
-    # Streamlit 1.30+: st.rerun()
     st.rerun()
 
 def text_input_w(label: str, value: Optional[str], key: str) -> str:
@@ -282,14 +298,12 @@ def select_category_required(label: str, value: Optional[str], key: str) -> str:
     """
     cats = list_categories()
     if cats:
-        # Ensure current value maps to an existing option
         idx = 0
         if value and value in cats:
             idx = cats.index(value)
         selected = st.selectbox(label + " *", options=cats, index=idx, key=key)
         return selected.strip() if selected else ""
     else:
-        # No categories table/list—require free-text category
         typed = st.text_input(label + " * (type a category name)", value=value or "", key=key)
         return typed.strip()
 
@@ -346,11 +360,9 @@ tab_view, tab_add, tab_edit, tab_delete, tab_cat, tab_svc = st.tabs(
 with tab_view:
     st.subheader("Browse Vendors")
     df = load_vendors_df()
-    # Columns ordering if present
     desired = ["business_name", "category", "service", "contact_name",
                "phone", "address", "website", "notes", "keywords"]
     show_cols = [c for c in desired if c in df.columns]
-    # Display: service column already cleaned to blank if missing
     st.dataframe(
         df[["id"] + show_cols],
         use_container_width=True,
@@ -372,7 +384,6 @@ with tab_add:
         website       = st.text_input("Website (URL)", key="add_url")
         category      = select_category_required("Category", value=None, key="add_cat")  # REQUIRED
     with col3:
-        # Service OPTIONAL; UI renders blank if none
         service       = select_service_optional("Service (optional)", value=None, key="add_svc")
         notes         = st.text_area("Notes", key="add_notes", height=100)
         keywords_val  = st.text_input("Keywords (comma/space OK)" if vendors_has_keywords() else "Keywords (not in DB)", key="add_kw")
@@ -402,8 +413,7 @@ with tab_add:
                         keywords=keywords_val.strip() if vendors_has_keywords() and keywords_val else None,
                     )
                     st.success(f"Added: {business_name.strip()}")
-                    invalidate_refs()
-                    load_vendors_df.clear()
+                    invalidate_caches()
                     rerun()
                 except Exception as ex:
                     st.error(f"Failed to add vendor: {ex}")
@@ -418,7 +428,6 @@ with tab_edit:
         st.info("No vendors found.")
     else:
         id_to_label = {int(r["id"]): f'{r.get("business_name","(no name)")} — #{int(r["id"])}' for _, r in df_all.iterrows()}
-        # Sort labels by business name
         sort_ids = sorted(id_to_label.keys(), key=lambda i: id_to_label[i].lower())
         chosen_id = st.selectbox("Select Vendor", options=sort_ids, format_func=lambda i: id_to_label[i], key="edit_sel")
 
@@ -437,7 +446,6 @@ with tab_edit:
                     website_e       = text_input_w("Website (URL)", row.get("website"), key="e_url")
                     category_e      = select_category_required("Category", row.get("category"), key="e_cat")  # REQUIRED
                 with col3:
-                    # Service optional; show blank if missing
                     service_val = row.get("service") or ""
                     service_e   = select_service_optional("Service (optional)", value=service_val if service_val else None, key="e_svc")
                     notes_e     = st.text_area("Notes", value=row.get("notes") or "", key="e_notes", height=100)
@@ -470,8 +478,7 @@ with tab_edit:
                                 keywords=keywords_e.strip() if (vendors_has_keywords() and keywords_e) else None,
                             )
                             st.success("Saved.")
-                            invalidate_refs()
-                            load_vendors_df.clear()
+                            invalidate_caches()
                             rerun()
                         except Exception as ex:
                             st.error(f"Failed to save changes: {ex}")
@@ -491,8 +498,7 @@ with tab_delete:
         if del_id and st.button("Delete", type="secondary"):
             delete_vendor(int(del_id))
             st.success(f"Deleted #{int(del_id)}")
-            invalidate_refs()
-            load_vendors_df.clear()
+            invalidate_caches()
             rerun()
 
 # -----------------------------
@@ -509,7 +515,7 @@ with tab_cat:
         else:
             add_category(new_cat.strip())
             st.success(f"Category added/kept: {new_cat.strip()}")
-            invalidate_refs()
+            invalidate_caches()
             rerun()
 
     st.markdown("**Existing Categories**")
@@ -534,7 +540,7 @@ with tab_svc:
         else:
             add_service(new_svc.strip())
             st.success(f"Service added/kept: {new_svc.strip()}")
-            invalidate_refs()
+            invalidate_caches()
             rerun()
 
     st.markdown("**Existing Services**")
