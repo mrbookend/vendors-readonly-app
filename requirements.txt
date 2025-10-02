@@ -1,18 +1,17 @@
-# Build tools (optional; harmless to keep on Streamlit Cloud)
+# Build tools (ok to keep)
 pip==24.2
 setuptools==72.1.0
 wheel==0.44.0
 
 # Core
-streamlit==1.37.1
+streamlit==1.36.0
 pandas==2.2.2
 numpy==1.26.4
 
 # SQL stack (Turso/libSQL support)
-SQLAlchemy==2.0.32
+SQLAlchemy==2.0.30
 sqlalchemy-libsql==0.1.1
 libsql-client==0.3.6
 
 # Streamlit can pull protobuf; keep this to avoid breakage
 protobuf<5
-
