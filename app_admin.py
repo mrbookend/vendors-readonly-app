@@ -1,11 +1,13 @@
 # app_admin.py
 # Vendors Admin — Category REQUIRED, Service optional (blank display if missing)
+# - FIX: auto-rewrite libSQL DSN from libsql://… -> sqlite+libsql://… to avoid SQLAlchemy NoSuchModuleError
+# - Requires packages: sqlalchemy-libsql, libsql-client
 # - DB diagnostics; supports LIBSQL_* or TURSO_* secrets
-# - Column width controls via secrets: [COLUMN_WIDTHS_PX] and PAGE_MAX_WIDTH_PX, etc.
+# - Column width controls via secrets: [COLUMN_WIDTHS_PX], PAGE_MAX_WIDTH_PX, etc.
 # - Add/Edit/Delete flows with persistent success notices
 # - Category required; Service optional (stored NULL, shown blank)
 # - Phone & URL normalization
-# - Robust cache invalidation across Streamlit versions
+# - Robust cache invalidation
 
 from __future__ import annotations
 import os
@@ -37,10 +39,9 @@ def _get_int_secret(name: str, default: int) -> int:
         return default
 
 def _get_libsql_creds() -> Dict[str, Optional[str]]:
-    url = (_get_secret("LIBSQL_URL")
-           or _get_secret("TURSO_DATABASE_URL"))
-    token = (_get_secret("LIBSQL_AUTH_TOKEN")
-             or _get_secret("TURSO_AUTH_TOKEN"))
+    # Accept either generic libSQL names or Turso names
+    url = (_get_secret("LIBSQL_URL") or _get_secret("TURSO_DATABASE_URL"))
+    token = (_get_secret("LIBSQL_AUTH_TOKEN") or _get_secret("TURSO_AUTH_TOKEN"))
     return {"url": url, "token": token}
 
 def _default_sqlite_path() -> str:
@@ -50,13 +51,25 @@ def _default_sqlite_path() -> str:
 # -----------------------------
 # DB selection & engine
 # -----------------------------
+_LIBSQL_SCHEME_RE = re.compile(r"^libsql://", re.IGNORECASE)
+
+def _normalize_libsql_url(url: str) -> str:
+    """
+    SQLAlchemy needs 'sqlite+libsql://' dialect. Turso often gives 'libsql://'.
+    This rewrites the scheme only; host/params untouched.
+    """
+    if _LIBSQL_SCHEME_RE.match(url):
+        return _LIBSQL_SCHEME_RE.sub("sqlite+libsql://", url, count=1)
+    return url
+
 def current_db_info() -> Dict[str, Optional[str]]:
     creds = _get_libsql_creds()
     sqlite_path = _get_secret("SQLITE_PATH") or _default_sqlite_path()
     if creds["url"]:
+        dsn = _normalize_libsql_url(str(creds["url"]))
         return {
             "backend": "libsql",
-            "dsn": creds["url"],
+            "dsn": dsn,
             "auth": "token_set" if creds["token"] else "no_token",
             "sqlite_path": None,
             "note": "Remote DB (persistent).",
@@ -73,9 +86,9 @@ def get_engine() -> Engine:
     info = current_db_info()
     if info["backend"] == "libsql":
         connect_args = {}
-        token = (_get_secret("LIBSQL_AUTH_TOKEN")
-                 or _get_secret("TURSO_AUTH_TOKEN"))
+        token = (_get_secret("LIBSQL_AUTH_TOKEN") or _get_secret("TURSO_AUTH_TOKEN"))
         if token:
+            # sqlalchemy-libsql expects authToken in connect_args
             connect_args["authToken"] = token
         return create_engine(info["dsn"], connect_args=connect_args, pool_pre_ping=True, future=True)
     return create_engine(info["dsn"], future=True)
@@ -159,7 +172,6 @@ def normalize_url(url: str | None) -> str | None:
 # Column width configuration
 # -----------------------------
 def _get_column_widths_px() -> Dict[str, int]:
-    # Secrets supports nested dicts; env vars won’t for the block, so we only read st.secrets here.
     mapping = {}
     try:
         block = st.secrets.get("COLUMN_WIDTHS_PX", {})
@@ -171,7 +183,6 @@ def _get_column_widths_px() -> Dict[str, int]:
                     pass
     except Exception:
         pass
-    # Back-compat: optional single WEBSITE_COL_WIDTH_PX if not in the block
     website_w = _get_int_secret("WEBSITE_COL_WIDTH_PX", 0)
     if website_w and "website" not in mapping:
         mapping["website"] = website_w
@@ -200,7 +211,6 @@ def _build_column_config(show_cols: List[str], widths: Dict[str, int]) -> Dict[s
     cfg: Dict[str, st.column_config.Column] = {}
     for c in show_cols:
         w = widths.get(c, 0)
-        # Pick a sensible default if not provided; let Streamlit auto-size if w<=0
         if c == "id":
             cfg[c] = st.column_config.NumberColumn("id", width=70 if w <= 0 else w)
         else:
@@ -453,7 +463,6 @@ with tab_view:
     desired = ["business_name", "category", "service", "contact_name",
                "phone", "address", "website", "notes", "keywords"]
     show_cols = [c for c in df.columns if c in desired]
-    # Build column_config with pixel widths from secrets (if provided)
     col_cfg = _build_column_config(show_cols=(["id"] + show_cols) if "id" in df.columns else show_cols,
                                    widths=_col_widths)
 
