@@ -619,7 +619,7 @@ with tab_delete:
             except Exception as ex:
                 del_feedback.error(f"Failed to delete vendor: {ex}")
         if "delete_success_msg" in st.session_state:
-            del_feedback.success(st_session_state.pop("delete_success_msg"))  # type: ignore[name-defined]
+            del_feedback.success(st.session_state.pop("delete_success_msg"))  # type: ignore[name-defined]
 
 # -----------------------------
 # Categories Admin
