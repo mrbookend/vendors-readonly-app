@@ -1,3 +1,5 @@
+from layout_header import apply_layout
+apply_layout()
 # app_admin.py
 # Vendors Admin — Category REQUIRED, Service optional (blank display if missing)
 # - Categories/Services Admin now surfaces **orphans** (values used by vendors but missing from the ref tables).
