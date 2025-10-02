@@ -512,7 +512,7 @@ def load_vendor_by_id(vid: int) -> Optional[Dict]:
 # -----------------------------
 # App layout
 # -----------------------------
-st.set_page_config(page_title="Vendors Admin", layout="wide")
+
 st.title("Vendors Admin")
 
 _page = _page_layout_from_secrets()
