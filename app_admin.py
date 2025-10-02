@@ -1,11 +1,10 @@
 # app_admin.py
 # Vendors Admin — Category REQUIRED, Service optional (blank display if missing)
-# - FIX: auto-rewrite libSQL DSN from libsql://… -> sqlite+libsql://… to avoid SQLAlchemy NoSuchModuleError
-# - Requires packages: sqlalchemy-libsql, libsql-client
-# - DB diagnostics; supports LIBSQL_* or TURSO_* secrets
+# - FIX: use connect_args={"auth_token": ...} for libSQL (not "authToken")
+# - Also append ?secure=true to sqlite+libsql DSN to ensure TLS
+# - Works with LIBSQL_* or TURSO_* secrets
 # - Column width controls via secrets: [COLUMN_WIDTHS_PX], PAGE_MAX_WIDTH_PX, etc.
-# - Add/Edit/Delete flows with persistent success notices
-# - Category required; Service optional (stored NULL, shown blank)
+# - Add/Edit/Delete with persistent success notices
 # - Phone & URL normalization
 # - Robust cache invalidation
 
@@ -54,19 +53,23 @@ def _default_sqlite_path() -> str:
 _LIBSQL_SCHEME_RE = re.compile(r"^libsql://", re.IGNORECASE)
 
 def _normalize_libsql_url(url: str) -> str:
-    """
-    SQLAlchemy needs 'sqlite+libsql://' dialect. Turso often gives 'libsql://'.
-    This rewrites the scheme only; host/params untouched.
-    """
+    """Rewrite libsql://... to sqlite+libsql://... for SQLAlchemy."""
     if _LIBSQL_SCHEME_RE.match(url):
         return _LIBSQL_SCHEME_RE.sub("sqlite+libsql://", url, count=1)
     return url
+
+def _append_secure_param(dsn: str) -> str:
+    """Ensure ?secure=true is present for TLS; append or extend query string."""
+    if "secure=" in dsn:
+        return dsn
+    return f"{dsn}&secure=true" if "?" in dsn else f"{dsn}?secure=true"
 
 def current_db_info() -> Dict[str, Optional[str]]:
     creds = _get_libsql_creds()
     sqlite_path = _get_secret("SQLITE_PATH") or _default_sqlite_path()
     if creds["url"]:
         dsn = _normalize_libsql_url(str(creds["url"]))
+        dsn = _append_secure_param(dsn)
         return {
             "backend": "libsql",
             "dsn": dsn,
@@ -88,8 +91,8 @@ def get_engine() -> Engine:
         connect_args = {}
         token = (_get_secret("LIBSQL_AUTH_TOKEN") or _get_secret("TURSO_AUTH_TOKEN"))
         if token:
-            # sqlalchemy-libsql expects authToken in connect_args
-            connect_args["authToken"] = token
+            # sqlalchemy-libsql expects snake_case 'auth_token'
+            connect_args["auth_token"] = token
         return create_engine(info["dsn"], connect_args=connect_args, pool_pre_ping=True, future=True)
     return create_engine(info["dsn"], future=True)
 
@@ -455,7 +458,7 @@ tab_view, tab_add, tab_edit, tab_delete, tab_cat, tab_svc = st.tabs(
 )
 
 # -----------------------------
-# View tab (uses per-column widths)
+# View tab
 # -----------------------------
 with tab_view:
     st.subheader("Browse Vendors")
@@ -616,7 +619,7 @@ with tab_delete:
             except Exception as ex:
                 del_feedback.error(f"Failed to delete vendor: {ex}")
         if "delete_success_msg" in st.session_state:
-            del_feedback.success(st.session_state.pop("delete_success_msg"))
+            del_feedback.success(st_session_state.pop("delete_success_msg"))  # type: ignore[name-defined]
 
 # -----------------------------
 # Categories Admin
@@ -630,7 +633,10 @@ with tab_cat:
         if not new_cat.strip():
             st.error("Category name required.")
         else:
-            add_category(new_cat.strip())
+            with engine.begin() as conn:
+                conn.execute(sql_text("CREATE TABLE IF NOT EXISTS categories(name TEXT PRIMARY KEY)"))
+            with engine.begin() as conn:
+                conn.execute(sql_text("INSERT OR IGNORE INTO categories(name) VALUES(:n)"), {"n": new_cat.strip()})
             st.success(f"Category added/kept: {new_cat.strip()}")
             invalidate_caches()
             rerun()
@@ -652,7 +658,10 @@ with tab_svc:
         if not new_svc.strip():
             st.error("Service name required.")
         else:
-            add_service(new_svc.strip())
+            with engine.begin() as conn:
+                conn.execute(sql_text("CREATE TABLE IF NOT EXISTS services(name TEXT PRIMARY KEY)"))
+            with engine.begin() as conn:
+                conn.execute(sql_text("INSERT OR IGNORE INTO services(name) VALUES(:n)"), {"n": new_svc.strip()})
             st.success(f"Service added/kept: {new_svc.strip()}")
             invalidate_caches()
             rerun()
