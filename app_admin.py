@@ -576,6 +576,27 @@ with st.expander("Database Status & Schema (debug)", expanded=False):
         if "COLUMN_WIDTHS_PX" in st.secrets:
             st.write("**Raw COLUMN_WIDTHS_PX (debug)**")
             st.json(st.secrets["COLUMN_WIDTHS_PX"])
+            # Secrets debug — keep until satisfied; remove later if you wish
+try:
+    st.write("**Secrets keys (debug)**", sorted(list(st.secrets.keys())))
+    if "COLUMN_WIDTHS_PX" in st.secrets:
+        st.write("**Raw COLUMN_WIDTHS_PX (debug)**")
+        st.json(st.secrets["COLUMN_WIDTHS_PX"])
+
+        # ↓↓↓ TEMP DEBUG: paste these lines ↓↓↓
+        raw = st.secrets.get("COLUMN_WIDTHS_PX", None)
+        st.write("**type(COLUMN_WIDTHS_PX)**", type(raw).__name__)
+        st.write("**repr(COLUMN_WIDTHS_PX)**")
+        st.code(repr(raw))
+        # ↑↑↑ remove after troubleshooting ↑↑↑
+
+    else:
+        st.warning("COLUMN_WIDTHS_PX not found in st.secrets")
+    st.write("**Loaded column widths (debug)**")
+    st.json(_get_column_widths_px())
+except Exception as _e:
+    st.write("Secrets debug error:", str(_e))
+
         else:
             st.warning("COLUMN_WIDTHS_PX not found in st.secrets")
         st.write("**Loaded column widths (debug)**")
