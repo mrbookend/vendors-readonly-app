@@ -1,13 +1,7 @@
 # app_readonly.py
-# Read-only Providers/Vendors view with:
-# - Pixel widths from secrets (COLUMN_WIDTHS_PX_READONLY or fallback)
-# - Wrapped cells; rows auto-grow in height
-# - Client-side sort on headers + quick filter (JS in the embedded table)
-# - Optional sticky first column via secrets
-# - Wide layout; width from secrets
-# - Help via st.expander (reads READONLY_HELP_MD from secrets)
-# - CSV download button at the very bottom (just before debug)
-# - Optional display label overrides via [READONLY_COLUMN_LABELS] in secrets
+# - Help via st.expander reading READONLY_HELP_MD from secrets (no duplicate title)
+# - CSV download button at bottom (just above debug)
+# - Bottom debug now also previews the first 120 chars of READONLY_HELP_MD
 
 from __future__ import annotations
 
@@ -34,7 +28,7 @@ def _read_secret_early(name: str, default=None):
     return os.environ.get(name, default)
 
 _title   = _read_secret_early("page_title", "Vendors (Read-only)")
-_sidebar = _read_secret_early("sidebar_state", "collapsed")  # "collapsed" | "expanded"
+_sidebar = _read_secret_early("sidebar_state", "collapsed")
 _max_w   = _read_secret_early("page_max_width_px", 3000)
 try:
     _max_w = int(_max_w)
@@ -87,15 +81,6 @@ def _get_bool_secret(name: str, default: bool) -> bool:
     return default
 
 def _get_column_labels() -> Dict[str, str]:
-    """
-    Optional display label overrides for headers.
-    Provide in secrets as:
-      [READONLY_COLUMN_LABELS]
-      business_name = "Provider"
-      category      = "Service Category"
-      service       = "Specialty"
-    Or JSON string under READONLY_COLUMN_LABELS.
-    """
     import json
     from collections.abc import Mapping
     raw = _get_secret("READONLY_COLUMN_LABELS", None)
@@ -142,11 +127,7 @@ def current_db_info() -> Dict[str, Optional[str]]:
     if creds["url"]:
         dsn = _normalize_libsql_url(str(creds["url"]))
         dsn = _append_secure_param(dsn)
-        return {
-            "backend": "libsql",
-            "dsn": dsn,
-            "auth": "token_set" if creds["token"] else "no_token",
-        }
+        return {"backend": "libsql", "dsn": dsn, "auth": "token_set" if creds["token"] else "no_token"}
     sqlite_path = _get_secret("SQLITE_PATH") or os.path.join(os.path.dirname(os.path.abspath(__file__)), "vendors.db")
     return {"backend": "sqlite", "dsn": f"sqlite:///{sqlite_path}", "auth": None}
 
@@ -472,7 +453,8 @@ def render_help_expander():
     md = _get_secret("READONLY_HELP_MD", None)
     with st.expander(title, expanded=False):
         if md and str(md).strip():
-            st.markdown(str(md))
+            # Normalize newlines (Windows/Mac) and render as Markdown/plain
+            st.markdown(str(md).replace("\r\n", "\n").replace("\r", "\n"))
         else:
             st.write("Providers Help / Tips")
 
@@ -516,6 +498,15 @@ with st.expander("Status & Secrets (debug)", expanded=False):
     st.write("**DB**", current_db_info())
     try:
         st.write("**Secrets keys**", sorted(list(st.secrets.keys())))
+        # Preview the help MD so you can confirm it's loaded
+        md = _get_secret("READONLY_HELP_MD", None)
+        if md is None or str(md).strip() == "":
+            st.write("Help MD: (missing or empty)")
+        else:
+            txt = str(md)
+            st.write(f"Help MD length: {len(txt)} chars")
+            st.code(txt[:120] + ("…" if len(txt) > 120 else ""), language="text")
+
         raw_ro = st.secrets.get("COLUMN_WIDTHS_PX_READONLY", None)
         raw = st.secrets.get("COLUMN_WIDTHS_PX", None)
         st.write("**Raw COLUMN_WIDTHS_PX_READONLY (type)**", type(raw_ro).__name__)
