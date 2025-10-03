@@ -1,16 +1,5 @@
-# Core framework
 streamlit==1.39.0
-
-# Database / ORM
+pandas==2.2.2
 sqlalchemy==2.0.34
-pandas==2.2.3
-
-# AG Grid integration
 streamlit-aggrid==0.3.4.post3
-
-# Drivers
-pysqlite3-binary==0.5.3        # Ensures sqlite works in some cloud envs
-libsql-experimental==0.1.7     # Needed for Turso/libSQL
-
-# Optional helpers
-python-dateutil==2.9.0.post0
+libsql-experimental==0.1.7
