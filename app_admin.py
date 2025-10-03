@@ -17,6 +17,27 @@ from sqlalchemy.sql import text as sql_text
 from urllib.parse import urlparse
 from datetime import datetime, timezone
 
+# --- TEMP PATCH: log & neutralize st.write/st.code(None) ---
+import sys, traceback
+_orig_write = st.write
+_orig_code = st.code
+def _write_patch(*args, **kwargs):
+    if any(a is None for a in args):
+        print("\n[DEBUG] st.write(None) called", file=sys.stderr)
+        traceback.print_stack(limit=8, file=sys.stderr)  # <- shows file:line
+        # replace Nones so UI doesn't render "None"
+        args = tuple("" if a is None else a for a in args)
+    return _orig_write(*args, **kwargs)
+def _code_patch(obj, *args, **kwargs):
+    if obj is None:
+        print("\n[DEBUG] st.code(None) called", file=sys.stderr)
+        traceback.print_stack(limit=8, file=sys.stderr)
+        obj = ""  # neutralize UI output
+    return _orig_code(obj, *args, **kwargs)
+st.write = _write_patch
+st.code  = _code_patch
+# --- END TEMP PATCH ---
+
 # -----------------------------
 # Secrets / env helpers
 # -----------------------------
