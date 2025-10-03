@@ -1,9 +1,9 @@
-# app_admin.py — Vendors Admin (v3.5)
+# app_admin.py — Vendors Admin (v3.5.1)
 # View | Add | Edit | Delete | Categories Admin | Services Admin | Maintenance | Changelog
-# - Real auto-expand rows (AgGrid) with NO per-column filters
-# - Quick filter under Help (AND-match across row text; partial words ok)
-# - CSV at bottom (before debug)
-# - Validators: phone (10 digits -> (xxx) xxx-xxxx), website (http/https host), service required unless category="Home Repair"
+# - AgGrid: NO per-column filters; long text (notes/address/website url) wraps + auto-expands rows
+# - FIX: use JS-style keys in cellStyle (whiteSpace/wordBreak/overflowWrap) so wrapping actually works
+# - Quick filter under Help; CSV at bottom; Debug expander at very bottom
+# - Validators: phone (10 digits), website (http/https), service required unless category="Home Repair"
 # - Audit trail: created_at, updated_at, updated_by + vendor_changes changelog
 # - Auto-migration for audit columns/tables
 
@@ -164,7 +164,6 @@ _ensure_schema()
 # CSS (fallback table only)
 # -----------------------------
 def _apply_css(field_order: List[str]):
-    # Only used when AgGrid isn't available; keeps fallback readable
     rules = []
     for idx, col in enumerate(field_order, start=1):
         px = COLUMN_WIDTHS.get(col)
@@ -417,13 +416,18 @@ def _aggrid_view(df_show: pd.DataFrame, website_label: str = "website"):
         if px:
             gob.configure_column(col, width=px)
 
-    # Long text columns auto-expand
+    # Long text columns auto-expand (FIX: AgGrid cellStyle uses JS-style keys)
     long_cols = {"notes","address"}
     if url_col:
         long_cols.add(url_col)
     for col in list(_df.columns):
         if col.lower() in long_cols:
-            gob.configure_column(col, wrapText=True, autoHeight=True, cellStyle={"white-space": "normal"})
+            gob.configure_column(
+                col,
+                wrapText=True,
+                autoHeight=True,
+                cellStyle={"whiteSpace": "normal", "wordBreak": "break-word", "overflowWrap": "anywhere"},
+            )
 
     # Clickable "Website"
     if website_key and url_col:
@@ -691,7 +695,7 @@ def tab_changelog():
 
 
 # -----------------------------
-# Status & Secrets (debug) — END
+# Status & Secrets (debug) — END (BOTTOM)
 # -----------------------------
 def render_status_debug():
     with st.expander("Status & Secrets (debug)", expanded=False):
@@ -728,7 +732,8 @@ def main():
     with tabs[6]: tab_maintenance()
     with tabs[7]: tab_changelog()
 
-    render_status_debug()  # LAST
+    # Ensure debug expander is at the very bottom of the page
+    render_status_debug()
 
 if __name__ == "__main__":
     main()
