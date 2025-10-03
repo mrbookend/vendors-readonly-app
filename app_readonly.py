@@ -611,7 +611,7 @@ def _render_help(style: str = "modal"):
         }});
       }})();
     </script>
-    """, height=1, scrolling=False)
+    """, height=60, scrolling=False)
 
 # Choose style via secrets (defaults to modal)
 _help_style = str(st.secrets.get("READONLY_HELP_STYLE", "modal")).lower()
