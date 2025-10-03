@@ -1,10 +1,11 @@
 # app_readonly.py
 # Read-only Vendors view with:
-# - True pixel widths from secrets
-# - Wrapping cells; rows auto-grow in height
+# - True pixel widths from secrets (COLUMN_WIDTHS_PX_READONLY or fallback to COLUMN_WIDTHS_PX)
+# - Wrapped cells; rows auto-grow in height
 # - Click-to-sort on every column (client-side)
 # - Quick filter (client-side)
 # - Optional sticky first column (id)
+# - Wide page layout with configurable max width via secrets
 
 from __future__ import annotations
 
@@ -20,21 +21,48 @@ from sqlalchemy.engine import Engine
 import streamlit.components.v1 as components
 
 # -----------------------------
-# Optional layout helper (if present in your repo)
+# Page layout (must happen before any other Streamlit UI output)
 # -----------------------------
-try:
-    from layout_header import apply_layout
-    apply_layout()
-except Exception:
-    pass
+def _read_secret_early(name: str, default=None):
+    try:
+        if name in st.secrets:
+            return st.secrets[name]
+    except Exception:
+        pass
+    return os.environ.get(name, default)
 
-# Toggle sticky first column (ID) here if you want it by default
-STICKY_FIRST_COL_DEFAULT = True
+_title   = _read_secret_early("page_title", "Vendors")
+_sidebar = _read_secret_early("sidebar_state", "collapsed")  # "collapsed" | "expanded"
+_max_w   = _read_secret_early("page_max_width_px", 3000)
+try:
+    _max_w = int(_max_w)
+except Exception:
+    _max_w = 3000
+
+# First UI call
+st.set_page_config(page_title=_title, layout="wide", initial_sidebar_state=_sidebar)
+st.markdown(
+    f"""
+    <style>
+    .main .block-container {{
+        max-width: {_max_w}px;
+        padding-left: 16px;
+        padding-right: 16px;
+    }}
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
+# -----------------------------
+# Config
+# -----------------------------
+STICKY_FIRST_COL_DEFAULT = True  # can be overridden by READONLY_STICKY_FIRST_COL in secrets
 
 # -----------------------------
 # Secrets helpers
 # -----------------------------
-def _get_secret(name: str, default: Optional[str | int] = None):
+def _get_secret(name: str, default: Optional[str | int | bool] = None):
     try:
         if name in st.secrets:
             return st.secrets[name]
@@ -113,7 +141,7 @@ engine = get_engine()
 # Column widths loader
 # -----------------------------
 def _width_value_to_px(val) -> int:
-    """Convert size words or ints to px."""
+    """Convert size words or ints/strings to px."""
     if isinstance(val, int):
         return max(20, val)
     s = str(val).strip().lower()
@@ -123,7 +151,6 @@ def _width_value_to_px(val) -> int:
         return 160
     if s in {"large", "l"}:
         return 240
-    # fallback
     try:
         return max(20, int(s))
     except Exception:
@@ -143,7 +170,7 @@ def _coerce_map(obj) -> Dict[str, int]:
 def _get_column_widths_px() -> Dict[str, int]:
     """
     Prefer COLUMN_WIDTHS_PX_READONLY; fallback to COLUMN_WIDTHS_PX.
-    Accepts Streamlit AttrDict mapping, JSON-like mapping, or key/val mapping.
+    Accepts Streamlit AttrDict mapping, JSON-like mapping, or key/val mapping in TOML block.
     """
     import json
     from collections.abc import Mapping
@@ -163,13 +190,11 @@ def _get_column_widths_px() -> Dict[str, int]:
         mapping = _coerce_map(raw)
     elif isinstance(raw, str):
         s = raw.strip()
-        # Try JSON mapping
         try:
             obj = json.loads(s)
             if isinstance(obj, Mapping):
                 mapping = _coerce_map(obj)
         except Exception:
-            # Try line-based "key = value"
             local_map: Dict[str, int] = {}
             for line in s.splitlines():
                 line = line.strip()
@@ -190,7 +215,6 @@ def _get_column_widths_px() -> Dict[str, int]:
 
     return mapping
 
-# Optional sticky first col secret override
 def _sticky_first_col_enabled() -> bool:
     return _get_bool_secret("READONLY_STICKY_FIRST_COL", STICKY_FIRST_COL_DEFAULT)
 
@@ -221,7 +245,7 @@ def load_vendors_df() -> pd.DataFrame:
         return pd.DataFrame()
     with engine.begin() as conn:
         df = pd.read_sql_query(sql_text(f"SELECT {', '.join(sel_cols)} FROM vendors"), conn)
-    # Minor normalizations to make display tidy
+    # Tidy display
     if "service" in df.columns:
         df["service"] = df["service"].apply(lambda v: v if (isinstance(v, str) and v.strip()) else "")
     if "category" in df.columns:
@@ -340,9 +364,7 @@ def _render_sortable_wrapped_table(
     thead = ["<thead><tr>"]
     for idx, c in enumerate(cols):
         label = html.escape(c.replace("_", " ").title())
-        th_classes = ""
-        if sticky_first_col and idx == 0:
-            th_classes = ' class="sticky-col sticky-shadow"'
+        th_classes = ' class="sticky-col sticky-shadow"' if (sticky_first_col and idx == 0) else ""
         thead.append(
             f'<th{th_classes} data-col="{html.escape(c)}">'
             f'<span class="th-inner">{label}<span class="sort-arrow">▲</span></span>'
@@ -356,9 +378,7 @@ def _render_sortable_wrapped_table(
         tbody.append("<tr>")
         for idx, c in enumerate(cols):
             val = row[c]
-            td_class = ""
-            if sticky_first_col and idx == 0:
-                td_class = ' class="sticky-col sticky-shadow"'
+            td_class = ' class="sticky-col sticky-shadow"' if (sticky_first_col and idx == 0) else ""
             if c == "website" and isinstance(val, str) and val.strip():
                 href = html.escape(val)
                 text = html.escape(val)
