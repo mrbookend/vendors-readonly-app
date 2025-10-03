@@ -303,35 +303,59 @@ DEBUG_KEYS = (
 
 
 def render_status_debug():
-    with st.expander("Status & Secrets (debug)", expanded=False):
-        try:
-            keys = list(st.secrets.keys())
-        except Exception:
-            keys = []
+   with st.expander("Status & Secrets (debug)", expanded=False):
+    # --- Engine / Dialect facts
+    engine_meta = {
+        "sqlalchemy_url": str(engine.url),
+        "dialect": getattr(engine.dialect, "name", "?"),
+        "driver": getattr(engine.dialect, "driver", "?"),
+    }
+    using_remote = (engine_meta["driver"] == "libsql")  # True => Turso active; False => local SQLite
 
-        backend = (
-            "libsql" if str(_read_secret_early("TURSO_DATABASE_URL", "")).startswith("sqlite+libsql://") else "sqlite"
-        )
-        dsn = _read_secret_early("TURSO_DATABASE_URL", "")
-        auth = "token_set" if bool(_read_secret_early("TURSO_AUTH_TOKEN", None)) else "none"
+    # Probe connection for extra hints (non-fatal if it fails)
+    probe = {}
+    try:
+        with engine.connect() as conn:
+            # When local SQLite, show on-disk DB path via PRAGMA database_list
+            try:
+                rows = conn.exec_driver_sql("PRAGMA database_list").fetchall()
+                # rows like: [(0, 'main', '/path/to/vendors.db'), ...]
+                if rows and len(rows[0]) >= 3:
+                    probe["sqlite_db_path"] = rows[0][2]
+            except Exception as e:
+                probe["pragma_error"] = repr(e)
+    except Exception as e:
+        probe["connect_error"] = repr(e)
 
-        st.write("DB")
-        st.code({"backend": backend, "dsn": dsn, "auth": auth})
+    st.subheader("DB (resolved)")
+    st.code({
+        "using_remote": using_remote,  # <- this is the truth signal
+        **engine_meta
+    }, language="json")
 
-        st.write("Secrets keys (present)")
-        st.code(keys)
+    if probe:
+        st.subheader("DB Probe")
+        st.code(probe, language="json")
 
-        st.write("Help MD:", "present" if bool(HELP_MD) else "(missing or empty)")
-        st.write("Sticky first col enabled:", STICKY_FIRST)
+    # --- Secrets overview (kept concise)
+    try:
+        keys = list(st.secrets.keys())
+    except Exception:
+        keys = []
+    st.subheader("Secrets keys (present)")
+    st.write(keys if keys else "No st.secrets or cannot enumerate in this environment.")
 
-        st.write("Raw COLUMN_WIDTHS_PX_READONLY (type)", type(COLUMN_WIDTHS_PX).__name__)
-        st.code(COLUMN_WIDTHS_PX)
+    st.subheader("Help Content")
+    st.write({"title": HELP_TITLE, "md_len": len(HELP_MD or "")})
 
-        st.write("Column label overrides (if any)")
-        st.code(LABEL_OVERRIDES)
+    st.subheader("Raw column widths (from secrets, merged with defaults)")
+    st.code(COLUMN_WIDTHS_PX, language="json")
 
-        st.write("Effective column order")
-        st.code(COLUMN_ORDER)
+    st.subheader("Column label overrides (if any)")
+    st.code(LABEL_OVERRIDES, language="json")
+
+    st.subheader("Effective column order")
+    st.code(COLUMN_ORDER, language="json")
 
 
 # -----------------------------
