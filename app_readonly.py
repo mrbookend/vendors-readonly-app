@@ -1,18 +1,19 @@
-# app_readonly.py — Read‑Only Vendors (stability‑first v3)
+# app_readonly.py — Read‑Only Vendors (stability‑first v3.2)
 # 
 # Goals
-# - Preserve the original look/feel and column order (zero surprise)
-# - Use secrets for labels, widths, sticky first column, help text
-# - Fix prior Help crash (no nested expanders; Markdown rendering)
+# - Preserve original look/feel and column order (zero surprise)
+# - Secrets control labels, widths, sticky first column, help text
+# - Fix Help crash (no nested expanders; Markdown rendering)
 # - Turso (libSQL) primary DB, local SQLite fallback
-# - Simple, robust quick filter (client‑side contains across all string cols)
-# - Minimal CSS just for wrapping and column widths; no other visual drift
-# - Keep code compact and readable without cleverness
-# - Place "Download Providers (CSV)" and then "Status & Secrets (debug)" at the END of the page
+# - Simple quick filter (client‑side contains across all string cols)
+# - Minimal CSS for wrapping/widths; no other visual drift
+# - Download CSV button; Status & Secrets (debug) pinned at END
+# - Website: clickable link (display text = "Website") only when URL is valid,
+#   and a full URL text column immediately to the right.
 #
 # Expected schema: vendors(id, category, service, business_name, contact_name, phone, address, website, notes, keywords)
 #
-# Version: 3.0 (2025‑10‑03)
+# Version: 3.2 (2025‑10‑03)
 
 from __future__ import annotations
 
@@ -23,11 +24,13 @@ import pandas as pd
 import streamlit as st
 from sqlalchemy import create_engine, text as sql_text
 from sqlalchemy.engine import Engine
+from urllib.parse import urlparse
 
 
 # -----------------------------
 # Early secret/env helpers
 # -----------------------------
+
 def _read_secret_early(name: str, default=None):
     try:
         if name in st.secrets:
@@ -48,6 +51,7 @@ def _get_secret_bool(val, default=False) -> bool:
 # -----------------------------
 # Page layout (must run first)
 # -----------------------------
+
 def _apply_page_layout():
     title = _read_secret_early("page_title", "HCR Vendors (Read‑Only)")
     sidebar_state = _read_secret_early("sidebar_state", "expanded")
@@ -76,6 +80,7 @@ _apply_page_layout()
 # -----------------------------
 # Secrets-driven config
 # -----------------------------
+
 COLUMN_WIDTHS_PX: Dict[str, int] = _read_secret_early("COLUMN_WIDTHS_PX_READONLY", {}) or {}
 LABEL_OVERRIDES: Dict[str, str] = _read_secret_early("READONLY_COLUMN_LABELS", {}) or {}
 STICKY_FIRST = _get_secret_bool(_read_secret_early("READONLY_STICKY_FIRST_COL", False), False)
@@ -95,7 +100,7 @@ HELP_DEBUG = _get_secret_bool(
     _get_secret_bool(LABEL_OVERRIDES.get("readonly_help_debug"), False),
 )
 
-# Allow optional column order override via secrets; default to canonical order
+# Optional column order override via secrets; default to canonical order
 DEFAULT_ORDER = [
     "id",
     "business_name",
@@ -117,6 +122,7 @@ COLUMN_ORDER: List[str] = (
 # -----------------------------
 # Database engine
 # -----------------------------
+
 def _make_engine() -> Engine:
     url = _read_secret_early(
         "TURSO_DATABASE_URL",
@@ -147,6 +153,7 @@ engine = _make_engine()
 # -----------------------------
 # Data access
 # -----------------------------
+
 EXPECTED_COLS = set(DEFAULT_ORDER)
 
 
@@ -182,6 +189,7 @@ def load_vendors() -> pd.DataFrame:
 # -----------------------------
 # CSS: wrapping, widths, optional sticky first column
 # -----------------------------
+
 def _apply_table_css(field_order: List[str], widths_px: Dict[str, int], sticky_first: bool):
     width_rules = []
     # Build nth-child selectors aligned to the *visible* order
@@ -234,6 +242,7 @@ def _apply_table_css(field_order: List[str], widths_px: Dict[str, int], sticky_f
 # -----------------------------
 # Column label overrides (display only)
 # -----------------------------
+
 def _apply_label_overrides(df: pd.DataFrame, overrides: Dict[str, str]) -> pd.DataFrame:
     if not overrides:
         return df
@@ -244,6 +253,7 @@ def _apply_label_overrides(df: pd.DataFrame, overrides: Dict[str, str]) -> pd.Da
 # -----------------------------
 # Quick filter
 # -----------------------------
+
 def _quick_filter(df: pd.DataFrame) -> pd.DataFrame:
     st.subheader("Browse Providers")
     q = st.text_input("Quick filter (matches any column)", value="", placeholder="e.g., plumb, roof, 78245…").strip()
@@ -261,6 +271,7 @@ def _quick_filter(df: pd.DataFrame) -> pd.DataFrame:
 # -----------------------------
 # Help (single expander, Markdown; optional raw debug)
 # -----------------------------
+
 def render_help():
     with st.expander(HELP_TITLE, expanded=False):
         if HELP_MD:
@@ -275,6 +286,7 @@ def render_help():
 # -----------------------------
 # Debug panel (kept concise)
 # -----------------------------
+
 DEBUG_KEYS = (
     "COLUMN_WIDTHS_PX_READONLY",
     "READONLY_COLUMN_LABELS",
@@ -323,8 +335,36 @@ def render_status_debug():
 
 
 # -----------------------------
+# URL normalize + validate (for Website)
+# -----------------------------
+
+def _normalize_url(u: str) -> str:
+    """Return a normalized http(s) URL or empty string if invalid.
+    - Adds http:// if scheme missing
+    - Validates scheme is http(s) and netloc has a dot
+    """
+    s = (u or "").strip()
+    if not s:
+        return ""
+    if not isinstance(s, str):
+        s = str(s)
+    if not s.lower().startswith(("http://", "https://")):
+        s = "http://" + s
+    try:
+        p = urlparse(s)
+        if p.scheme not in ("http", "https"):
+            return ""
+        if not p.netloc or "." not in p.netloc:
+            return ""
+        return s
+    except Exception:
+        return ""
+
+
+# -----------------------------
 # CSV export helper
 # -----------------------------
+
 def _to_csv_bytes(df: pd.DataFrame) -> bytes:
     return df.to_csv(index=False).encode("utf-8")
 
@@ -356,19 +396,44 @@ def main():
     # Quick filter (client‑side)
     df_filtered = _quick_filter(df_display)
 
-    # Show table
-    st.dataframe(df_filtered, use_container_width=True, hide_index=True)
+    # Show table — Website link with display text and adjacent full URL column
+    website_key = LABEL_OVERRIDES.get("website", "website")
+    _df_show = df_filtered.copy()
 
-    # --- Download CSV button just before debug section ---
+    if website_key in _df_show.columns:
+        try:
+            # Normalize/validate; empty string means "no link"
+            norm_urls = _df_show[website_key].apply(_normalize_url)
+
+            # Full URL column immediately to the right of Website
+            url_col = f"{website_key} URL" if website_key.lower() != "website" else "Website URL"
+            w_idx = _df_show.columns.get_loc(website_key)
+            _df_show.insert(w_idx + 1, url_col, norm_urls)
+
+            # Render: LinkColumn shows "Website" text only for non-empty URLs
+            st.dataframe(
+                _df_show.assign(**{website_key: norm_urls}),
+                use_container_width=True,
+                hide_index=True,
+                column_config={
+                    website_key: st.column_config.LinkColumn(display_text="Website"),
+                },
+            )
+        except Exception:
+            st.dataframe(_df_show, use_container_width=True, hide_index=True)
+    else:
+        st.dataframe(_df_show, use_container_width=True, hide_index=True)
+
+    # Download CSV button just before debug section
     st.download_button(
         label="Download Providers (CSV)",
-        data=_to_csv_bytes(df_filtered),
+        data=_to_csv_bytes(_df_show),
         file_name="providers.csv",
         mime="text/csv",
         help="Exports exactly what you see (after filter and label overrides).",
     )
 
-    # --- Debug panel LAST on the page ---
+    # Debug panel LAST on the page
     render_status_debug()
 
 
