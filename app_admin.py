@@ -1,8 +1,9 @@
-# app_admin.py — Vendors Admin (v3.4) with Audit Trail + Changelog
+# app_admin.py — Vendors Admin (v3.5) with Audit Trail + Changelog
 # Tabs: View | Add | Edit | Delete | Categories Admin | Services Admin | Maintenance | Changelog
 # - Same UX as v3.3 (validators, widths/labels/help, website link + URL col, CSV, debug-at-end)
-# - NEW: Audit trail (created_at, updated_at, updated_by) on vendors + vendor_changes history table
+# - Audit trail (created_at, updated_at, updated_by) on vendors + vendor_changes history table
 # - Auto-migration: adds missing vendors audit columns; creates vendor_changes if absent
+# - Hardened: no top-level Streamlit renders; guarded debug block (no None prints); engine/layout init moved into main()
 
 from __future__ import annotations
 
@@ -14,33 +15,17 @@ import pandas as pd
 import streamlit as st
 from sqlalchemy import create_engine
 from sqlalchemy.sql import text as sql_text
+from sqlalchemy.engine import Engine
 from urllib.parse import urlparse
 from datetime import datetime, timezone
 
-# --- TEMP PATCH: log & neutralize st.write/st.code(None) ---
-import sys, traceback
-_orig_write = st.write
-_orig_code = st.code
-def _write_patch(*args, **kwargs):
-    if any(a is None for a in args):
-        print("\n[DEBUG] st.write(None) called", file=sys.stderr)
-        traceback.print_stack(limit=8, file=sys.stderr)  # <- shows file:line
-        # replace Nones so UI doesn't render "None"
-        args = tuple("" if a is None else a for a in args)
-    return _orig_write(*args, **kwargs)
-def _code_patch(obj, *args, **kwargs):
-    if obj is None:
-        print("\n[DEBUG] st.code(None) called", file=sys.stderr)
-        traceback.print_stack(limit=8, file=sys.stderr)
-        obj = ""  # neutralize UI output
-    return _orig_code(obj, *args, **kwargs)
-st.write = _write_patch
-st.code  = _code_patch
-# --- END TEMP PATCH ---
+# Global engine placeholder (initialized in main())
+eng: Engine | None = None
 
 # -----------------------------
 # Secrets / env helpers
 # -----------------------------
+
 def _read_secret(name: str, default=None):
     try:
         if name in st.secrets:
@@ -49,6 +34,7 @@ def _read_secret(name: str, default=None):
         pass
     return os.environ.get(name, default)
 
+
 def _get_bool(val, default=False):
     if isinstance(val, bool):
         return val
@@ -56,13 +42,20 @@ def _get_bool(val, default=False):
         return val.strip().lower() in ("1", "true", "yes", "on")
     return bool(default)
 
+
 def _now_iso() -> str:
     # Store as UTC ISO 8601 with seconds precision
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
 
+
+def _nz(x, default=""):
+    """Return default when x is None; otherwise x."""
+    return default if x is None else x
+
 # -----------------------------
 # Page config
 # -----------------------------
+
 def _apply_layout():
     st.set_page_config(
         page_title=_read_secret("page_title", "HCR Vendors Admin"),
@@ -82,11 +75,11 @@ def _apply_layout():
         """,
         unsafe_allow_html=True,
     )
-_apply_layout()
 
 # -----------------------------
 # Global config from secrets
 # -----------------------------
+
 LABEL_OVERRIDES: Dict[str, str] = _read_secret("READONLY_COLUMN_LABELS", {}) or {}
 COLUMN_WIDTHS: Dict[str, int] = _read_secret("COLUMN_WIDTHS_PX_READONLY", {}) or {}
 STICKY_FIRST: bool = _get_bool(_read_secret("READONLY_STICKY_FIRST_COL", False), False)
@@ -127,7 +120,8 @@ AUDIT_COLS = ["created_at", "updated_at", "updated_by"]
 # -----------------------------
 # Engine
 # -----------------------------
-def _engine():
+
+def _engine() -> Engine:
     url = _read_secret(
         "TURSO_DATABASE_URL",
         "sqlite+libsql://vendors-prod-mrbookend.aws-us-west-2.turso.io?secure=true",
@@ -135,40 +129,48 @@ def _engine():
     token = _read_secret("TURSO_AUTH_TOKEN", None)
     if isinstance(url, str) and url.startswith("sqlite+libsql://"):
         try:
-            eng = create_engine(url, connect_args={"auth_token": token} if token else {}, pool_pre_ping=True)
-            with eng.connect() as c:
+            eng_local = create_engine(
+                url,
+                connect_args={"auth_token": token} if token else {},
+                pool_pre_ping=True,
+            )
+            with eng_local.connect() as c:
                 c.execute(sql_text("SELECT 1"))
-            return eng
+            return eng_local
         except Exception as e:
             st.warning(f"Turso connection failed ({e}). Falling back to local SQLite vendors.db.")
     local = "/mount/src/vendors-readonly-app/vendors.db"
     if not os.path.exists(local):
         local = "vendors.db"
     return create_engine(f"sqlite:///{local}")
-eng = _engine()
 
 # -----------------------------
 # DB migration (adds audit columns & change log table)
 # -----------------------------
+
+def _column_exists(conn, table: str, col: str) -> bool:
+    try:
+        res = conn.execute(sql_text(f"PRAGMA table_info({table})")).fetchall()
+        cols = [r[1] for r in res]  # (cid, name, type, notnull, dflt, pk)
+        return col in cols
+    except Exception:
+        return False
+
+
 def _ensure_schema():
+    assert eng is not None, "Engine not initialized"
     with eng.begin() as c:
-        # Add audit columns to vendors if missing
-        # Note: simple ADD COLUMN is supported by SQLite/libsql
-        # created_at
-        c.execute(sql_text(
-            "ALTER TABLE vendors ADD COLUMN created_at TEXT"
-        )) if not _column_exists(c, "vendors", "created_at") else None
-        # updated_at
-        c.execute(sql_text(
-            "ALTER TABLE vendors ADD COLUMN updated_at TEXT"
-        )) if not _column_exists(c, "vendors", "updated_at") else None
-        # updated_by
-        c.execute(sql_text(
-            "ALTER TABLE vendors ADD COLUMN updated_by TEXT"
-        )) if not _column_exists(c, "vendors", "updated_by") else None
+        # Add audit columns to vendors if missing (SQLite/libsql supports simple ADD COLUMN)
+        if not _column_exists(c, "vendors", "created_at"):
+            c.execute(sql_text("ALTER TABLE vendors ADD COLUMN created_at TEXT"))
+        if not _column_exists(c, "vendors", "updated_at"):
+            c.execute(sql_text("ALTER TABLE vendors ADD COLUMN updated_at TEXT"))
+        if not _column_exists(c, "vendors", "updated_by"):
+            c.execute(sql_text("ALTER TABLE vendors ADD COLUMN updated_by TEXT"))
 
         # vendor_changes table
-        c.execute(sql_text("""
+        c.execute(sql_text(
+            """
             CREATE TABLE IF NOT EXISTS vendor_changes (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 vendor_id INTEGER NOT NULL,
@@ -179,21 +181,13 @@ def _ensure_schema():
                 old_value TEXT,
                 new_value TEXT
             )
-        """))
-
-def _column_exists(conn, table: str, col: str) -> bool:
-    try:
-        res = conn.execute(sql_text(f"PRAGMA table_info({table})")).fetchall()
-        cols = [r[1] for r in res]  # (cid, name, type, notnull, dflt, pk)
-        return col in cols
-    except Exception:
-        return False
-
-_ensure_schema()
+            """
+        ))
 
 # -----------------------------
 # CSS widths / sticky (same as Read-Only)
 # -----------------------------
+
 def _apply_css(field_order: List[str]):
     rules = []
     for idx, col in enumerate(field_order, start=1):
@@ -235,6 +229,7 @@ def _apply_css(field_order: List[str]):
 # -----------------------------
 # URL + phone helpers (validators/formatters)
 # -----------------------------
+
 def _normalize_url(u: str) -> str:
     """Return normalized URL or empty string if invalid."""
     s = (u or "").strip()
@@ -252,14 +247,17 @@ def _normalize_url(u: str) -> str:
     except Exception:
         return ""
 
+
 def _digits_only(s: str) -> str:
     return re.sub(r"[^0-9]", "", s or "")
+
 
 def _format_phone_10(digits: str) -> str:
     d = _digits_only(digits)
     if len(d) != 10:
         return ""
     return f"({d[0:3]}) {d[3:6]}-{d[6:10]}"
+
 
 def _validate_vendor_fields(
     business_name: str,
@@ -311,6 +309,7 @@ def _validate_vendor_fields(
 # -----------------------------
 # Help (single expander; Markdown)
 # -----------------------------
+
 def render_help():
     with st.expander(HELP_TITLE, expanded=False):
         if HELP_MD:
@@ -324,7 +323,9 @@ def render_help():
 # -----------------------------
 # Data access + Audit helpers
 # -----------------------------
+
 def _fetch_df() -> pd.DataFrame:
+    assert eng is not None, "Engine not initialized"
     with eng.connect() as c:
         df = pd.read_sql_query(sql_text("SELECT * FROM vendors"), c)
     # Ensure columns exist
@@ -333,41 +334,56 @@ def _fetch_df() -> pd.DataFrame:
             df[col] = ""
     return df[RAW_COLS + AUDIT_COLS]
 
+
 def _cats() -> pd.DataFrame:
+    assert eng is not None, "Engine not initialized"
     with eng.connect() as c:
         try:
             return pd.read_sql_query(sql_text("SELECT id, name FROM categories ORDER BY name COLLATE NOCASE"), c)
         except Exception:
             return pd.DataFrame(columns=["id", "name"]).astype({"id": int, "name": str})
 
+
 def _svcs() -> pd.DataFrame:
+    assert eng is not None, "Engine not initialized"
     with eng.connect() as c:
         try:
             return pd.read_sql_query(sql_text("SELECT id, name FROM services ORDER BY name COLLATE NOCASE"), c)
         except Exception:
             return pd.DataFrame(columns=["id", "name"]).astype({"id": int, "name": str})
 
+
 def _insert_vendor(row: Dict[str, str]):
+    assert eng is not None, "Engine not initialized"
     now = _now_iso()
     row2 = dict(row)
     row2["created_at"] = now
     row2["updated_at"] = now
     row2["updated_by"] = ADMIN_DISPLAY_NAME
-    q = sql_text("""
+    q = sql_text(
+        """
         INSERT INTO vendors(category, service, business_name, contact_name, phone, address, website, notes, keywords, created_at, updated_at, updated_by)
         VALUES(:category,:service,:business_name,:contact_name,:phone,:address,:website,:notes,:keywords,:created_at,:updated_at,:updated_by)
-    """)
+        """
+    )
     with eng.begin() as c:
-        res = c.execute(q, row2)
+        c.execute(q, row2)
         # vendor id
         vid = c.execute(sql_text("SELECT last_insert_rowid()")).scalar()
         # changelog insert
-        c.execute(sql_text("""
-            INSERT INTO vendor_changes(vendor_id, changed_at, changed_by, action, field, old_value, new_value)
-            VALUES(:vendor_id, :changed_at, :changed_by, 'insert', NULL, NULL, NULL)
-        """), {"vendor_id": vid, "changed_at": now, "changed_by": ADMIN_DISPLAY_NAME})
+        c.execute(
+            sql_text(
+                """
+                INSERT INTO vendor_changes(vendor_id, changed_at, changed_by, action, field, old_value, new_value)
+                VALUES(:vendor_id, :changed_at, :changed_by, 'insert', NULL, NULL, NULL)
+                """
+            ),
+            {"vendor_id": vid, "changed_at": now, "changed_by": ADMIN_DISPLAY_NAME},
+        )
+
 
 def _update_vendor(vid: int, new_row: Dict[str, str]):
+    assert eng is not None, "Engine not initialized"
     # compute diffs against current
     with eng.begin() as c:
         cur = c.execute(sql_text("SELECT * FROM vendors WHERE id = :id"), {"id": vid}).mappings().first()
@@ -384,46 +400,67 @@ def _update_vendor(vid: int, new_row: Dict[str, str]):
         for k, newv in new_row.items():
             oldv = cur.get(k, "")
             if (oldv or "") != (newv or ""):
-                c.execute(sql_text("""
-                    INSERT INTO vendor_changes(vendor_id, changed_at, changed_by, action, field, old_value, new_value)
-                    VALUES(:vendor_id, :changed_at, :changed_by, 'update', :field, :old_value, :new_value)
-                """), {
-                    "vendor_id": vid,
-                    "changed_at": now,
-                    "changed_by": ADMIN_DISPLAY_NAME,
-                    "field": k,
-                    "old_value": str(oldv) if oldv is not None else "",
-                    "new_value": str(newv) if newv is not None else "",
-                })
+                c.execute(
+                    sql_text(
+                        """
+                        INSERT INTO vendor_changes(vendor_id, changed_at, changed_by, action, field, old_value, new_value)
+                        VALUES(:vendor_id, :changed_at, :changed_by, 'update', :field, :old_value, :new_value)
+                        """
+                    ),
+                    {
+                        "vendor_id": vid,
+                        "changed_at": now,
+                        "changed_by": ADMIN_DISPLAY_NAME,
+                        "field": k,
+                        "old_value": str(oldv) if oldv is not None else "",
+                        "new_value": str(newv) if newv is not None else "",
+                    },
+                )
+
 
 def _delete_vendor(vid: int):
+    assert eng is not None, "Engine not initialized"
     now = _now_iso()
     with eng.begin() as c:
-        c.execute(sql_text("""
-            INSERT INTO vendor_changes(vendor_id, changed_at, changed_by, action, field, old_value, new_value)
-            VALUES(:vendor_id, :changed_at, :changed_by, 'delete', NULL, NULL, NULL)
-        """), {"vendor_id": vid, "changed_at": now, "changed_by": ADMIN_DISPLAY_NAME})
+        c.execute(
+            sql_text(
+                """
+                INSERT INTO vendor_changes(vendor_id, changed_at, changed_by, action, field, old_value, new_value)
+                VALUES(:vendor_id, :changed_at, :changed_by, 'delete', NULL, NULL, NULL)
+                """
+            ),
+            {"vendor_id": vid, "changed_at": now, "changed_by": ADMIN_DISPLAY_NAME},
+        )
         c.execute(sql_text("DELETE FROM vendors WHERE id = :id"), {"id": vid})
 
+
 def _upsert_category(name: str):
+    assert eng is not None, "Engine not initialized"
     with eng.begin() as c:
         c.execute(sql_text("INSERT OR IGNORE INTO categories(name) VALUES(:n)"), {"n": name.strip()})
 
+
 def _delete_category(name: str):
+    assert eng is not None, "Engine not initialized"
     with eng.begin() as c:
         c.execute(sql_text("DELETE FROM categories WHERE name = :n"), {"n": name.strip()})
 
+
 def _upsert_service(name: str):
+    assert eng is not None, "Engine not initialized"
     with eng.begin() as c:
         c.execute(sql_text("INSERT OR IGNORE INTO services(name) VALUES(:n)"), {"n": name.strip()})
 
+
 def _delete_service(name: str):
+    assert eng is not None, "Engine not initialized"
     with eng.begin() as c:
         c.execute(sql_text("DELETE FROM services WHERE name = :n"), {"n": name.strip()})
 
 # -----------------------------
 # Label mapping (display only)
 # -----------------------------
+
 def _apply_labels(df: pd.DataFrame) -> pd.DataFrame:
     if not LABEL_OVERRIDES:
         return df
@@ -433,8 +470,10 @@ def _apply_labels(df: pd.DataFrame) -> pd.DataFrame:
 # -----------------------------
 # VIEW tab
 # -----------------------------
+
 def _apply_table_css_for_view(df_raw_cols: List[str]):
     _apply_css(df_raw_cols)
+
 
 def tab_view():
     df = _fetch_df()
@@ -473,6 +512,7 @@ def tab_view():
 # -----------------------------
 # ADD tab (validators + audit)
 # -----------------------------
+
 def tab_add():
     cats = _cats()["name"].tolist()
     svcs = _svcs()["name"].tolist()
@@ -482,7 +522,7 @@ def tab_add():
         col = st.columns(2)
         with col[0]:
             business_name = st.text_input(f"**{LABEL_OVERRIDES.get('business_name','business_name')}** *", placeholder="Acme Plumbing")
-            category = st.selectbox(LABEL_OVERRIDES.get("category", "category"), options=sorted(cats))
+            category = st.selectbox(LABEL_OVERRIDES.get("category", "category"), options=sorted(cats) or [""])
             service = st.selectbox(LABEL_OVERRIDES.get("service", "service"), options=[""] + sorted(svcs))
             contact_name = st.text_input(LABEL_OVERRIDES.get("contact_name", "contact_name"))
             phone = st.text_input(LABEL_OVERRIDES.get("phone", "phone"), placeholder="(210) 555-0123 or 210-555-0123")
@@ -523,6 +563,7 @@ def tab_add():
 # -----------------------------
 # EDIT tab (validators + audit)
 # -----------------------------
+
 def tab_edit():
     df = _fetch_df()
     if df.empty:
@@ -547,11 +588,11 @@ def tab_edit():
     with st.form("edit_vendor_form"):
         col = st.columns(2)
         with col[0]:
-            row["business_name"] = st.text_input(LABEL_OVERRIDES.get("business_name", "business_name"), value=row["business_name"])
+            row["business_name"] = st.text_input(LABEL_OVERRIDES.get("business_name", "business_name"), value=row["business_name"]) 
             row["category"] = st.selectbox(
                 LABEL_OVERRIDES.get("category", "category"),
-                options=sorted(cats),
-                index=max(0, sorted(cats).index(row["category"]) if row["category"] in cats else 0),
+                options=sorted(cats) or [""],
+                index=max(0, (sorted(cats) or [""]).index(row["category"]) if row["category"] in cats else 0),
             )
             row["service"] = st.selectbox(
                 LABEL_OVERRIDES.get("service", "service"),
@@ -601,6 +642,7 @@ def tab_edit():
 # -----------------------------
 # DELETE tab (audited delete)
 # -----------------------------
+
 def tab_delete():
     df = _fetch_df()
     if df.empty:
@@ -623,6 +665,7 @@ def tab_delete():
 # -----------------------------
 # CATEGORIES ADMIN
 # -----------------------------
+
 def tab_categories():
     st.subheader("Categories Admin")
     cats = _cats()
@@ -641,6 +684,7 @@ def tab_categories():
 # -----------------------------
 # SERVICES ADMIN
 # -----------------------------
+
 def tab_services():
     st.subheader("Services Admin")
     svcs = _svcs()
@@ -659,37 +703,66 @@ def tab_services():
 # -----------------------------
 # MAINTENANCE
 # -----------------------------
+
 def tab_maintenance():
     st.subheader("Maintenance")
     st.caption("Quick utilities for data hygiene.")
     col = st.columns(2)
     with col[0]:
         if st.button("Normalize phone format to (xxx) xxx-xxxx"):
+            assert eng is not None, "Engine not initialized"
             with eng.begin() as c:
                 dfp = pd.read_sql_query(sql_text("SELECT id, phone FROM vendors"), c.connection)
                 for _, r in dfp.iterrows():
                     fmt = _format_phone_10(str(r.get("phone", "")))
                     if fmt and fmt != (r.get("phone") or ""):
-                        c.execute(sql_text(
-                            "UPDATE vendors SET phone = :phone, updated_at = :ua, updated_by = :ub WHERE id = :id"
-                        ), {"phone": fmt, "ua": _now_iso(), "ub": ADMIN_DISPLAY_NAME, "id": int(r["id"])})
-                        c.execute(sql_text("""
-                            INSERT INTO vendor_changes(vendor_id, changed_at, changed_by, action, field, old_value, new_value)
-                            VALUES(:vendor_id, :changed_at, :changed_by, 'update', 'phone', :old_value, :new_value)
-                        """), {"vendor_id": int(r["id"]), "changed_at": _now_iso(), "changed_by": ADMIN_DISPLAY_NAME,
-                               "old_value": str(r.get("phone") or ""), "new_value": fmt})
+                        c.execute(
+                            sql_text(
+                                "UPDATE vendors SET phone = :phone, updated_at = :ua, updated_by = :ub WHERE id = :id"
+                            ),
+                            {"phone": fmt, "ua": _now_iso(), "ub": ADMIN_DISPLAY_NAME, "id": int(r["id"])},
+                        )
+                        c.execute(
+                            sql_text(
+                                """
+                                INSERT INTO vendor_changes(vendor_id, changed_at, changed_by, action, field, old_value, new_value)
+                                VALUES(:vendor_id, :changed_at, :changed_by, 'update', 'phone', :old_value, :new_value)
+                                """
+                            ),
+                            {
+                                "vendor_id": int(r["id"]),
+                                "changed_at": _now_iso(),
+                                "changed_by": ADMIN_DISPLAY_NAME,
+                                "old_value": str(r.get("phone") or ""),
+                                "new_value": fmt,
+                            },
+                        )
             st.success("Phone numbers normalized where possible.")
     with col[1]:
         if st.button("Trim whitespace in text fields"):
+            assert eng is not None, "Engine not initialized"
             with eng.begin() as c:
-                for k in ["category", "service", "business_name", "contact_name", "address", "website", "notes", "keywords"]:
+                for k in [
+                    "category",
+                    "service",
+                    "business_name",
+                    "contact_name",
+                    "address",
+                    "website",
+                    "notes",
+                    "keywords",
+                ]:
                     c.execute(sql_text(f"UPDATE vendors SET {k} = TRIM({k})"))
-                c.execute(sql_text("UPDATE vendors SET updated_at = :ua, updated_by = :ub"), {"ua": _now_iso(), "ub": ADMIN_DISPLAY_NAME})
+                c.execute(
+                    sql_text("UPDATE vendors SET updated_at = :ua, updated_by = :ub"),
+                    {"ua": _now_iso(), "ub": ADMIN_DISPLAY_NAME},
+                )
             st.success("Whitespace trimmed.")
 
 # -----------------------------
 # CHANGELOG tab
 # -----------------------------
+
 def _fmt_when(s: str) -> str:
     # Show local-ish friendly format; leave as ISO if parsing fails
     try:
@@ -697,6 +770,7 @@ def _fmt_when(s: str) -> str:
         return dt.astimezone().strftime("%b %-d, %Y, %-I:%M %p")
     except Exception:
         return s
+
 
 def tab_changelog():
     st.subheader("Changelog")
@@ -707,14 +781,17 @@ def tab_changelog():
     with fcol2:
         user_filter = st.text_input("Filter by edited-by contains", "")
 
+    assert eng is not None, "Engine not initialized"
     with eng.connect() as c:
-        q = """
+        q = (
+            """
             SELECT vc.id, vc.vendor_id, vc.changed_at, vc.changed_by, vc.action, vc.field, vc.old_value, vc.new_value,
                    v.business_name
             FROM vendor_changes vc
             LEFT JOIN vendors v ON v.id = vc.vendor_id
             ORDER BY vc.changed_at DESC, vc.id DESC
-        """
+            """
+        )
         df = pd.read_sql_query(sql_text(q), c)
 
     if vendor_filter.strip():
@@ -737,7 +814,6 @@ def tab_changelog():
             field = r.get("field") or "field"
             oldv = r.get("old_value") or ""
             newv = r.get("new_value") or ""
-            # Compact old→new
             arrow = f"`{oldv}` → `{newv}`" if oldv or newv else ""
             lines.append(f"{when} — Updated **{field}** for **{name}** (by {by}) {arrow}")
         else:
@@ -749,46 +825,76 @@ def tab_changelog():
         st.markdown("\n\n".join(f"- {ln}" for ln in lines))
 
 # -----------------------------
-# Status & Secrets (debug) — END
+# Status & Secrets (debug)
 # -----------------------------
+
 def render_status_debug():
     with st.expander("Status & Secrets (debug)", expanded=False):
         backend = "libsql" if str(_read_secret("TURSO_DATABASE_URL", "")).startswith("sqlite+libsql://") else "sqlite"
         st.write("DB")
-        st.code({"backend": backend, "dsn": _read_secret("TURSO_DATABASE_URL", ""), "auth": "token_set" if bool(_read_secret("TURSO_AUTH_TOKEN")) else "none"})
+        st.code({
+            "backend": backend,
+            "dsn": _read_secret("TURSO_DATABASE_URL", ""),
+            "auth": "token_set" if bool(_read_secret("TURSO_AUTH_TOKEN")) else "none",
+        })
         try:
             keys = list(st.secrets.keys())
         except Exception:
             keys = []
-        st.write("Secrets keys (present)"); st.code(keys)
+        st.write("Secrets keys (present)")
+        st.code(keys or [])
         st.write("Help MD:", "present" if bool(HELP_MD) else "(missing or empty)")
         st.write("Sticky first col enabled:", STICKY_FIRST)
-        st.write("Raw COLUMN_WIDTHS_PX_READONLY (type)", type(COLUMN_WIDTHS).__name__); st.code(COLUMN_WIDTHS)
-        st.write("Column label overrides (if any)"); st.code(LABEL_OVERRIDES)
-        st.write("Admin display name:", ADMIN_DISPLAY_NAME)
+        st.write("Raw COLUMN_WIDTHS_PX_READONLY (type)", type(COLUMN_WIDTHS).__name__)
+        st.code(COLUMN_WIDTHS or {})
+        st.write("Column label overrides (if any)")
+        st.code(LABEL_OVERRIDES or {})
+        st.write("Admin display name:", _nz(ADMIN_DISPLAY_NAME, ""))
 
 # -----------------------------
 # Main
 # -----------------------------
+
 def main():
-    st.text("TOP-SENTINEL")  # ← add this line
+    # Initialize UI and DB **first** (no top-level side-effects)
+    _apply_layout()
+    global eng
+    eng = _engine()
+    _ensure_schema()
+
     render_help()
 
     tabs = st.tabs([
-        "View", "Add", "Edit", "Delete", "Categories Admin", "Services Admin", "Maintenance", "Changelog"
+        "View",
+        "Add",
+        "Edit",
+        "Delete",
+        "Categories Admin",
+        "Services Admin",
+        "Maintenance",
+        "Changelog",
     ])
 
-    with tabs[0]: tab_view()
-    with tabs[1]: tab_add()
-    with tabs[2]: tab_edit()
-    with tabs[3]: tab_delete()
-    with tabs[4]: tab_categories()
-    with tabs[5]: tab_services()
-    with tabs[6]: tab_maintenance()
-    with tabs[7]: tab_changelog()
+    with tabs[0]:
+        tab_view()
+    with tabs[1]:
+        tab_add()
+    with tabs[2]:
+        tab_edit()
+    with tabs[3]:
+        tab_delete()
+    with tabs[4]:
+        tab_categories()
+    with tabs[5]:
+        tab_services()
+    with tabs[6]:
+        tab_maintenance()
+    with tabs[7]:
+        tab_changelog()
 
     # Debug LAST
     render_status_debug()
+
 
 if __name__ == "__main__":
     main()
