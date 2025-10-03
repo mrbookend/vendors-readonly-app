@@ -1,7 +1,3 @@
-cd ~/vendors-readonly-app
-cp app_readonly.py app_readonly.py.bak 2>/dev/null || true
-
-cat > app_readonly.py <<'PY'
 # app_readonly.py — Providers Read-Only (v3.6)
 # Tabs: View | Categories | Services | Changelog
 # - No top-level Streamlit renders; init happens inside main()
