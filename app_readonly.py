@@ -4,10 +4,9 @@
 # - Wrapped cells; rows auto-grow in height
 # - Click-to-sort on every column (client-side)
 # - Quick filter (client-side)
-# - Optional sticky first column (id) via READONLY_STICKY_FIRST_COL
-# - Wide page layout via page_max_width_px
-# - Large Help modal sized by secrets
-
+# - Optional sticky first column (id) — default OFF
+# - Wide page layout with configurable max width via secrets
+# - Help modal (opens on click, iframe height expands while open)
 from __future__ import annotations
 
 import os
@@ -58,7 +57,7 @@ st.markdown(
 # -----------------------------
 # Config
 # -----------------------------
-STICKY_FIRST_COL_DEFAULT = False  # can be overridden by READONLY_STICKY_FIRST_COL
+STICKY_FIRST_COL_DEFAULT = False  # can be overridden by READONLY_STICKY_FIRST_COL in secrets
 
 # -----------------------------
 # Secrets helpers
@@ -262,7 +261,7 @@ def _render_sortable_wrapped_table(
     df: pd.DataFrame,
     px_map: Dict[str, int],
     height_px: int = 720,
-    sticky_first_col: bool = True,
+    sticky_first_col: bool = False,
 ) -> None:
     """
     Client-side sortable table with:
@@ -464,26 +463,64 @@ def _render_sortable_wrapped_table(
     components.html(html_doc, height=height_px, scrolling=True)
 
 # -----------------------------
-# Help modal content + renderer
+# Help modal content (secrets-driven)
 # -----------------------------
-st.title("Vendors (Read-only)")
-
-HELP_MD = """
-**How to use this table**
-
-- **Sort**: Click any column header. Click again to reverse (▲ / ▼).
-- **Filter**: Use the “Quick filter” above the table — matches any column.
-- **Wrap & row height**: Long text wraps; the row grows so everything is visible.
-- **Copy text**: Select text in a cell and press Ctrl/Cmd+C. Website links open in a new tab.
-- **Horizontal scroll**: Scroll the grid if columns are off-screen.
-- **Column widths**: Controlled in secrets (`[COLUMN_WIDTHS_PX_READONLY]` or `[COLUMN_WIDTHS_PX]`).
-"""
-
-HELP_HTML = f"""
+DEFAULT_HELP_HTML = """
 <div style="line-height:1.55;">
-  {HELP_MD.replace('**', '<strong>').replace('__','<u>').replace('*','')}
+  <h2 style="margin:0 0 10px;">Vendors — How to Use</h2>
+
+  <h3 style="margin:14px 0 6px;">Sorting</h3>
+  <ul>
+    <li>Click a column header to sort ascending; click again for descending (▲ / ▼).</li>
+    <li>Numeric columns sort numerically; others sort A→Z.</li>
+  </ul>
+
+  <h3 style="margin:14px 0 6px;">Filtering</h3>
+  <ul>
+    <li>Use the <strong>Quick filter</strong> box above the table.</li>
+    <li>It matches text across <em>all</em> columns.</li>
+  </ul>
+
+  <h3 style="margin:14px 0 6px;">Viewing Long Text</h3>
+  <ul>
+    <li>Cells wrap automatically; row height expands to fit content.</li>
+    <li>Scroll horizontally if a column is off-screen.</li>
+  </ul>
+
+  <h3 style="margin:14px 0 6px;">Copy & Links</h3>
+  <ul>
+    <li>Select text in any cell and press Ctrl/Cmd+C to copy.</li>
+    <li>Website values are clickable and open in a new tab.</li>
+  </ul>
+
+  <h3 style="margin:14px 0 6px;">Column Widths</h3>
+  <ul>
+    <li>Set pixel widths in <code>[COLUMN_WIDTHS_PX_READONLY]</code> in secrets.</li>
+    <li>Example: <code>address = 220</code>, <code>notes = 320</code>.</li>
+  </ul>
 </div>
 """
+
+DEFAULT_HELP_MD = """
+**How to use this table**
+- **Sort**: Click any column header; click again to reverse (▲ / ▼).
+- **Filter**: Use the Quick filter above the table (matches any column).
+- **Wrap**: Long text wraps; rows grow in height automatically.
+- **Copy**: Select & press Ctrl/Cmd+C. Links open in a new tab.
+"""
+
+# Choose help content: prefer full HTML from secrets; fallback to MD; else default HTML
+HELP_HTML = st.secrets.get("READONLY_HELP_HTML", None)
+if not HELP_HTML:
+    HELP_MD = st.secrets.get("READONLY_HELP_MD", DEFAULT_HELP_MD)
+    # very light "markdown" support
+    HELP_HTML = f"""
+    <div style="line-height:1.55;">
+      {HELP_MD.replace('**', '<strong>').replace('__','<u>').replace('*','')}
+    </div>
+    """
+if not HELP_HTML:
+    HELP_HTML = DEFAULT_HELP_HTML
 
 def _help_modal_dims_from_secrets():
     def _get(name, default):
@@ -493,49 +530,43 @@ def _help_modal_dims_from_secrets():
         except Exception:
             pass
         return default
-    try:
-        width_px = int(_get("READONLY_HELP_WIDTH_PX", 900))
-    except Exception:
-        width_px = 900
-    try:
-        max_h_vh = int(_get("READONLY_HELP_MAX_H_VH", 90))
-    except Exception:
-        max_h_vh = 90
-    try:
-        font_px  = int(_get("READONLY_HELP_FONT_PX", 14))
-    except Exception:
-        font_px  = 14
+    try:    width_px = int(_get("READONLY_HELP_WIDTH_PX", 900))   # modal width cap
+    except: width_px = 900
+    try:    max_h_vh = int(_get("READONLY_HELP_MAX_H_VH", 90))    # modal max height in vh
+    except: max_h_vh = 90
+    try:    font_px  = int(_get("READONLY_HELP_FONT_PX", 14))     # body font size
+    except: font_px  = 14
     return width_px, max_h_vh, font_px
 
 def _render_help(style: str = "modal"):
     style = (style or "modal").strip().lower()
     if style != "modal":
-        # Optional alternate styles
+        # fallback to expander or popover if desired
         try:
             if style == "popover" and hasattr(st, "popover"):
                 with st.popover("Help"):
-                    st.markdown(HELP_MD)
+                    st.markdown(HELP_HTML, unsafe_allow_html=True)
                 return
         except Exception:
             pass
         with st.expander("Help / Tips", expanded=False):
-            st.markdown(HELP_MD)
+            st.markdown(HELP_HTML, unsafe_allow_html=True)
         return
 
-    # Modal implementation (HTML/CSS/JS)
-    import uuid
-    w, mh, fs = _help_modal_dims_from_secrets()
-    uid = f"help_{uuid.uuid4().hex[:8]}"
-    _page_h = int(st.secrets.get("READONLY_HELP_IFRAME_H_PX", 900))
-
-        # Modal implementation (HTML/CSS/JS) — dynamic iframe height
+    # Modal implementation (HTML/CSS/JS) — dynamic iframe height
     import uuid
     w, mh, fs = _help_modal_dims_from_secrets()
     uid = f"help_{uuid.uuid4().hex[:8]}"
 
     # Closed/open iframe heights (can be overridden via secrets)
-    closed_h = int(st.secrets.get("READONLY_HELP_IFRAME_H_CLOSED_PX", 56))   # just the button
-    open_h   = int(st.secrets.get("READONLY_HELP_IFRAME_H_PX", 900))         # tall when modal open
+    try:
+        closed_h = int(st.secrets.get("READONLY_HELP_IFRAME_H_CLOSED_PX", 56))
+    except Exception:
+        closed_h = 56
+    try:
+        open_h = int(st.secrets.get("READONLY_HELP_IFRAME_H_PX", 1000))
+    except Exception:
+        open_h = 1000
 
     components.html(
         f'''
@@ -643,19 +674,19 @@ def _render_help(style: str = "modal"):
   }})();
 </script>
 ''',
-        height=closed_h,   # compact when closed
+        height=56,   # compact when closed (just the button visible)
         scrolling=False,
     )
 
+# -----------------------------
+# App UI
+# -----------------------------
+st.title("Vendors (Read-only)")
 
-# Choose style via secrets (defaults to modal)
+# Help control via secrets (defaults to modal)
 _help_style = str(st.secrets.get("READONLY_HELP_STYLE", "modal")).lower()
 _render_help(_help_style)
-# ---- end Help modal ----
 
-# -----------------------------
-# Debug expander (optional)
-# -----------------------------
 with st.expander("Status & Secrets (debug)", expanded=False):
     st.write("**DB**", current_db_info())
     try:
@@ -680,11 +711,10 @@ with st.expander("Status & Secrets (debug)", expanded=False):
     except Exception as e:
         st.write("Debug error:", str(e))
 
-# -----------------------------
-# Data + Grid render
-# -----------------------------
+# Load data
 df = load_vendors_df()
 
+# Column order to display
 desired = ["business_name","category","service","contact_name",
            "phone","address","website","notes","keywords"]
 show_cols = [c for c in df.columns if c in desired]
@@ -696,12 +726,12 @@ else:
     df_view = df[columns_order].copy()
     widths_px = _get_column_widths_px()
 
-    # Render once (avoid accidental doubles)
+    # Prevent accidental double-render in Streamlit re-run edge cases
     if not st.session_state.get("_rendered_grid_once"):
         st.session_state["_rendered_grid_once"] = True
         _render_sortable_wrapped_table(
             df_view,
             widths_px,
-            height_px=int(st.secrets.get("READONLY_GRID_HEIGHT_PX", 720)),  # optional secret
-            sticky_first_col=_sticky_first_col_enabled(),
+            height_px=720,  # viewport height
+            sticky_first_col=_sticky_first_col_enabled(),  # defaults to False unless enabled in secrets
         )
