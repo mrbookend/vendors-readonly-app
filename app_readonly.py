@@ -460,7 +460,12 @@ def _render_sortable_wrapped_table(
         + "</div>"
     )
 
-    components.html(html_doc, height=height_px, scrolling=True)
+ # Before (likely 60)
+# components.html(f""" ... """, height=60, scrolling=False)
+
+# After (secret-driven, with sensible default)
+_page_h = int(st.secrets.get("READONLY_HELP_IFRAME_H_PX", 900))  # px
+components.html(f""" ... """, height=_page_h, scrolling=False)
 
 # -----------------------------
 # App UI
