@@ -657,15 +657,13 @@ if df.empty:
 else:
     df_view = df[columns_order].copy()
     widths_px = _get_column_widths_px()
-    _render_sortable_wrapped_table(
-        df_view,
-        widths_px,
-        height_px=720,                          # viewport height
-        sticky_first_col=_sticky_first_col_enabled(),
-    )
-_render_sortable_wrapped_table(
-    df_view,
-    widths_px,
-    height_px=720,
-    sticky_first_col=False,   # force off
-)
+
+    # Prevent accidental double-render
+    if not st.session_state.get("_rendered_grid_once"):
+        st.session_state["_rendered_grid_once"] = True
+        _render_sortable_wrapped_table(
+            df_view,
+            widths_px,
+            height_px=720,  # viewport height
+            sticky_first_col=_sticky_first_col_enabled(),  # defaults to False per your config
+        )
