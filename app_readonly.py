@@ -1,44 +1,36 @@
-# app_readonly.py — Providers Read-Only (v3.6)
-# Tabs: View | Categories | Services | Changelog
-# - No top-level Streamlit renders; init happens inside main()
-# - Read-only: NEVER mutates DB (no schema changes, no writes)
-# - Debug panel gated via ADMIN_DEBUG (secrets/env)
-# - Cross-platform timestamp formatting, CSS widths/sticky, link column
-# - Cached lookups for categories/services
+# app_readonly.py — HCR Vendors (Read-Only) v3.4 with st_aggrid auto-height
+# - Labels, widths, Help all come from secrets (same as Admin)
+# - Real auto-expanding rows via st_aggrid (wrapText + autoHeight); falls back to st.dataframe if not installed
+# - Website column shows "Website" (clickable) only if URL is valid; adjacent "Website URL" shows the full link
+# - CSV download; Status & Secrets (debug) at end
+# - No edits/audit here — strictly read-only
 
 from __future__ import annotations
 
 import os
-import re
+from urllib.parse import urlparse
 from typing import Dict, List
 
 import pandas as pd
 import streamlit as st
 from sqlalchemy import create_engine
 from sqlalchemy.sql import text as sql_text
-from sqlalchemy.engine import Engine
-from urllib.parse import urlparse
-from datetime import datetime, timezone
 
-# Global engine placeholder (initialized in main())
-eng: Engine | None = None
+# Try to load st_aggrid (auto-expand rows)
+try:
+    from st_aggrid import AgGrid, GridOptionsBuilder, JsCode, GridUpdateMode, ColumnsAutoSizeMode
+    _AGGRID_AVAILABLE = True
+except Exception:
+    _AGGRID_AVAILABLE = False
+
 
 # -----------------------------
 # Secrets / env helpers
 # -----------------------------
 def _read_secret(name: str, default=None):
-    """
-    Read from Streamlit secrets first (if available), then environment.
-    Robust to missing st.secrets.
-    """
     try:
-        s = getattr(st, "secrets", None)
-        if s is not None:
-            try:
-                if name in s:
-                    return s[name]
-            except Exception:
-                pass
+        if name in st.secrets:
+            return st.secrets[name]
     except Exception:
         pass
     return os.environ.get(name, default)
@@ -50,42 +42,13 @@ def _get_bool(val, default=False):
         return val.strip().lower() in ("1", "true", "yes", "on")
     return bool(default)
 
-def _now_iso() -> str:
-    # UTC ISO 8601 (seconds precision)
-    return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
-
-def _digits_only(s: str) -> str:
-    return re.sub(r"[^0-9]", "", s or "")
-
-def _format_phone_10(digits: str) -> str:
-    d = _digits_only(digits)
-    if len(d) != 10:
-        return ""
-    return f"({d[0:3]}) {d[3:6]}-{d[6:10]}"
-
-def _normalize_url(u: str) -> str:
-    """Return normalized URL or empty string if invalid."""
-    s = (u or "").strip()
-    if not s:
-        return ""
-    if not s.lower().startswith(("http://", "https://")):
-        s = "http://" + s
-    try:
-        p = urlparse(s)
-        if p.scheme not in ("http", "https"):
-            return ""
-        if not p.netloc or "." not in p.netloc:
-            return ""
-        return s
-    except Exception:
-        return ""
 
 # -----------------------------
-# Page config
+# Page config / layout
 # -----------------------------
 def _apply_layout():
     st.set_page_config(
-        page_title=_read_secret("page_title", "HCR Providers"),
+        page_title=_read_secret("page_title", "HCR Vendors (Read-Only)"),
         layout="wide",
         initial_sidebar_state=_read_secret("sidebar_state", "expanded"),
     )
@@ -103,12 +66,15 @@ def _apply_layout():
         unsafe_allow_html=True,
     )
 
+_apply_layout()
+
+
 # -----------------------------
-# Global config from secrets
+# Config from secrets
 # -----------------------------
 LABEL_OVERRIDES: Dict[str, str] = _read_secret("READONLY_COLUMN_LABELS", {}) or {}
-COLUMN_WIDTHS: Dict[str, int] = _read_secret("COLUMN_WIDTHS_PX_READONLY", {}) or {}
-STICKY_FIRST: bool = _get_bool(_read_secret("READONLY_STICKY_FIRST_COL", False), False)
+COLUMN_WIDTHS: Dict[str, int]   = _read_secret("COLUMN_WIDTHS_PX_READONLY", {}) or {}
+STICKY_FIRST: bool              = _get_bool(_read_secret("READONLY_STICKY_FIRST_COL", False), False)
 
 HELP_TITLE: str = (
     _read_secret("READONLY_HELP_TITLE")
@@ -125,53 +91,33 @@ HELP_DEBUG: bool = _get_bool(
     _get_bool(LABEL_OVERRIDES.get("readonly_help_debug"), False),
 )
 
-# Gate the debug panel (strict boolean parsing)
-SHOW_DEBUG = _get_bool(_read_secret("ADMIN_DEBUG", False), False)
+RAW_COLS = ["id","business_name","category","service","contact_name","phone","address","website","notes","keywords"]
 
-# Columns expected from vendors table
-RAW_COLS = [
-    "id",
-    "category",
-    "service",
-    "business_name",
-    "contact_name",
-    "phone",
-    "address",
-    "website",
-    "notes",
-    "keywords",
-]
-AUDIT_COLS = ["created_at", "updated_at", "updated_by"]  # may or may not be present
 
 # -----------------------------
-# Engine (read-only app still needs a connection)
+# Engine (Turso/libSQL with fallback)
 # -----------------------------
-def _engine() -> Engine:
-    url = _read_secret(
-        "TURSO_DATABASE_URL",
-        "sqlite+libsql://vendors-prod-mrbookend.aws-us-west-2.turso.io?secure=true",
-    )
+def _engine():
+    url = _read_secret("TURSO_DATABASE_URL", "sqlite+libsql://vendors-prod-mrbookend.aws-us-west-2.turso.io?secure=true")
     token = _read_secret("TURSO_AUTH_TOKEN", None)
     if isinstance(url, str) and url.startswith("sqlite+libsql://"):
         try:
-            eng_local = create_engine(
-                url,
-                connect_args={"auth_token": token} if token else {},
-                pool_pre_ping=True,
-            )
-            with eng_local.connect() as c:
+            eng = create_engine(url, connect_args={"auth_token": token} if token else {}, pool_pre_ping=True)
+            with eng.connect() as c:
                 c.execute(sql_text("SELECT 1"))
-            return eng_local
+            return eng
         except Exception as e:
-            # Don’t crash—fall back to local file if present
             st.warning(f"Turso connection failed ({e}). Falling back to local SQLite vendors.db.")
     local = "/mount/src/vendors-readonly-app/vendors.db"
     if not os.path.exists(local):
         local = "vendors.db"
     return create_engine(f"sqlite:///{local}")
 
+eng = _engine()
+
+
 # -----------------------------
-# CSS widths / sticky
+# CSS (applies to fallback table only; aggrid handles its own)
 # -----------------------------
 def _apply_css(field_order: List[str]):
     rules = []
@@ -211,8 +157,29 @@ def _apply_css(field_order: List[str]):
         unsafe_allow_html=True,
     )
 
+
 # -----------------------------
-# Help (single expander; Markdown)
+# URL helper
+# -----------------------------
+def _normalize_url(u: str) -> str:
+    s = (u or "").strip()
+    if not s:
+        return ""
+    if not s.lower().startswith(("http://","https://")):
+        s = "http://" + s
+    try:
+        p = urlparse(s)
+        if p.scheme not in ("http","https"):
+            return ""
+        if not p.netloc or "." not in p.netloc:
+            return ""
+        return s
+    except Exception:
+        return ""
+
+
+# -----------------------------
+# Help
 # -----------------------------
 def render_help():
     with st.expander(HELP_TITLE, expanded=False):
@@ -224,82 +191,135 @@ def render_help():
         else:
             st.info("No help content has been configured yet.")
 
+
 # -----------------------------
-# Data access (strictly read-only)
+# Data access
 # -----------------------------
 def _fetch_df() -> pd.DataFrame:
-    assert eng is not None, "Engine not initialized"
     with eng.connect() as c:
         df = pd.read_sql_query(sql_text("SELECT * FROM vendors"), c)
-    # Ensure columns exist for display
-    for col in RAW_COLS + AUDIT_COLS:
+    for col in RAW_COLS:
         if col not in df.columns:
             df[col] = ""
-    # Preserve column order but tolerate missing audit cols in DB
-    desired = [c for c in (RAW_COLS + AUDIT_COLS) if c in df.columns]
-    return df[desired]
+    return df[RAW_COLS]
 
-@st.cache_data(ttl=30)
-def _cats_cached():
-    assert eng is not None, "Engine not initialized"
-    with eng.connect() as c:
-        try:
-            return pd.read_sql_query(sql_text("SELECT id, name FROM categories ORDER BY name COLLATE NOCASE"), c)
-        except Exception:
-            return pd.DataFrame(columns=["id", "name"]).astype({"id": int, "name": str})
-
-@st.cache_data(ttl=30)
-def _svcs_cached():
-    assert eng is not None, "Engine not initialized"
-    with eng.connect() as c:
-        try:
-            return pd.read_sql_query(sql_text("SELECT id, name FROM services ORDER BY name COLLATE NOCASE"), c)
-        except Exception:
-            return pd.DataFrame(columns=["id", "name"]).astype({"id": int, "name": str})
-
-def _cats() -> pd.DataFrame:
-    return _cats_cached()
-
-def _svcs() -> pd.DataFrame:
-    return _svcs_cached()
-
-# -----------------------------
-# Label mapping (display only)
-# -----------------------------
 def _apply_labels(df: pd.DataFrame) -> pd.DataFrame:
     if not LABEL_OVERRIDES:
         return df
-    mapping = {k: v for k, v in LABEL_OVERRIDES.items() if k in df.columns and isinstance(v, str) and v}
+    mapping = {k:v for k,v in LABEL_OVERRIDES.items() if k in df.columns and isinstance(v,str) and v}
     return df.rename(columns=mapping)
 
-# -----------------------------
-# VIEW tab
-# -----------------------------
-def _apply_table_css_for_view(df_raw_cols: List[str]):
-    _apply_css(df_raw_cols)
 
-def tab_view():
-    try:
-        df = _fetch_df()
-    except Exception as e:
-        st.error(f"Failed to load vendors table: {e}")
+# -----------------------------
+# AG Grid renderer (autoHeight)
+# -----------------------------
+def _aggrid_view(df_show: pd.DataFrame, website_label: str = "website"):
+    """Render DataFrame with st_aggrid using wrap + autoHeight rows and a clickable Website cell."""
+    if df_show.empty:
+        st.info("No rows to display.")
         return
 
-    df_show = _apply_labels(df)
-    _apply_table_css_for_view([c for c in df.columns if c in COLUMN_WIDTHS or c in RAW_COLS])
+    # Detect displayed 'website' column name (handles label overrides)
+    website_key = website_label
+    if website_key not in df_show.columns:
+        for c in df_show.columns:
+            if c.lower() == "website":
+                website_key = c
+                break
 
-    # Website link with adjacent full URL column
-    website_key = LABEL_OVERRIDES.get("website", "website")
+    # Insert normalized URL column to the right of the Website column (if present)
     _df = df_show.copy()
+    norm = None
+    url_col = None
     if website_key in _df.columns:
-        try:
-            base_col = "website" if "website" in df.columns else website_key
-            norm = df[base_col].apply(_normalize_url) if base_col in df.columns else _df[website_key].apply(_normalize_url)
-            url_col = f"{website_key} URL" if website_key.lower() != "website" else "Website URL"
-            w_idx = _df.columns.get_loc(website_key)
-            _df.insert(w_idx + 1, url_col, norm)
-            # Use LinkColumn if available (Streamlit >=1.29), else plain dataframe
+        # If the raw website column exists, use it to normalize; else use the displayed column
+        raw_guess = "website"
+        if raw_guess in _df.columns:
+            norm = _df[raw_guess].map(_normalize_url)
+        else:
+            norm = _df[website_key].map(_normalize_url)
+        url_col = f"{website_key} URL" if website_key.lower() != "website" else "Website URL"
+        widx = _df.columns.get_loc(website_key)
+        _df.insert(widx + 1, url_col, norm)
+
+    gob = GridOptionsBuilder.from_dataframe(_df)
+    gob.configure_default_column(
+        resizable=True,
+        sortable=True,
+        filter=True,
+        wrapText=True,
+        autoHeight=True,
+        cellStyle={"white-space": "normal"}
+    )
+
+    # Map raw width config to displayed names
+    display_to_raw = {}
+    for raw, disp in LABEL_OVERRIDES.items():
+        if isinstance(disp, str) and disp:
+            display_to_raw[disp] = raw
+    for col in _df.columns:
+        raw_key = display_to_raw.get(col, col)
+        px = COLUMN_WIDTHS.get(raw_key)
+        if px:
+            gob.configure_column(col, width=px)
+
+    # Clickable website cell (only if we created a URL column)
+    if norm is not None and website_key in _df.columns:
+        link_renderer = JsCode("""
+            function(params){
+                const col = '""" + (url_col or "") + """';
+                const url = params.data && params.data[col] ? params.data[col] : "";
+                if (!url) return "";
+                return `<a href="${url}" target="_blank" rel="noopener noreferrer">Website</a>`;
+            }
+        """)
+        gob.configure_column(website_key, cellRenderer=link_renderer)
+
+    grid_options = gob.build()
+    grid_options["domLayout"] = "autoHeight"  # real auto-expanded rows
+
+    AgGrid(
+        _df,
+        gridOptions=grid_options,
+        update_mode=GridUpdateMode.NO_UPDATE,
+        fit_columns_on_grid_load=False,
+        allow_unsafe_jscode=True,
+        enable_enterprise_modules=False,
+        columns_auto_size_mode=ColumnsAutoSizeMode.FIT_CONTENTS,
+        height=400,  # ignored with autoHeight, but required by API
+    )
+
+
+# -----------------------------
+# View body
+# -----------------------------
+def render_view():
+    df = _fetch_df()
+    df_show = _apply_labels(df)
+
+    # CSV download (first; grid can be tall)
+    st.download_button(
+        label="Download Providers (CSV)",
+        data=df_show.to_csv(index=False).encode("utf-8"),
+        file_name="providers_readonly.csv",
+        mime="text/csv",
+    )
+
+    if _AGGRID_AVAILABLE:
+        _aggrid_view(df_show, website_label=LABEL_OVERRIDES.get("website", "website"))
+    else:
+        # Fallback table (no true auto-height)
+        st.warning("`streamlit-aggrid` not installed — showing basic table without auto-expanding rows.")
+        website_key = LABEL_OVERRIDES.get("website", "website")
+        _df = df_show.copy()
+        if website_key in _df.columns:
             try:
+                base_col = "website" if "website" in df.columns else website_key
+                norm = df[base_col].apply(_normalize_url) if base_col in df.columns else _df[website_key].apply(_normalize_url)
+                url_col = f"{website_key} URL" if website_key.lower() != "website" else "Website URL"
+                w_idx = _df.columns.get_loc(website_key)
+                _df.insert(w_idx + 1, url_col, norm)
+                _apply_css(df.columns.tolist())
                 st.dataframe(
                     _df.assign(**{website_key: norm}),
                     use_container_width=True,
@@ -307,161 +327,51 @@ def tab_view():
                     column_config={website_key: st.column_config.LinkColumn(display_text="Website")},
                 )
             except Exception:
+                _apply_css(df.columns.tolist())
                 st.dataframe(_df, use_container_width=True, hide_index=True)
-        except Exception:
-            st.dataframe(_df, use_container_width=True, hide_index=True)
-    else:
-        st.dataframe(_df, use_container_width=True, hide_index=True)
-
-    st.download_button(
-        label="Download Providers (CSV)",
-        data=df_show.to_csv(index=False).encode("utf-8"),
-        file_name="providers_readonly_view.csv",
-        mime="text/csv",
-    )
-
-# -----------------------------
-# CATEGORIES tab (read-only)
-# -----------------------------
-def tab_categories():
-    st.subheader("Categories")
-    cats = _cats()
-    st.dataframe(cats, use_container_width=True, hide_index=True)
-
-# -----------------------------
-# SERVICES tab (read-only)
-# -----------------------------
-def tab_services():
-    st.subheader("Services")
-    svcs = _svcs()
-    st.dataframe(svcs, use_container_width=True, hide_index=True)
-
-# -----------------------------
-# CHANGELOG tab (read-only)
-# -----------------------------
-def _fmt_when(s: str) -> str:
-    """Human-friendly local time; works on Windows/macOS/Linux."""
-    try:
-        dt = datetime.fromisoformat(s.replace("Z", "+00:00")).astimezone()
-        out = dt.strftime("%b %d, %Y, %I:%M %p")
-        return out.replace(" 0", " ")
-    except Exception:
-        return s
-
-def tab_changelog():
-    st.subheader("Changelog")
-    fcol1, fcol2 = st.columns(2)
-    with fcol1:
-        vendor_filter = st.text_input("Filter by vendor name contains", "")
-    with fcol2:
-        user_filter = st.text_input("Filter by edited-by contains", "")
-
-    assert eng is not None, "Engine not initialized"
-    with eng.connect() as c:
-        try:
-            q = """
-                SELECT vc.id, vc.vendor_id, vc.changed_at, vc.changed_by, vc.action, vc.field, vc.old_value, vc.new_value,
-                       v.business_name
-                FROM vendor_changes vc
-                LEFT JOIN vendors v ON v.id = vc.vendor_id
-                ORDER BY vc.changed_at DESC, vc.id DESC
-            """
-            df = pd.read_sql_query(sql_text(q), c)
-        except Exception:
-            st.info("No changelog available (vendor_changes table missing or inaccessible).")
-            return
-
-    if vendor_filter.strip():
-        df = df[df["business_name"].fillna("").str.contains(vendor_filter.strip(), case=False, na=False)]
-    if user_filter.strip():
-        df = df[df["changed_by"].fillna("").str.contains(user_filter.strip(), case=False, na=False)]
-
-    lines = []
-    for _, r in df.iterrows():
-        when = _fmt_when(str(r["changed_at"]))
-        by = r.get("changed_by") or "unknown"
-        name = r.get("business_name") or f"Vendor #{r.get('vendor_id')}"
-        action = r.get("action")
-        if action == "insert":
-            lines.append(f"{when} — Added **{name}** (by {by})")
-        elif action == "delete":
-            lines.append(f"{when} — Deleted **{name}** (by {by})")
-        elif action == "update":
-            field = r.get("field") or "field"
-            oldv = r.get("old_value") or ""
-            newv = r.get("new_value") or ""
-            arrow = f"`{oldv}` → `{newv}`" if oldv or newv else ""
-            lines.append(f"{when} — Updated **{field}** for **{name}** (by {by}) {arrow}")
         else:
-            lines.append(f"{when} — Change on **{name}** (by {by})")
+            _apply_css(df.columns.tolist())
+            st.dataframe(_df, use_container_width=True, hide_index=True)
 
-    if not lines:
-        st.info("No changes recorded yet.")
-    else:
-        st.markdown("\n\n".join(f"- {ln}" for ln in lines))
 
 # -----------------------------
-# Status & Secrets (debug) — gated
+# Status & Secrets (debug) — END
 # -----------------------------
 def render_status_debug():
     with st.expander("Status & Secrets (debug)", expanded=False):
         backend = "libsql" if str(_read_secret("TURSO_DATABASE_URL", "")).startswith("sqlite+libsql://") else "sqlite"
         st.write("DB")
-        st.code({
-            "backend": backend,
-            "dsn": _read_secret("TURSO_DATABASE_URL", ""),
-            "auth": "token_set" if bool(_read_secret("TURSO_AUTH_TOKEN")) else "none",
-        })
+        st.code(
+            {
+                "backend": backend,
+                "dsn": _read_secret("TURSO_DATABASE_URL",""),
+                "auth": "token_set" if bool(_read_secret("TURSO_AUTH_TOKEN")) else "none",
+            }
+        )
         try:
             keys = list(st.secrets.keys())
         except Exception:
             keys = []
         st.write("Secrets keys (present)")
-        st.code(keys or [])
+        st.code(keys)
         st.write("Help MD:", "present" if bool(HELP_MD) else "(missing or empty)")
         st.write("Sticky first col enabled:", STICKY_FIRST)
         st.write("Raw COLUMN_WIDTHS_PX_READONLY (type)", type(COLUMN_WIDTHS).__name__)
-        st.code(COLUMN_WIDTHS or {})
+        st.code(COLUMN_WIDTHS)
         st.write("Column label overrides (if any)")
-        st.code(LABEL_OVERRIDES or {})
+        st.code(LABEL_OVERRIDES)
+
 
 # -----------------------------
 # Main
 # -----------------------------
 def main():
-    _apply_layout()
-    global eng
-    eng = _engine()
-
-    # Health check (no writes)
-    try:
-        with eng.connect() as c:
-            c.execute(sql_text("SELECT 1"))
-    except Exception as e:
-        st.error(f"DB health check failed: {e}")
-        st.stop()
-
     render_help()
+    st.header("View", anchor=False)
+    render_view()
 
-    tabs = st.tabs([
-        "View",
-        "Categories",
-        "Services",
-        "Changelog",
-    ])
-
-    with tabs[0]:
-        tab_view()
-    with tabs[1]:
-        tab_categories()
-    with tabs[2]:
-        tab_services()
-    with tabs[3]:
-        tab_changelog()
-
-    # Debug LAST (gated)
-    if SHOW_DEBUG:
-        render_status_debug()
+    # Debug LAST
+    render_status_debug()
 
 if __name__ == "__main__":
     main()
