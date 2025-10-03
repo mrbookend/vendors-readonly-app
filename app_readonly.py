@@ -214,70 +214,66 @@ def _apply_labels(df: pd.DataFrame) -> pd.DataFrame:
 # AG Grid renderer (autoHeight)
 # -----------------------------
 def _aggrid_view(df_show: pd.DataFrame, website_label: str = "website"):
-    """Render DataFrame with st_aggrid using wrap + autoHeight rows and a clickable Website cell."""
+    """AgGrid with wrapped cells and autoHeight ONLY on long-text columns, using a normal scrollable grid."""
     if df_show.empty:
         st.info("No rows to display.")
         return
 
-    # Detect displayed 'website' column name (handles label overrides)
-    website_key = website_label
-    if website_key not in df_show.columns:
-        for c in df_show.columns:
-            if c.lower() == "website":
-                website_key = c
-                break
+    # Detect displayed website column (handles label overrides)
+    website_key = website_label if website_label in df_show.columns else next((c for c in df_show.columns if c.lower()=="website"), None)
 
-    # Insert normalized URL column to the right of the Website column (if present)
+    # Build display DF + normalized URL column to the right of website
     _df = df_show.copy()
-    norm = None
     url_col = None
-    if website_key in _df.columns:
-        # If the raw website column exists, use it to normalize; else use the displayed column
-        raw_guess = "website"
-        if raw_guess in _df.columns:
-            norm = _df[raw_guess].map(_normalize_url)
-        else:
-            norm = _df[website_key].map(_normalize_url)
+    if website_key:
+        norm = _df.get("website", _df[website_key]).map(_normalize_url)
         url_col = f"{website_key} URL" if website_key.lower() != "website" else "Website URL"
         widx = _df.columns.get_loc(website_key)
         _df.insert(widx + 1, url_col, norm)
 
     gob = GridOptionsBuilder.from_dataframe(_df)
+
+    # Base column config
     gob.configure_default_column(
         resizable=True,
         sortable=True,
         filter=True,
-        wrapText=True,
-        autoHeight=True,
-        cellStyle={"white-space": "normal"}
+        wrapText=False,      # default: no wrap (keeps rows compact)
+        autoHeight=False,    # default: fixed row height
     )
 
+    # Columns that should wrap and auto-height
+    long_cols = {"notes", "address"}
+    if url_col:
+        long_cols.add(url_col)
+
     # Map raw width config to displayed names
-    display_to_raw = {}
-    for raw, disp in LABEL_OVERRIDES.items():
-        if isinstance(disp, str) and disp:
-            display_to_raw[disp] = raw
+    display_to_raw = {disp: raw for raw, disp in LABEL_OVERRIDES.items() if isinstance(disp, str) and disp}
     for col in _df.columns:
         raw_key = display_to_raw.get(col, col)
         px = COLUMN_WIDTHS.get(raw_key)
         if px:
             gob.configure_column(col, width=px)
 
-    # Clickable website cell (only if we created a URL column)
-    if norm is not None and website_key in _df.columns:
-        link_renderer = JsCode("""
-            function(params){
-                const col = '""" + (url_col or "") + """';
-                const url = params.data && params.data[col] ? params.data[col] : "";
+        # Enable wrapping/autoHeight only on long text columns
+        if col.lower() in long_cols:
+            gob.configure_column(col, wrapText=True, autoHeight=True, cellStyle={"white-space": "normal"})
+
+    # Clickable "Website" label (only if we created URL column)
+    if website_key and url_col:
+        link_renderer = JsCode(f"""
+            function(params){{
+                const url = params.data["{url_col}"] || "";
                 if (!url) return "";
-                return `<a href="${url}" target="_blank" rel="noopener noreferrer">Website</a>`;
-            }
+                return `<a href="${{url}}" target="_blank" rel="noopener noreferrer">Website</a>`;
+            }}
         """)
         gob.configure_column(website_key, cellRenderer=link_renderer)
 
     grid_options = gob.build()
-    grid_options["domLayout"] = "autoHeight"  # real auto-expanded rows
 
+    # IMPORTANT: use normal layout (scroll inside grid) so heights are stable
+    # We also set a reasonable grid height; adjust if you want more/less visible rows
     AgGrid(
         _df,
         gridOptions=grid_options,
@@ -286,7 +282,8 @@ def _aggrid_view(df_show: pd.DataFrame, website_label: str = "website"):
         allow_unsafe_jscode=True,
         enable_enterprise_modules=False,
         columns_auto_size_mode=ColumnsAutoSizeMode.FIT_CONTENTS,
-        height=400,  # ignored with autoHeight, but required by API
+        height=600,     # scrollable grid; no domLayout:'autoHeight'
+        theme="streamlit",
     )
 
 
