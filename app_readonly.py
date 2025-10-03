@@ -4,8 +4,9 @@
 # - Wrapped cells; rows auto-grow in height
 # - Click-to-sort on every column (client-side)
 # - Quick filter (client-side)
-# - Optional sticky first column (id)
-# - Wide page layout with configurable max width via secrets
+# - Optional sticky first column (id) via READONLY_STICKY_FIRST_COL
+# - Wide page layout via page_max_width_px
+# - Large Help modal sized by secrets
 
 from __future__ import annotations
 
@@ -31,7 +32,7 @@ def _read_secret_early(name: str, default=None):
         pass
     return os.environ.get(name, default)
 
-_title   = _read_secret_early("page_title", "Vendors")
+_title   = _read_secret_early("page_title", "Vendors (Read-only)")
 _sidebar = _read_secret_early("sidebar_state", "collapsed")  # "collapsed" | "expanded"
 _max_w   = _read_secret_early("page_max_width_px", 3000)
 try:
@@ -57,7 +58,7 @@ st.markdown(
 # -----------------------------
 # Config
 # -----------------------------
-STICKY_FIRST_COL_DEFAULT = False  # can be overridden by READONLY_STICKY_FIRST_COL in secrets
+STICKY_FIRST_COL_DEFAULT = False  # can be overridden by READONLY_STICKY_FIRST_COL
 
 # -----------------------------
 # Secrets helpers
@@ -460,13 +461,13 @@ def _render_sortable_wrapped_table(
         + "</div>"
     )
 
+    components.html(html_doc, height=height_px, scrolling=True)
 
 # -----------------------------
-# App UI
+# Help modal content + renderer
 # -----------------------------
 st.title("Vendors (Read-only)")
 
-# ---- Help modal (large content friendly) ----
 HELP_MD = """
 **How to use this table**
 
@@ -478,7 +479,6 @@ HELP_MD = """
 - **Column widths**: Controlled in secrets (`[COLUMN_WIDTHS_PX_READONLY]` or `[COLUMN_WIDTHS_PX]`).
 """
 
-# Same content as HTML; you can expand this to your “half-sheet” of tips.
 HELP_HTML = f"""
 <div style="line-height:1.55;">
   {HELP_MD.replace('**', '<strong>').replace('__','<u>').replace('*','')}
@@ -486,26 +486,31 @@ HELP_HTML = f"""
 """
 
 def _help_modal_dims_from_secrets():
-    # Defaults tuned for long content; override via secrets if desired
-    import streamlit as st
-    def _get(name, default): 
+    def _get(name, default):
         try:
-            if name in st.secrets: return st.secrets[name]
+            if name in st.secrets:
+                return st.secrets[name]
         except Exception:
             pass
         return default
-    try:    width_px = int(_get("READONLY_HELP_WIDTH_PX", 900))   # modal width cap
-    except: width_px = 900
-    try:    max_h_vh = int(_get("READONLY_HELP_MAX_H_VH", 90))    # modal max height in vh
-    except: max_h_vh = 90
-    try:    font_px  = int(_get("READONLY_HELP_FONT_PX", 14))     # body font size
-    except: font_px  = 14
+    try:
+        width_px = int(_get("READONLY_HELP_WIDTH_PX", 900))
+    except Exception:
+        width_px = 900
+    try:
+        max_h_vh = int(_get("READONLY_HELP_MAX_H_VH", 90))
+    except Exception:
+        max_h_vh = 90
+    try:
+        font_px  = int(_get("READONLY_HELP_FONT_PX", 14))
+    except Exception:
+        font_px  = 14
     return width_px, max_h_vh, font_px
 
 def _render_help(style: str = "modal"):
     style = (style or "modal").strip().lower()
     if style != "modal":
-        # keep other styles if you ever want to switch
+        # Optional alternate styles
         try:
             if style == "popover" and hasattr(st, "popover"):
                 with st.popover("Help"):
@@ -518,109 +523,115 @@ def _render_help(style: str = "modal"):
         return
 
     # Modal implementation (HTML/CSS/JS)
-    import uuid, streamlit.components.v1 as components
+    import uuid
     w, mh, fs = _help_modal_dims_from_secrets()
     uid = f"help_{uuid.uuid4().hex[:8]}"
-    components.html(f"""
-    <div id="{uid}_root">
-      <button id="{uid}_open" class="help-btn">Help</button>
-      <div id="{uid}_overlay" class="help-overlay" style="display:none;">
-        <div class="help-modal" role="dialog" aria-modal="true" aria-labelledby="{uid}_title" tabindex="-1">
-          <div class="help-header">
-            <span id="{uid}_title">Help</span>
-            <div class="help-actions">
-              <button id="{uid}_copy" class="act-btn" title="Copy all">Copy</button>
-              <button id="{uid}_print" class="act-btn" title="Print">Print</button>
-              <button id="{uid}_close" class="close-btn" aria-label="Close">&times;</button>
-            </div>
-          </div>
-          <div id="{uid}_body" class="help-body">{HELP_HTML}</div>
+    _page_h = int(st.secrets.get("READONLY_HELP_IFRAME_H_PX", 900))
+
+    components.html(
+        f'''
+<div id="{uid}_root">
+  <button id="{uid}_open" class="help-btn">Help</button>
+  <div id="{uid}_overlay" class="help-overlay" style="display:none;">
+    <div class="help-modal" role="dialog" aria-modal="true" aria-labelledby="{uid}_title" tabindex="-1">
+      <div class="help-header">
+        <span id="{uid}_title">Help</span>
+        <div class="help-actions">
+          <button id="{uid}_copy" class="act-btn" title="Copy all">Copy</button>
+          <button id="{uid}_print" class="act-btn" title="Print">Print</button>
+          <button id="{uid}_close" class="close-btn" aria-label="Close">&times;</button>
         </div>
       </div>
+      <div id="{uid}_body" class="help-body">{HELP_HTML}</div>
     </div>
-    <style>
-      .help-btn {{
-        padding: 6px 10px; border: 1px solid #ddd; border-radius: 6px; background:#fff; cursor:pointer;
-      }}
-      .help-overlay {{
-        position: fixed; inset: 0; background: rgba(0,0,0,0.35);
-        display: none; align-items: center; justify-content: center; z-index: 9999;
-      }}
-      .help-modal {{
-        background:#fff; border-radius:10px; width: min({w}px, 96vw);
-        max-height: {mh}vh; overflow:auto; box-shadow: 0 10px 30px rgba(0,0,0,0.25);
-      }}
-      .help-header {{
-        padding: 10px 14px; border-bottom: 1px solid #eee; display:flex; justify-content: space-between; align-items:center;
-        position: sticky; top:0; background:#fff; z-index: 1;
-      }}
-      .help-actions {{ display:flex; gap:8px; align-items:center; }}
-      .act-btn {{
-        padding: 4px 8px; border: 1px solid #ddd; border-radius: 6px; background:#fafafa; cursor:pointer; font-size: 13px;
-      }}
-      .close-btn {{
-        font-size: 22px; line-height: 1; padding: 2px 8px; border:none; background:transparent; cursor:pointer;
-      }}
-      .help-body {{ padding: 14px; font-size: {fs}px; }}
-      .help-body p {{ margin: 0 0 10px 0; }}
-      .help-body ul {{ margin: 0 0 10px 22px; }}
-      .help-body li {{ margin: 4px 0; }}
-    </style>
-    <script>
-      (function(){{
-        const overlay = document.getElementById("{uid}_overlay");
-        const openBtn = document.getElementById("{uid}_open");
-        const closeBtn = document.getElementById("{uid}_close");
-        const modal = overlay.querySelector(".help-modal");
-        const body = document.getElementById("{uid}_body");
-        const copyBtn = document.getElementById("{uid}_copy");
-        const printBtn = document.getElementById("{uid}_print");
+  </div>
+</div>
+<style>
+  .help-btn {{
+    padding: 6px 10px; border: 1px solid #ddd; border-radius: 6px; background:#fff; cursor:pointer;
+  }}
+  .help-overlay {{
+    position: fixed; inset: 0; background: rgba(0,0,0,0.35);
+    display: none; align-items: center; justify-content: center; z-index: 9999;
+  }}
+  .help-modal {{
+    background:#fff; border-radius:10px; width: min({w}px, 96vw);
+    max-height: {mh}vh; overflow:auto; box-shadow: 0 10px 30px rgba(0,0,0,0.25);
+  }}
+  .help-header {{
+    padding: 10px 14px; border-bottom: 1px solid #eee; display:flex; justify-content: space-between; align-items:center;
+    position: sticky; top:0; background:#fff; z-index: 1;
+  }}
+  .help-actions {{ display:flex; gap:8px; align-items:center; }}
+  .act-btn {{
+    padding: 4px 8px; border: 1px solid #ddd; border-radius: 6px; background:#fafafa; cursor:pointer; font-size: 13px;
+  }}
+  .close-btn {{
+    font-size: 22px; line-height: 1; padding: 2px 8px; border:none; background:transparent; cursor:pointer;
+  }}
+  .help-body {{ padding: 14px; font-size: {fs}px; }}
+  .help-body p {{ margin: 0 0 10px 0; }}
+  .help-body ul {{ margin: 0 0 10px 22px; }}
+  .help-body li {{ margin: 4px 0; }}
+</style>
+<script>
+  (function(){{
+    const overlay = document.getElementById("{uid}_overlay");
+    const openBtn = document.getElementById("{uid}_open");
+    const closeBtn = document.getElementById("{uid}_close");
+    const modal = overlay.querySelector(".help-modal");
+    const body = document.getElementById("{uid}_body");
+    const copyBtn = document.getElementById("{uid}_copy");
+    const printBtn = document.getElementById("{uid}_print");
 
-        function openModal() {{
-          overlay.style.display = "flex";
-          modal.focus();
-        }}
-        function closeModal() {{
-          overlay.style.display = "none";
-          openBtn.focus();
-        }}
-        openBtn.addEventListener("click", openModal);
-        closeBtn.addEventListener("click", closeModal);
-        overlay.addEventListener("click", (e) => {{ if (e.target === overlay) closeModal(); }});
-        document.addEventListener("keydown", (e) => {{ if (e.key === "Escape") closeModal(); }});
+    function openModal() {{
+      overlay.style.display = "flex";
+      modal.focus();
+    }}
+    function closeModal() {{
+      overlay.style.display = "none";
+      openBtn.focus();
+    }}
 
-        copyBtn.addEventListener("click", async () => {{
-          try {{
-            const txt = body.textContent || "";
-            await navigator.clipboard.writeText(txt);
-            copyBtn.textContent = "Copied";
-            setTimeout(()=> copyBtn.textContent = "Copy", 1200);
-          }} catch (err) {{
-            alert("Copy failed");
-          }}
-        }});
+    openBtn.addEventListener("click", openModal);
+    closeBtn.addEventListener("click", closeModal);
+    overlay.addEventListener("click", (e) => {{ if (e.target === overlay) closeModal(); }});
+    document.addEventListener("keydown", (e) => {{ if (e.key === "Escape") closeModal(); }});
 
-        printBtn.addEventListener("click", () => {{
-          const w = window.open("", "_blank");
-          w.document.write("<html><head><title>Help</title></head><body>" + body.innerHTML + "</body></html>");
-          w.document.close();
-          w.focus();
-          w.print();
-          setTimeout(()=> w.close(), 250);
-        }});
-      }})();
-    </script>
-   _page_h = int(st.secrets.get("READONLY_HELP_IFRAME_H_PX", 900))
-components.html(f"""
-    ... the same modal HTML/CSS/JS above ...
-    """, height=_page_h, scrolling=False)
+    copyBtn.addEventListener("click", async () => {{
+      try {{
+        const txt = body.textContent || "";
+        await navigator.clipboard.writeText(txt);
+        copyBtn.textContent = "Copied";
+        setTimeout(()=> copyBtn.textContent = "Copy", 1200);
+      }} catch (err) {{
+        alert("Copy failed");
+      }}
+    }});
+
+    printBtn.addEventListener("click", () => {{
+      const w = window.open("", "_blank");
+      w.document.write("<html><head><title>Help</title></head><body>" + body.innerHTML + "</body></html>");
+      w.document.close();
+      w.focus();
+      w.print();
+      setTimeout(()=> w.close(), 250);
+    }});
+  }})();
+</script>
+''',
+        height=_page_h,
+        scrolling=False,
+    )
 
 # Choose style via secrets (defaults to modal)
 _help_style = str(st.secrets.get("READONLY_HELP_STYLE", "modal")).lower()
 _render_help(_help_style)
 # ---- end Help modal ----
 
-
+# -----------------------------
+# Debug expander (optional)
+# -----------------------------
 with st.expander("Status & Secrets (debug)", expanded=False):
     st.write("**DB**", current_db_info())
     try:
@@ -645,10 +656,11 @@ with st.expander("Status & Secrets (debug)", expanded=False):
     except Exception as e:
         st.write("Debug error:", str(e))
 
-# Load data
+# -----------------------------
+# Data + Grid render
+# -----------------------------
 df = load_vendors_df()
 
-# Column order to display
 desired = ["business_name","category","service","contact_name",
            "phone","address","website","notes","keywords"]
 show_cols = [c for c in df.columns if c in desired]
@@ -660,12 +672,12 @@ else:
     df_view = df[columns_order].copy()
     widths_px = _get_column_widths_px()
 
-    # Prevent accidental double-render
+    # Render once (avoid accidental doubles)
     if not st.session_state.get("_rendered_grid_once"):
         st.session_state["_rendered_grid_once"] = True
         _render_sortable_wrapped_table(
             df_view,
             widths_px,
-            height_px=720,  # viewport height
-            sticky_first_col=_sticky_first_col_enabled(),  # defaults to False per your config
+            height_px=int(st.secrets.get("READONLY_GRID_HEIGHT_PX", 720)),  # optional secret
+            sticky_first_col=_sticky_first_col_enabled(),
         )
