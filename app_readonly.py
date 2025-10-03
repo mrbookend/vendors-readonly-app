@@ -1,25 +1,31 @@
 # app_readonly.py
-# - Help via st.expander reading READONLY_HELP_MD from secrets (no duplicate title)
-# - CSV download button at bottom (just above debug)
-# - Bottom debug now also previews the first 120 chars of READONLY_HELP_MD
+# Read-only Vendors view with:
+# - Turso (libSQL) via SQLITE+LIBSQL URL, token from secrets; local SQLite fallback
+# - Page layout from secrets (title, sidebar, max width)
+# - Column labels and pixel widths from secrets (COLUMN_WIDTHS_PX_READONLY)
+# - Quick filter (client-side, matches across all text columns)
+# - Click-to-sort on every column (st.dataframe)
+# - Wrapped cells; rows auto-grow in height
+# - Optional sticky first column (CSS-based best effort)
+# - Help section from top-level secrets (Markdown), with raw debug toggle
 
 from __future__ import annotations
 
 import os
 import re
-import html as py_html
-from typing import List, Dict, Optional
+from typing import Dict, List, Optional
 
 import pandas as pd
 import streamlit as st
 from sqlalchemy import create_engine, text as sql_text
 from sqlalchemy.engine import Engine
-import streamlit.components.v1 as components
+
 
 # -----------------------------
-# Early layout setup
+# Early secrets + env helpers
 # -----------------------------
 def _read_secret_early(name: str, default=None):
+    # Try Streamlit secrets first (safe if not available), then env var, else default
     try:
         if name in st.secrets:
             return st.secrets[name]
@@ -27,534 +33,339 @@ def _read_secret_early(name: str, default=None):
         pass
     return os.environ.get(name, default)
 
-_title   = _read_secret_early("page_title", "Vendors (Read-only)")
-_sidebar = _read_secret_early("sidebar_state", "collapsed")
-_max_w   = _read_secret_early("page_max_width_px", 3000)
-try:
-    _max_w = int(_max_w)
-except Exception:
-    _max_w = 3000
 
-st.set_page_config(page_title=_title, layout="wide", initial_sidebar_state=_sidebar)
-st.markdown(
-    f"""
-    <style>
-      .main .block-container {{
-        max-width: {_max_w}px;
-        padding-left: 16px;
-        padding-right: 16px;
-      }}
-    </style>
-    """,
-    unsafe_allow_html=True,
-)
-
-# -----------------------------
-# Config + secrets helpers
-# -----------------------------
-STICKY_FIRST_COL_DEFAULT = False
-
-def _get_secret(name: str, default: Optional[str | int | bool] = None):
-    try:
-        if name in st.secrets:
-            return st.secrets[name]
-    except Exception:
-        pass
-    return os.environ.get(name, default if default is None else str(default))
-
-def _get_int_secret(name: str, default: int) -> int:
-    val = _get_secret(name, None)
-    try:
-        return int(val) if val is not None else default
-    except Exception:
-        return default
-
-def _get_bool_secret(name: str, default: bool) -> bool:
-    val = _get_secret(name, None)
-    if val is None:
-        return default
-    s = str(val).strip().lower()
-    if s in {"1", "true", "yes", "on"}:
-        return True
-    if s in {"0", "false", "no", "off"}:
-        return False
+def _get_secret_bool(val, default=False):
+    if isinstance(val, bool):
+        return val
+    if isinstance(val, str):
+        return val.strip().lower() in ("1", "true", "yes", "on")
     return default
 
-def _get_column_labels() -> Dict[str, str]:
-    import json
-    from collections.abc import Mapping
-    raw = _get_secret("READONLY_COLUMN_LABELS", None)
-    labels: Dict[str, str] = {}
-    if raw is None:
-        return labels
-    if isinstance(raw, Mapping):
-        for k, v in raw.items():
-            labels[str(k).strip().lower()] = str(v)
-        return labels
-    if isinstance(raw, str):
-        s = raw.strip()
-        try:
-            obj = json.loads(s)
-            if isinstance(obj, Mapping):
-                for k, v in obj.items():
-                    labels[str(k).strip().lower()] = str(v)
-        except Exception:
-            pass
-    return labels
 
 # -----------------------------
-# DB engine
+# Page layout (must be first)
 # -----------------------------
-_LIBSQL_SCHEME_RE = re.compile(r"^libsql://", re.IGNORECASE)
+def _apply_page_layout():
+    page_title = _read_secret_early("page_title", "HCR Vendors (Read-Only)")
+    sidebar_state = _read_secret_early("sidebar_state", "expanded")
+    max_width = _read_secret_early("page_max_width_px", 2300)
 
-def _normalize_libsql_url(url: str) -> str:
-    if _LIBSQL_SCHEME_RE.match(url):
-        return _LIBSQL_SCHEME_RE.sub("sqlite+libsql://", url, count=1)
-    return url
+    # Set page config
+    st.set_page_config(page_title=page_title, layout="wide", initial_sidebar_state=sidebar_state)
 
-def _append_secure_param(dsn: str) -> str:
-    if "secure=" in dsn:
-        return dsn
-    return f"{dsn}&secure=true" if "?" in dsn else f"{dsn}?secure=true"
+    # Constrain main content width with CSS
+    try:
+        max_width = int(max_width)
+    except Exception:
+        max_width = 2300
+    st.markdown(
+        f"""
+        <style>
+        .block-container {{
+            max-width: {max_width}px;
+        }}
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
 
-def _get_libsql_creds() -> Dict[str, Optional[str]]:
-    url = (_get_secret("LIBSQL_URL") or _get_secret("TURSO_DATABASE_URL"))
-    token = (_get_secret("LIBSQL_AUTH_TOKEN") or _get_secret("TURSO_AUTH_TOKEN"))
-    return {"url": url, "token": token}
 
-def current_db_info() -> Dict[str, Optional[str]]:
-    creds = _get_libsql_creds()
-    if creds["url"]:
-        dsn = _normalize_libsql_url(str(creds["url"]))
-        dsn = _append_secure_param(dsn)
-        return {"backend": "libsql", "dsn": dsn, "auth": "token_set" if creds["token"] else "no_token"}
-    sqlite_path = _get_secret("SQLITE_PATH") or os.path.join(os.path.dirname(os.path.abspath(__file__)), "vendors.db")
-    return {"backend": "sqlite", "dsn": f"sqlite:///{sqlite_path}", "auth": None}
+_apply_page_layout()
 
-def get_engine() -> Engine:
-    info = current_db_info()
-    if info["backend"] == "libsql":
+
+# -----------------------------
+# Secrets-driven display config
+# -----------------------------
+COLUMN_WIDTHS_PX_READONLY: Dict[str, int] = _read_secret_early("COLUMN_WIDTHS_PX_READONLY", {}) or {}
+
+LABEL_OVERRIDES: Dict[str, str] = _read_secret_early("READONLY_COLUMN_LABELS", {}) or {}
+
+READONLY_STICKY_FIRST_COL = _get_secret_bool(_read_secret_early("READONLY_STICKY_FIRST_COL", False), False)
+
+# Help secrets (top-level preferred; fallback to overrides for backward-compat)
+HELP_TITLE = (
+    _read_secret_early("READONLY_HELP_TITLE")
+    or LABEL_OVERRIDES.get("readonly_help_title")
+    or "Providers Help / Tips"
+)
+HELP_MD = (
+    _read_secret_early("READONLY_HELP_MD")
+    or LABEL_OVERRIDES.get("readonly_help_md")
+    or ""
+)
+HELP_DEBUG = _get_secret_bool(
+    _read_secret_early("READONLY_HELP_DEBUG"),
+    _get_secret_bool(LABEL_OVERRIDES.get("readonly_help_debug"), False),
+)
+
+
+# -----------------------------
+# DB engine (Turso first; SQLite fallback)
+# -----------------------------
+def _make_engine() -> Engine:
+    # Preferred: full URL in secrets (already includes ?secure=true for libsql)
+    url = _read_secret_early(
+        "TURSO_DATABASE_URL",
+        "sqlite+libsql://vendors-prod-mrbookend.aws-us-west-2.turso.io?secure=true",
+    )
+    token = _read_secret_early("TURSO_AUTH_TOKEN", None)
+
+    if url and url.startswith("sqlite+libsql://"):
         connect_args = {}
-        token = (_get_secret("LIBSQL_AUTH_TOKEN") or _get_secret("TURSO_AUTH_TOKEN"))
         if token:
+            # SQLAlchemy libsql dialect supports "auth_token" in connect_args
             connect_args["auth_token"] = token
-        return create_engine(info["dsn"], connect_args=connect_args, pool_pre_ping=True, future=True)
-    return create_engine(info["dsn"], future=True)
-
-engine = get_engine()
-
-# -----------------------------
-# Column widths loader
-# -----------------------------
-def _width_value_to_px(val) -> int:
-    if isinstance(val, int):
-        return max(20, val)
-    s = str(val).strip().lower()
-    if s in {"small", "s"}:  return 100
-    if s in {"medium", "m"}: return 160
-    if s in {"large", "l"}:  return 240
-    try:
-        return max(20, int(s))
-    except Exception:
-        return 140
-
-def _coerce_map(obj) -> Dict[str, int]:
-    out: Dict[str, int] = {}
-    try:
-        items = obj.items()
-    except Exception:
-        return out
-    for k, v in items:
-        out[str(k).strip().lower()] = _width_value_to_px(v)
-    return out
-
-def _get_column_widths_px() -> Dict[str, int]:
-    import json
-    from collections.abc import Mapping
-    def _load_block(name: str):
         try:
-            return st.secrets.get(name, None)
-        except Exception:
-            return None
-    raw = _load_block("COLUMN_WIDTHS_PX_READONLY")
-    if raw is None:
-        raw = _load_block("COLUMN_WIDTHS_PX")
-    mapping: Dict[str, int] = {}
-    if isinstance(raw, Mapping):
-        mapping = _coerce_map(raw)
-    elif isinstance(raw, str):
-        s = raw.strip()
-        try:
-            obj = json.loads(s)
-            if isinstance(obj, Mapping):
-                mapping = _coerce_map(obj)
-        except Exception:
-            local_map: Dict[str, int] = {}
-            for line in s.splitlines():
-                line = line.strip()
-                if not line or line.startswith("#") or "=" not in line:
-                    continue
-                k, v = line.split("=", 1)
-                key = k.strip().strip('"').strip("'").lower()
-                val = v.strip().strip('"').strip("'")
-                local_map[key] = _width_value_to_px(val)
-            mapping = local_map
-    else:
-        mapping = {}
-    website_w = _get_int_secret("WEBSITE_COL_WIDTH_PX", 0)
-    if website_w and "website" not in mapping:
-        mapping["website"] = website_w
-    return mapping
+            eng = create_engine(url, connect_args=connect_args, pool_pre_ping=True)
+            # quick sanity ping
+            with eng.connect() as conn:
+                conn.execute(sql_text("SELECT 1"))
+            return eng
+        except Exception as e:
+            st.warning(f"Turso connection failed ({e}). Falling back to local SQLite vendors.db.")
 
-def _sticky_first_col_enabled() -> bool:
-    return _get_bool_secret("READONLY_STICKY_FIRST_COL", STICKY_FIRST_COL_DEFAULT)
+    # Fallback: local SQLite file bundled with the app
+    local_path = "/mount/src/vendors-readonly-app/vendors.db"
+    if not os.path.exists(local_path):
+        # also try relative path (local dev)
+        local_path = "vendors.db"
+    eng = create_engine(f"sqlite:///{local_path}")
+    return eng
+
+
+engine = _make_engine()
+
 
 # -----------------------------
-# Data loading
+# Data access
 # -----------------------------
-@st.cache_data(show_spinner=False, ttl=30)
-def get_columns(table: str) -> List[str]:
-    try:
-        with engine.begin() as conn:
-            rows = conn.execute(sql_text(f"PRAGMA table_info({table})")).fetchall()
-            return [r[1] for r in rows]
-    except Exception:
-        try:
-            with engine.begin() as conn:
-                df = pd.read_sql_query(sql_text(f"SELECT * FROM {table} LIMIT 1"), conn)
-            return list(df.columns)
-        except Exception:
-            return []
+DISPLAY_COL_ORDER = [
+    "id",
+    "business_name",
+    "category",
+    "service",
+    "contact_name",
+    "phone",
+    "address",
+    "website",
+    "notes",
+    "keywords",
+]
 
-@st.cache_data(show_spinner=False, ttl=30)
-def load_vendors_df() -> pd.DataFrame:
-    cols = get_columns("vendors")
-    base_cols = ["id", "category", "service", "business_name", "contact_name",
-                 "phone", "address", "website", "notes", "keywords"]
-    sel_cols = [c for c in base_cols if c in cols]
-    if not sel_cols:
-        return pd.DataFrame()
-    with engine.begin() as conn:
-        df = pd.read_sql_query(sql_text(f"SELECT {', '.join(sel_cols)} FROM vendors"), conn)
-    if "service" in df.columns:
-        df["service"] = df["service"].apply(lambda v: v if (isinstance(v, str) and v.strip()) else "")
-    if "category" in df.columns:
-        df["category"] = df["category"].apply(lambda v: v.strip() if isinstance(v, str) else v)
-    if "business_name" in df.columns:
-        df = df.sort_values("business_name", key=lambda s: s.str.lower()).reset_index(drop=True)
-    return df
+
+def load_vendors() -> pd.DataFrame:
+    query = f"""
+        SELECT {", ".join(DISPLAY_COL_ORDER)}
+        FROM vendors
+        ORDER BY category COLLATE NOCASE ASC,
+                 business_name COLLATE NOCASE ASC,
+                 id ASC
+    """
+    with engine.connect() as conn:
+        df = pd.read_sql_query(sql_text(query), conn)
+    # Ensure consistent dtypes for display
+    for col in DISPLAY_COL_ORDER:
+        if col not in df.columns:
+            df[col] = ""
+    # Normalize phone to string for consistent rendering
+    if "phone" in df.columns:
+        df["phone"] = df["phone"].astype(str).fillna("").replace("nan", "")
+    # Website ensure string
+    if "website" in df.columns:
+        df["website"] = df["website"].astype(str).fillna("").replace("nan", "")
+    return df[DISPLAY_COL_ORDER]
+
 
 # -----------------------------
-# HTML grid renderer (sortable + wrap)
+# UI helpers
 # -----------------------------
-def _render_sortable_wrapped_table(
-    df: pd.DataFrame,
-    px_map: Dict[str, int],
-    height_px: int = 720,
-    sticky_first_col: bool = False,
-) -> None:
-    if df.empty:
-        st.info("No records found.")
+def _apply_css_wrapping_and_widths(field_order: List[str], widths_px: Dict[str, int], sticky_first: bool):
+    """Inject CSS that:
+    - Wraps cell text
+    - Sets per-column width hints in px (min/max width)
+    - Optionally sticky first column
+    Note: relies on current Streamlit HTML structure; harmless if it ever changes.
+    """
+    # Build nth-child selectors for widths (1-based, matching visible column order)
+    width_css_rules = []
+    for idx, field in enumerate(field_order, start=1):
+        px = widths_px.get(field)
+        if not px:
+            continue
+        width_css_rules.append(
+            f'''
+            /* Column {idx} ({field}) width */
+            div[data-testid="stDataFrame"] table tbody tr td:nth-child({idx}),
+            div[data-testid="stDataFrame"] table thead tr th:nth-child({idx}) {{
+                min-width: {px}px !important;
+                max-width: {px}px !important;
+                width: {px}px !important;
+                white-space: normal !important;
+                overflow-wrap: anywhere !important;
+                word-break: break-word !important;
+            }}
+            '''
+        )
+    width_css = "\n".join(width_css_rules)
+
+    sticky_css = ""
+    if sticky_first and field_order:
+        # Best-effort sticky first column
+        sticky_css = f"""
+        /* Sticky first column */
+        div[data-testid="stDataFrame"] table tbody tr td:nth-child(1),
+        div[data-testid="stDataFrame"] table thead tr th:nth-child(1) {{
+            position: sticky;
+            left: 0;
+            z-index: 2;  /* stay above other cells */
+            background: var(--background-color, white);
+            box-shadow: 1px 0 0 0 rgba(0,0,0,0.05);
+        }}
+        div[data-testid="stDataFrame"] table thead tr th:nth-child(1) {{
+            z-index: 3;  /* above data cells */
+        }}
+        """
+
+    st.markdown(
+        f"""
+        <style>
+        /* Wrap all cells + headers */
+        div[data-testid="stDataFrame"] table {{
+            table-layout: fixed !important;
+        }}
+        div[data-testid="stDataFrame"] table td,
+        div[data-testid="stDataFrame"] table th {{
+            white-space: normal !important;
+            overflow-wrap: anywhere !important;
+            word-break: break-word !important;
+        }}
+        {width_css}
+        {sticky_css}
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def _rename_columns_for_display(df: pd.DataFrame, label_map: Dict[str, str]) -> pd.DataFrame:
+    # Only rename keys that exist; leave others alone
+    renames = {k: v for k, v in label_map.items() if k in df.columns and isinstance(v, str) and v}
+    return df.rename(columns=renames)
+
+
+def _build_quick_filter(df: pd.DataFrame) -> pd.DataFrame:
+    st.subheader("Browse Providers")
+    q = st.text_input("Quick filter (matches any column)", value="", placeholder="e.g., plumb, roof, 78245…")
+    q = q.strip()
+    if not q:
+        return df
+
+    # Case-insensitive contains across all string columns
+    mask = pd.Series([False] * len(df))
+    lowered = df.copy()
+    for col in lowered.columns:
+        if pd.api.types.is_string_dtype(lowered[col]) or pd.api.types.is_object_dtype(lowered[col]):
+            lowered[col] = lowered[col].fillna("").astype(str).str.lower()
+            mask = mask | lowered[col].str.contains(q.lower(), na=False)
+    return df[mask]
+
+
+# -----------------------------
+# Help section (no nested expanders)
+# -----------------------------
+def render_help_section():
+    # If no help configured, show nothing (or a small info)
+    if not HELP_MD:
+        with st.expander(HELP_TITLE, expanded=False):
+            st.info("No help content has been configured yet.")
         return
 
-    cols = list(df.columns)
-    label_map = _get_column_labels()
+    with st.expander(HELP_TITLE, expanded=False):
+        st.markdown(HELP_MD)
+        if HELP_DEBUG:
+            st.caption("Raw help (debug preview)")
+            st.code(HELP_MD, language=None)
 
-    def _px(col: str) -> int:
-        try:
-            return px_map.get(col, 140)
-        except Exception:
-            return 140
 
-    def _label(col: str) -> str:
-        if col in label_map:
-            return py_html.escape(label_map[col])
-        return py_html.escape(col.replace("_", " ").title())
-
-    head_css = f"""
-    <style>
-      .tbl-container {{
-        border: 1px solid #e6e6e6;
-        border-radius: 8px;
-        overflow: hidden;
-        box-shadow: 0 1px 2px rgba(0,0,0,0.04);
-      }}
-      .tbl-toolbar {{
-        padding: 8px 10px;
-        border-bottom: 1px solid #eee;
-        background: #fafafa;
-        display: flex;
-        gap: 8px;
-        align-items: center;
-        font-size: 14px;
-      }}
-      .tbl-filter {{
-        flex: 1;
-        padding: 6px 8px;
-        border: 1px solid #ddd;
-        border-radius: 6px;
-        outline: none;
-      }}
-      .tbl-viewport {{
-        max-height: {height_px - 46}px;
-        overflow: auto;
-      }}
-      table.tbl {{
-        table-layout: fixed;
-        width: 100%;
-        border-collapse: collapse;
-        font-size: 14px;
-      }}
-      .tbl th, .tbl td {{
-        border-bottom: 1px solid #f0f0f0;
-        padding: 6px 8px;
-        vertical-align: top;
-      }}
-      .tbl thead th {{
-        position: sticky;
-        top: 0;
-        background: #ffffff;
-        z-index: 2;
-        cursor: pointer;
-        user-select: none;
-      }}
-      .tbl tbody tr:hover {{ background: #fcfcfc; }}
-      .tbl td {{
-        white-space: normal;
-        word-break: break-word;
-        text-overflow: clip;
-        overflow: visible;
-      }}
-      .th-inner {{
-        display: inline-flex;
-        align-items: center;
-        gap: 6px;
-      }}
-      .sort-arrow {{ font-size: 12px; color: #888; visibility: hidden; }}
-      th.sorted .sort-arrow {{ visibility: visible; }}
-
-      .tbl .sticky-col {{
-        position: sticky;
-        left: 0;
-        z-index: 3;
-        background: #ffffff;
-      }}
-      .tbl thead th.sticky-col {{ z-index: 4; }}
-      .sticky-shadow {{ box-shadow: 2px 0 0 rgba(0,0,0,0.06); }}
-    </style>
-    """
-
-    colgroup = ["<colgroup>"] + [f'<col style="width:{_px(c)}px">' for c in cols] + ["</colgroup>"]
-
-    thead = ["<thead><tr>"]
-    for idx, c in enumerate(cols):
-        label = _label(c)
-        th_classes = ' class="sticky-col sticky-shadow"' if (sticky_first_col and idx == 0) else ""
-        thead.append(
-            f'<th{th_classes} data-col="{py_html.escape(c)}">'
-            f'<span class="th-inner">{label}<span class="sort-arrow">▲</span></span>'
-            f"</th>"
+# -----------------------------
+# Main app
+# -----------------------------
+def main():
+    # Debug header (optional)
+    with st.expander("Status & Secrets (debug)", expanded=False):
+        # Backend info
+        backend = "libsql" if str(_read_secret_early("TURSO_DATABASE_URL", "")).startswith("sqlite+libsql://") else "sqlite"
+        dsn = _read_secret_early("TURSO_DATABASE_URL", "")
+        auth = "token_set" if bool(_read_secret_early("TURSO_AUTH_TOKEN")) else "none"
+        st.write("DB")
+        st.code(
+            {
+                "backend": backend,
+                "dsn": dsn,
+                "auth": auth,
+            }
         )
-    thead.append("</tr></thead>")
 
-    tbody = ["<tbody>"]
-    for _, row in df.iterrows():
-        tbody.append("<tr>")
-        for idx, c in enumerate(cols):
-            val = row[c]
-            td_class = ' class="sticky-col sticky-shadow"' if (sticky_first_col and idx == 0) else ""
-            if c == "website" and isinstance(val, str) and val.strip():
-                href = py_html.escape(val)
-                text = py_html.escape(val)
-                tbody.append(f'<td{td_class}><a href="{href}" target="_blank" rel="noopener noreferrer">{text}</a></td>')
-            else:
-                safe = "" if pd.isna(val) else str(val)
-                tbody.append(f"<td{td_class}>{py_html.escape(safe)}</td>")
-        tbody.append("</tr>")
-    tbody.append("</tbody>")
+        # Secrets keys present
+        keys = []
+        try:
+            keys = list(st.secrets.keys())
+        except Exception:
+            pass
+        st.write("Secrets keys")
+        st.code(keys)
 
-    script = """
-    <script>
-      (function() {
-        const container = document.currentScript.closest('.tbl-container');
-        const input = container.querySelector('.tbl-filter');
-        const table = container.querySelector('table.tbl');
-        const thead = table.tHead;
-        const tbody = table.tBodies[0];
-        const headers = Array.from(thead.rows[0].cells);
-        let sortState = {}; // colIndex -> 'asc'|'desc'
+        # Help presence
+        st.write("Help MD:", "present" if bool(HELP_MD) else "(missing or empty)")
 
-        function getCellText(td) {
-          return (td.textContent || td.innerText || '').trim();
-        }
-        function compare(a, b, idx, asc) {
-          const ta = getCellText(a.cells[idx]);
-          const tb = getCellText(b.cells[idx]);
-          const na = parseFloat(ta.replace(/[^0-9.-]/g, ''));
-          const nb = parseFloat(tb.replace(/[^0-9.-]/g, ''));
-          const bothNumeric = !isNaN(na) && !isNaN(nb) && ta !== '' && tb !== '';
-          let cmp = 0;
-          if (bothNumeric) cmp = na - nb;
-          else cmp = ta.localeCompare(tb, undefined, {sensitivity: 'base'});
-          return asc ? cmp : -cmp;
-        }
+        # Raw widths and labels
+        st.write("Raw COLUMN_WIDTHS_PX_READONLY (type)", type(COLUMN_WIDTHS_PX_READONLY).__name__)
+        st.code(COLUMN_WIDTHS_PX_READONLY)
+        st.write("Loaded column widths (effective)")
+        st.code(COLUMN_WIDTHS_PX_READONLY)
 
-        headers.forEach((th, idx) => {
-          th.addEventListener('click', () => {
-            const dir = sortState[idx] === 'asc' ? 'desc' : 'asc';
-            sortState = {}; sortState[idx] = dir;
+        st.write("Sticky first col enabled:", READONLY_STICKY_FIRST_COL)
 
-            headers.forEach(h => h.classList.remove('sorted'));
-            th.classList.add('sorted');
-            const arrow = th.querySelector('.sort-arrow');
-            if (arrow) arrow.textContent = dir === 'asc' ? '▲' : '▼';
+        st.write("Column label overrides (if any)")
+        st.code(LABEL_OVERRIDES)
 
-            const rows = Array.from(tbody.rows);
-            rows.sort((ra, rb) => compare(ra, rb, idx, dir === 'asc'));
-            rows.forEach(r => tbody.appendChild(r));
-          });
-        });
+    # Load data
+    df = load_vendors()
 
-        input.addEventListener('input', () => {
-          const q = input.value.toLowerCase();
-          Array.from(tbody.rows).forEach(tr => {
-            const text = tr.innerText.toLowerCase();
-            tr.style.display = text.includes(q) ? '' : 'none';
-          });
-        });
-      })();
-    </script>
-    """
+    # Apply widths & wrapping CSS (before rendering the dataframe)
+    _apply_css_wrapping_and_widths(DISPLAY_COL_ORDER, COLUMN_WIDTHS_PX_READONLY, READONLY_STICKY_FIRST_COL)
 
-    toolbar = """
-    <div class="tbl-toolbar">
-      <input class="tbl-filter" placeholder="Quick filter (matches any column)…" />
-    </div>
-    """
+    # Rename columns for display
+    df_display = _rename_columns_for_display(df, LABEL_OVERRIDES)
 
-    html_doc = (
-        '<div class="tbl-container">'
-        + head_css
-        + toolbar
-        + '<div class="tbl-viewport"><table class="tbl">'
-        + "".join(colgroup) + "".join(thead) + "".join(tbody)
-        + "</table></div>"
-        + script
-        + "</div>"
-    )
+    # Render Help section (safe single expander)
+    render_help_section()
 
-    components.html(html_doc, height=height_px, scrolling=True)
+    # Quick filter (client-side)
+    df_filtered = _build_quick_filter(df_display)
 
-def render_help_expander():
-    title = _get_secret("READONLY_HELP_TITLE", "Providers Help / Tips")
-    raw_md = _get_secret("READONLY_HELP_MD", "")
-    debug_help = str(_get_secret("READONLY_HELP_DEBUG", "0")).strip().lower() in {"1","true","yes","on"}
+    # Linkify website if it looks like a URL (ensure startswith http)
+    if "website" in df.columns:
+        # We won't mutate df_display's column names here—website kept as 'website' internally,
+        # but it might be renamed in df_display. Find the displayed name for website:
+        website_display_name = LABEL_OVERRIDES.get("website", "website")
+        if website_display_name in df_filtered.columns:
+            def _ensure_http(u: str) -> str:
+                u = (u or "").strip()
+                if not u:
+                    return ""
+                if not re.match(r"(?i)^https?://", u):
+                    return "http://" + u
+                return u
+            df_filtered[website_display_name] = df_filtered[website_display_name].apply(_ensure_http)
 
-    # Coerce to string and normalize newlines
-    md = str(raw_md or "")
-    md = md.replace("\r\n", "\n").replace("\r", "\n")
-
-    # Remove BOM & surrounding whitespace
-    md = md.lstrip("\ufeff").strip()
-
-    # Drop a duplicated first line if it matches the title (case & spacing aware)
-    lines = md.split("\n")
-    first_nonempty_idx = next((i for i, L in enumerate(lines) if L.strip() != ""), None)
-    if first_nonempty_idx is not None:
-        if lines[first_nonempty_idx].strip() == title.strip():
-            lines[first_nonempty_idx] = ""
-            # also remove next blank line to avoid double spacing
-            j = first_nonempty_idx + 1
-            if j < len(lines) and lines[j].strip() == "":
-                lines[j] = ""
-    # Collapse runs of blank lines
-    cleaned_lines = []
-    last_blank = False
-    for L in lines:
-        is_blank = (L.strip() == "")
-        if is_blank and last_blank:
-            continue
-        cleaned_lines.append(L)
-        last_blank = is_blank
-    md = "\n".join(cleaned_lines).strip()
-
-    with st.expander(title, expanded=False):
-        if md:
-            st.markdown(md)
-            if debug_help:
-                with st.expander("Help MD (raw preview)", expanded=False):
-                    st.write(f"Length: {len(str(raw_md))} chars")
-                    st.code((str(raw_md)[:400] + ("…" if len(str(raw_md)) > 400 else "")) or "(empty)", language="text")
-        else:
-            # Quiet fallback — title already shown in the expander label
-            st.write(title)
-
-# -----------------------------
-# App UI (no page title)
-# -----------------------------
-render_help_expander()
-
-# Load and render data
-df = load_vendors_df()
-desired = ["business_name","category","service","contact_name","phone","address","website","notes","keywords"]
-show_cols = [c for c in df.columns if c in desired]
-columns_order = (["id"] + show_cols) if "id" in df.columns else show_cols
-
-if df.empty:
-    st.info("No records found.")
-else:
-    df_view = df[columns_order].copy()
-    widths_px = _get_column_widths_px()
-    _render_sortable_wrapped_table(
-        df_view,
-        widths_px,
-        height_px=720,
-        sticky_first_col=_sticky_first_col_enabled(),
-    )
-
-# -----------------------------
-# Bottom section: Download + Debug
-# -----------------------------
-if 'df_view' in locals() and not df_view.empty:
-    csv_bytes = df_view.to_csv(index=False).encode("utf-8-sig")
-    st.download_button(
-        label="Download providers as CSV",
-        data=csv_bytes,
-        file_name="providers.csv",
-        mime="text/csv",
+    # Show the table (click-to-sort is built-in)
+    st.dataframe(
+        df_filtered,
         use_container_width=True,
+        hide_index=True,
     )
 
-with st.expander("Status & Secrets (debug)", expanded=False):
-    st.write("**DB**", current_db_info())
-    try:
-        st.write("**Secrets keys**", sorted(list(st.secrets.keys())))
-        # Preview the help MD so you can confirm it's loaded
-        md = _get_secret("READONLY_HELP_MD", None)
-        if md is None or str(md).strip() == "":
-            st.write("Help MD: (missing or empty)")
-        else:
-            txt = str(md)
-            st.write(f"Help MD length: {len(txt)} chars")
-            st.code(txt[:120] + ("…" if len(txt) > 120 else ""), language="text")
 
-        raw_ro = st.secrets.get("COLUMN_WIDTHS_PX_READONLY", None)
-        raw = st.secrets.get("COLUMN_WIDTHS_PX", None)
-        st.write("**Raw COLUMN_WIDTHS_PX_READONLY (type)**", type(raw_ro).__name__)
-        if raw_ro is not None:
-            try:
-                st.json(dict(raw_ro))
-            except Exception:
-                st.code(repr(raw_ro))
-        st.write("**Raw COLUMN_WIDTHS_PX (type)**", type(raw).__name__)
-        if raw is not None:
-            try:
-                st.json(dict(raw))
-            except Exception:
-                st.code(repr(raw))
-        st.write("**Loaded column widths (effective)**")
-        st.json(_get_column_widths_px())
-        st.write("**Sticky first col enabled**:", _sticky_first_col_enabled())
-        st.write("**Column label overrides (if any)**", _get_column_labels())
-    except Exception as e:
-        st.write("Debug error:", str(e))
+if __name__ == "__main__":
+    main()
