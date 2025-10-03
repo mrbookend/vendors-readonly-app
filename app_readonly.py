@@ -57,7 +57,7 @@ st.markdown(
 # -----------------------------
 # Config
 # -----------------------------
-STICKY_FIRST_COL_DEFAULT = True  # can be overridden by READONLY_STICKY_FIRST_COL in secrets
+STICKY_FIRST_COL_DEFAULT = False  # can be overridden by READONLY_STICKY_FIRST_COL in secrets
 
 # -----------------------------
 # Secrets helpers
@@ -511,3 +511,9 @@ else:
         height_px=720,                          # viewport height
         sticky_first_col=_sticky_first_col_enabled(),
     )
+_render_sortable_wrapped_table(
+    df_view,
+    widths_px,
+    height_px=720,
+    sticky_first_col=False,   # force off
+)
