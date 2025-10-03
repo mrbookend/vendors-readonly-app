@@ -1,18 +1,16 @@
-pip==24.2
-setuptools==72.1.0
-wheel==0.44.0
+# Core framework
+streamlit==1.39.0
 
-# App deps
-streamlit==1.36.0
-pandas==2.2.2
-numpy==1.26.4
-SQLAlchemy==2.0.30
+# Database / ORM
+sqlalchemy==2.0.34
+pandas==2.2.3
 
-# Streamlit tends to pull protobuf; this avoids odd newest-major issues
-protobuf<5
+# AG Grid integration
+streamlit-aggrid==0.3.4.post3
 
-# Turso/libSQL dialect (keeps sqlite+libsql working)
-sqlalchemy-libsql
+# Drivers
+pysqlite3-binary==0.5.3        # Ensures sqlite works in some cloud envs
+libsql-experimental==0.1.7     # Needed for Turso/libSQL
 
-# AgGrid for real auto-expand rows
-streamlit-aggrid>=0.3.4
+# Optional helpers
+python-dateutil==2.9.0.post0
