@@ -6,12 +6,13 @@
 # - Quick filter (client-side)
 # - Optional sticky first column (id) — default OFF
 # - Wide page layout with configurable max width via secrets
-# - Help modal (opens on click, iframe height expands while open)
+# - Help modal (opens on click, iframe height set from secrets)
+
 from __future__ import annotations
 
 import os
 import re
-import html
+import html as py_html  # avoid name clash with HTML strings
 from typing import List, Dict, Optional
 
 import pandas as pd
@@ -19,9 +20,10 @@ import streamlit as st
 from sqlalchemy import create_engine, text as sql_text
 from sqlalchemy.engine import Engine
 import streamlit.components.v1 as components
+import uuid
 
 # -----------------------------
-# Page layout (must happen before any other Streamlit UI output)
+# Early layout setup
 # -----------------------------
 def _read_secret_early(name: str, default=None):
     try:
@@ -39,29 +41,25 @@ try:
 except Exception:
     _max_w = 3000
 
-# First UI call
 st.set_page_config(page_title=_title, layout="wide", initial_sidebar_state=_sidebar)
 st.markdown(
     f"""
     <style>
-    .main .block-container {{
+      .main .block-container {{
         max-width: {_max_w}px;
         padding-left: 16px;
         padding-right: 16px;
-    }}
+      }}
     </style>
     """,
     unsafe_allow_html=True,
 )
 
 # -----------------------------
-# Config
+# Config + secrets helpers
 # -----------------------------
-STICKY_FIRST_COL_DEFAULT = False  # can be overridden by READONLY_STICKY_FIRST_COL in secrets
+STICKY_FIRST_COL_DEFAULT = False
 
-# -----------------------------
-# Secrets helpers
-# -----------------------------
 def _get_secret(name: str, default: Optional[str | int | bool] = None):
     try:
         if name in st.secrets:
@@ -88,11 +86,6 @@ def _get_bool_secret(name: str, default: bool) -> bool:
         return False
     return default
 
-def _get_libsql_creds() -> Dict[str, Optional[str]]:
-    url = (_get_secret("LIBSQL_URL") or _get_secret("TURSO_DATABASE_URL"))
-    token = (_get_secret("LIBSQL_AUTH_TOKEN") or _get_secret("TURSO_AUTH_TOKEN"))
-    return {"url": url, "token": token}
-
 # -----------------------------
 # DB engine
 # -----------------------------
@@ -108,6 +101,11 @@ def _append_secure_param(dsn: str) -> str:
         return dsn
     return f"{dsn}&secure=true" if "?" in dsn else f"{dsn}?secure=true"
 
+def _get_libsql_creds() -> Dict[str, Optional[str]]:
+    url = (_get_secret("LIBSQL_URL") or _get_secret("TURSO_DATABASE_URL"))
+    token = (_get_secret("LIBSQL_AUTH_TOKEN") or _get_secret("TURSO_AUTH_TOKEN"))
+    return {"url": url, "token": token}
+
 def current_db_info() -> Dict[str, Optional[str]]:
     creds = _get_libsql_creds()
     if creds["url"]:
@@ -119,11 +117,7 @@ def current_db_info() -> Dict[str, Optional[str]]:
             "auth": "token_set" if creds["token"] else "no_token",
         }
     sqlite_path = _get_secret("SQLITE_PATH") or os.path.join(os.path.dirname(os.path.abspath(__file__)), "vendors.db")
-    return {
-        "backend": "sqlite",
-        "dsn": f"sqlite:///{sqlite_path}",
-        "auth": None,
-    }
+    return {"backend": "sqlite", "dsn": f"sqlite:///{sqlite_path}", "auth": None}
 
 def get_engine() -> Engine:
     info = current_db_info()
@@ -145,12 +139,9 @@ def _width_value_to_px(val) -> int:
     if isinstance(val, int):
         return max(20, val)
     s = str(val).strip().lower()
-    if s in {"small", "s"}:
-        return 100
-    if s in {"medium", "m"}:
-        return 160
-    if s in {"large", "l"}:
-        return 240
+    if s in {"small", "s"}:  return 100
+    if s in {"medium", "m"}: return 160
+    if s in {"large", "l"}:  return 240
     try:
         return max(20, int(s))
     except Exception:
@@ -159,18 +150,17 @@ def _width_value_to_px(val) -> int:
 def _coerce_map(obj) -> Dict[str, int]:
     out: Dict[str, int] = {}
     try:
-        items = obj.items()  # Mapping/AttrDict-like
+        items = obj.items()
     except Exception:
         return out
     for k, v in items:
-        key = str(k).strip().lower()
-        out[key] = _width_value_to_px(v)
+        out[str(k).strip().lower()] = _width_value_to_px(v)
     return out
 
 def _get_column_widths_px() -> Dict[str, int]:
     """
     Prefer COLUMN_WIDTHS_PX_READONLY; fallback to COLUMN_WIDTHS_PX.
-    Accepts Streamlit AttrDict mapping, JSON-like mapping, or key/val mapping in TOML block.
+    Accepts Streamlit AttrDict mapping, JSON mapping string, or key/val mapping text.
     """
     import json
     from collections.abc import Mapping
@@ -208,7 +198,6 @@ def _get_column_widths_px() -> Dict[str, int]:
     else:
         mapping = {}
 
-    # Optional website width override (legacy)
     website_w = _get_int_secret("WEBSITE_COL_WIDTH_PX", 0)
     if website_w and "website" not in mapping:
         mapping["website"] = website_w
@@ -245,7 +234,6 @@ def load_vendors_df() -> pd.DataFrame:
         return pd.DataFrame()
     with engine.begin() as conn:
         df = pd.read_sql_query(sql_text(f"SELECT {', '.join(sel_cols)} FROM vendors"), conn)
-    # Tidy display
     if "service" in df.columns:
         df["service"] = df["service"].apply(lambda v: v if (isinstance(v, str) and v.strip()) else "")
     if "category" in df.columns:
@@ -263,14 +251,6 @@ def _render_sortable_wrapped_table(
     height_px: int = 720,
     sticky_first_col: bool = False,
 ) -> None:
-    """
-    Client-side sortable table with:
-      - True pixel widths via <colgroup>
-      - Wrapped cells -> rows auto-grow
-      - Sticky header
-      - Optional sticky first column (id)
-      - Quick filter
-    """
     if df.empty:
         st.info("No vendors found.")
         return
@@ -285,13 +265,13 @@ def _render_sortable_wrapped_table(
 
     head_css = f"""
     <style>
-    .tbl-container {{
+      .tbl-container {{
         border: 1px solid #e6e6e6;
         border-radius: 8px;
         overflow: hidden;
         box-shadow: 0 1px 2px rgba(0,0,0,0.04);
-    }}
-    .tbl-toolbar {{
+      }}
+      .tbl-toolbar {{
         padding: 8px 10px;
         border-bottom: 1px solid #eee;
         background: #fafafa;
@@ -299,80 +279,76 @@ def _render_sortable_wrapped_table(
         gap: 8px;
         align-items: center;
         font-size: 14px;
-    }}
-    .tbl-filter {{
+      }}
+      .tbl-filter {{
         flex: 1;
         padding: 6px 8px;
         border: 1px solid #ddd;
         border-radius: 6px;
         outline: none;
-    }}
-    .tbl-viewport {{
-        max-height: {height_px - 46}px; /* toolbar height */
+      }}
+      .tbl-viewport {{
+        max-height: {height_px - 46}px;
         overflow: auto;
-    }}
-    table.tbl {{
+      }}
+      table.tbl {{
         table-layout: fixed;
         width: 100%;
         border-collapse: collapse;
         font-size: 14px;
-    }}
-    .tbl th, .tbl td {{
+      }}
+      .tbl th, .tbl td {{
         border-bottom: 1px solid #f0f0f0;
         padding: 6px 8px;
         vertical-align: top;
-    }}
-    .tbl thead th {{
+      }}
+      .tbl thead th {{
         position: sticky;
         top: 0;
         background: #ffffff;
         z-index: 2;
         cursor: pointer;
         user-select: none;
-    }}
-    .tbl tbody tr:hover {{ background: #fcfcfc; }}
-    .tbl td {{
-        white-space: normal;        /* wrapping on */
+      }}
+      .tbl tbody tr:hover {{ background: #fcfcfc; }}
+      .tbl td {{
+        white-space: normal;
         word-break: break-word;
         text-overflow: clip;
         overflow: visible;
-    }}
-    .th-inner {{
+      }}
+      .th-inner {{
         display: inline-flex;
         align-items: center;
         gap: 6px;
-    }}
-    .sort-arrow {{ font-size: 12px; color: #888; visibility: hidden; }}
-    th.sorted .sort-arrow {{ visibility: visible; }}
+      }}
+      .sort-arrow {{ font-size: 12px; color: #888; visibility: hidden; }}
+      th.sorted .sort-arrow {{ visibility: visible; }}
 
-    /* Sticky first column support */
-    .tbl .sticky-col {{
+      .tbl .sticky-col {{
         position: sticky;
         left: 0;
         z-index: 3;
         background: #ffffff;
-    }}
-    .tbl thead th.sticky-col {{ z-index: 4; }}
-    .sticky-shadow {{ box-shadow: 2px 0 0 rgba(0,0,0,0.06); }}
+      }}
+      .tbl thead th.sticky-col {{ z-index: 4; }}
+      .sticky-shadow {{ box-shadow: 2px 0 0 rgba(0,0,0,0.06); }}
     </style>
     """
 
-    # Build colgroup with explicit widths
     colgroup = ["<colgroup>"] + [f'<col style="width:{_px(c)}px">' for c in cols] + ["</colgroup>"]
 
-    # Header (click-to-sort)
     thead = ["<thead><tr>"]
     for idx, c in enumerate(cols):
-        label = html.escape(c.replace("_", " ").title())
+        label = py_html.escape(c.replace("_", " ").title())
         th_classes = ' class="sticky-col sticky-shadow"' if (sticky_first_col and idx == 0) else ""
         thead.append(
-            f'<th{th_classes} data-col="{html.escape(c)}">'
+            f'<th{th_classes} data-col="{py_html.escape(c)}">'
             f'<span class="th-inner">{label}<span class="sort-arrow">▲</span></span>'
             f"</th>"
         )
     thead.append("</tr></thead>")
 
-    # Body
     tbody = ["<tbody>"]
     for _, row in df.iterrows():
         tbody.append("<tr>")
@@ -380,19 +356,19 @@ def _render_sortable_wrapped_table(
             val = row[c]
             td_class = ' class="sticky-col sticky-shadow"' if (sticky_first_col and idx == 0) else ""
             if c == "website" and isinstance(val, str) and val.strip():
-                href = html.escape(val)
-                text = html.escape(val)
+                href = py_html.escape(val)
+                text = py_html.escape(val)
                 tbody.append(f'<td{td_class}><a href="{href}" target="_blank" rel="noopener noreferrer">{text}</a></td>')
             else:
                 safe = "" if pd.isna(val) else str(val)
-                tbody.append(f"<td{td_class}>{html.escape(safe)}</td>")
+                tbody.append(f"<td{td_class}>{py_html.escape(safe)}</td>")
         tbody.append("</tr>")
     tbody.append("</tbody>")
 
-    # Quick filter + sort JS
+    # (plain triple-quoted string — no f-string, so braces are fine)
     script = """
     <script>
-    (function() {
+      (function() {
         const container = document.currentScript.closest('.tbl-container');
         const input = container.querySelector('.tbl-filter');
         const table = container.querySelector('table.tbl');
@@ -402,44 +378,44 @@ def _render_sortable_wrapped_table(
         let sortState = {}; // colIndex -> 'asc'|'desc'
 
         function getCellText(td) {
-            return (td.textContent || td.innerText || '').trim();
+          return (td.textContent || td.innerText || '').trim();
         }
         function compare(a, b, idx, asc) {
-            const ta = getCellText(a.cells[idx]);
-            const tb = getCellText(b.cells[idx]);
-            const na = parseFloat(ta.replace(/[^0-9.-]/g, ''));
-            const nb = parseFloat(tb.replace(/[^0-9.-]/g, ''));
-            const bothNumeric = !isNaN(na) && !isNaN(nb) && ta !== '' && tb !== '';
-            let cmp = 0;
-            if (bothNumeric) cmp = na - nb;
-            else cmp = ta.localeCompare(tb, undefined, {sensitivity: 'base'});
-            return asc ? cmp : -cmp;
+          const ta = getCellText(a.cells[idx]);
+          const tb = getCellText(b.cells[idx]);
+          const na = parseFloat(ta.replace(/[^0-9.-]/g, ''));
+          const nb = parseFloat(tb.replace(/[^0-9.-]/g, ''));
+          const bothNumeric = !isNaN(na) && !isNaN(nb) && ta !== '' && tb !== '';
+          let cmp = 0;
+          if (bothNumeric) cmp = na - nb;
+          else cmp = ta.localeCompare(tb, undefined, {sensitivity: 'base'});
+          return asc ? cmp : -cmp;
         }
 
         headers.forEach((th, idx) => {
-            th.addEventListener('click', () => {
-                const dir = sortState[idx] === 'asc' ? 'desc' : 'asc';
-                sortState = {}; sortState[idx] = dir;
+          th.addEventListener('click', () => {
+            const dir = sortState[idx] === 'asc' ? 'desc' : 'asc';
+            sortState = {}; sortState[idx] = dir;
 
-                headers.forEach(h => h.classList.remove('sorted'));
-                th.classList.add('sorted');
-                const arrow = th.querySelector('.sort-arrow');
-                if (arrow) arrow.textContent = dir === 'asc' ? '▲' : '▼';
+            headers.forEach(h => h.classList.remove('sorted'));
+            th.classList.add('sorted');
+            const arrow = th.querySelector('.sort-arrow');
+            if (arrow) arrow.textContent = dir === 'asc' ? '▲' : '▼';
 
-                const rows = Array.from(tbody.rows);
-                rows.sort((ra, rb) => compare(ra, rb, idx, dir === 'asc'));
-                rows.forEach(r => tbody.appendChild(r));
-            });
+            const rows = Array.from(tbody.rows);
+            rows.sort((ra, rb) => compare(ra, rb, idx, dir === 'asc'));
+            rows.forEach(r => tbody.appendChild(r));
+          });
         });
 
         input.addEventListener('input', () => {
-            const q = input.value.toLowerCase();
-            Array.from(tbody.rows).forEach(tr => {
-                const text = tr.innerText.toLowerCase();
-                tr.style.display = text.includes(q) ? '' : 'none';
-            });
+          const q = input.value.toLowerCase();
+          Array.from(tbody.rows).forEach(tr => {
+            const text = tr.innerText.toLowerCase();
+            tr.style.display = text.includes(q) ? '' : 'none';
+          });
         });
-    })();
+      })();
     </script>
     """
 
@@ -463,36 +439,31 @@ def _render_sortable_wrapped_table(
     components.html(html_doc, height=height_px, scrolling=True)
 
 # -----------------------------
-# Help modal content (secrets-driven)
+# Help modal (secrets-driven content & sizing)
 # -----------------------------
 DEFAULT_HELP_HTML = """
 <div style="line-height:1.55;">
   <h2 style="margin:0 0 10px;">Vendors — How to Use</h2>
-
   <h3 style="margin:14px 0 6px;">Sorting</h3>
   <ul>
     <li>Click a column header to sort ascending; click again for descending (▲ / ▼).</li>
     <li>Numeric columns sort numerically; others sort A→Z.</li>
   </ul>
-
   <h3 style="margin:14px 0 6px;">Filtering</h3>
   <ul>
     <li>Use the <strong>Quick filter</strong> box above the table.</li>
     <li>It matches text across <em>all</em> columns.</li>
   </ul>
-
   <h3 style="margin:14px 0 6px;">Viewing Long Text</h3>
   <ul>
     <li>Cells wrap automatically; row height expands to fit content.</li>
     <li>Scroll horizontally if a column is off-screen.</li>
   </ul>
-
   <h3 style="margin:14px 0 6px;">Copy & Links</h3>
   <ul>
     <li>Select text in any cell and press Ctrl/Cmd+C to copy.</li>
     <li>Website values are clickable and open in a new tab.</li>
   </ul>
-
   <h3 style="margin:14px 0 6px;">Column Widths</h3>
   <ul>
     <li>Set pixel widths in <code>[COLUMN_WIDTHS_PX_READONLY]</code> in secrets.</li>
@@ -501,17 +472,6 @@ DEFAULT_HELP_HTML = """
 </div>
 """
 
-# ---- Help modal (large content friendly) ----
-import uuid, streamlit.components.v1 as components
-
-def _get_secret(name, default=None):
-    try:
-        if name in st.secrets:
-            return st.secrets[name]
-    except Exception:
-        pass
-    return os.environ.get(name, default)
-
 def _help_sizes_from_secrets():
     def _int(name, default):
         val = _get_secret(name, default)
@@ -519,59 +479,41 @@ def _help_sizes_from_secrets():
             return int(val)
         except Exception:
             return default
-    width_px   = _int("READONLY_HELP_WIDTH_PX", 900)
-    max_h_vh   = _int("READONLY_HELP_MAX_H_VH", 90)
-    font_px    = _int("READONLY_HELP_FONT_PX", 14)
-    # One height is enough; components.html cannot resize after render.
-    # Use a large height here so the modal isn't clipped.
-    iframe_h   = _int("READONLY_HELP_IFRAME_H_PX", 1000)
+    width_px = _int("READONLY_HELP_WIDTH_PX", 900)
+    max_h_vh = _int("READONLY_HELP_MAX_H_VH", 90)
+    font_px  = _int("READONLY_HELP_FONT_PX", 14)
+    iframe_h = _int("READONLY_HELP_IFRAME_H_PX", 1000)
     return width_px, max_h_vh, font_px, iframe_h
 
-def _load_help_html():
-    # 1) Prefer explicit HTML from secrets
+def _load_help_html() -> str:
     html_from_secrets = _get_secret("READONLY_HELP_HTML", None)
     if html_from_secrets and str(html_from_secrets).strip():
         return str(html_from_secrets)
 
-    # 2) Or convert a simple Markdown block to HTML
     md = _get_secret("READONLY_HELP_MD", None)
     if md and str(md).strip():
         text = str(md)
-
-        # minimal, safe-ish conversion (no external libs):
-        # headings
         lines = []
         for line in text.split("\n"):
             if line.startswith("### "):
-                lines.append(f"<h3>{html.escape(line[4:])}</h3>")
+                lines.append(f"<h3>{py_html.escape(line[4:])}</h3>")
             elif line.startswith("## "):
-                lines.append(f"<h2>{html.escape(line[3:])}</h2>")
+                lines.append(f"<h2>{py_html.escape(line[3:])}</h2>")
             elif line.startswith("# "):
-                lines.append(f"<h1>{html.escape(line[2:])}</h1>")
+                lines.append(f"<h1>{py_html.escape(line[2:])}</h1>")
             else:
-                lines.append(html.escape(line))
+                lines.append(py_html.escape(line))
         text2 = "\n".join(lines)
-        # bold/italic (very light-touch)
         text2 = text2.replace("**", "<strong>").replace("__", "<u>")
-        # paragraph breaks on blank lines
         paras = [f"<p>{p.strip()}</p>" for p in text2.split("\n\n") if p.strip()]
         return "\n".join(paras)
 
-    # 3) Fallback default
-    return """
-    <h2>Vendors Help</h2>
-    <p>Use the Quick filter to find vendors fast. Click a column header to sort; click again to reverse.</p>
-    <ul>
-      <li>Long text wraps; rows grow in height automatically.</li>
-      <li>Copy any cell (Ctrl/Cmd+C). Website opens in a new tab.</li>
-      <li>Widths come from <code>[COLUMN_WIDTHS_PX_READONLY]</code> in secrets.</li>
-    </ul>
-    """
+    return DEFAULT_HELP_HTML
 
 def _render_help_modal():
     style = str(_get_secret("READONLY_HELP_STYLE", "modal")).strip().lower()
     if style != "modal":
-        # non-modal fallback (popover/expander)
+        # Non-modal fallback
         if style == "popover" and hasattr(st, "popover"):
             with st.popover("Help"):
                 st.markdown(_get_secret("READONLY_HELP_MD", "No help text configured."))
@@ -584,6 +526,7 @@ def _render_help_modal():
     w, mh, fs, iframe_h = _help_sizes_from_secrets()
     body_html = _load_help_html()
 
+    # f-string with lots of braces: ALL CSS/JS braces are doubled {{ }}
     html_doc = f"""
     <div id="{uid}_root">
       <button id="{uid}_open" class="help-btn">Help</button>
@@ -630,7 +573,7 @@ def _render_help_modal():
       .help-body li {{ margin: 4px 0; }}
     </style>
     <script>
-      (function(){{
+      (function() {{
         const overlay  = document.getElementById("{uid}_overlay");
         const openBtn  = document.getElementById("{uid}_open");
         const closeBtn = document.getElementById("{uid}_close");
@@ -665,14 +608,14 @@ def _render_help_modal():
     </script>
     """
 
-    # IMPORTANT: actually use the tall height from secrets
     components.html(html_doc, height=iframe_h, scrolling=False)
-    # Optional: tiny debug line so you can verify the effective height
     st.caption(f"Help iframe height in use: {iframe_h}px")
 
-# Render the Help button+modal
+# -----------------------------
+# App UI
+# -----------------------------
+st.title("Vendors (Read-only)")
 _render_help_modal()
-# ---- end Help modal ----
 
 with st.expander("Status & Secrets (debug)", expanded=False):
     st.write("**DB**", current_db_info())
@@ -698,12 +641,9 @@ with st.expander("Status & Secrets (debug)", expanded=False):
     except Exception as e:
         st.write("Debug error:", str(e))
 
-# Load data
+# Load and render data
 df = load_vendors_df()
-
-# Column order to display
-desired = ["business_name","category","service","contact_name",
-           "phone","address","website","notes","keywords"]
+desired = ["business_name","category","service","contact_name","phone","address","website","notes","keywords"]
 show_cols = [c for c in df.columns if c in desired]
 columns_order = (["id"] + show_cols) if "id" in df.columns else show_cols
 
@@ -712,13 +652,11 @@ if df.empty:
 else:
     df_view = df[columns_order].copy()
     widths_px = _get_column_widths_px()
-
-    # Prevent accidental double-render in Streamlit re-run edge cases
     if not st.session_state.get("_rendered_grid_once"):
         st.session_state["_rendered_grid_once"] = True
         _render_sortable_wrapped_table(
             df_view,
             widths_px,
-            height_px=720,  # viewport height
-            sticky_first_col=_sticky_first_col_enabled(),  # defaults to False unless enabled in secrets
+            height_px=720,
+            sticky_first_col=_sticky_first_col_enabled(),
         )
