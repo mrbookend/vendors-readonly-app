@@ -337,6 +337,41 @@ def render_help():
         else:
             st.info("No help content has been configured yet.")
 
+# ---------- Quick filter helpers ----------
+def _quick_filter_ui():
+    # Call this immediately AFTER render_help()
+    return st.text_input("Quick filter (type words or parts of words):", "", placeholder="e.g., plumber roof 78240")
+
+def _apply_quick_filter(df: pd.DataFrame, query: str) -> pd.DataFrame:
+    q = (query or "").strip().lower()
+    if not q:
+        return df
+    terms = [t for t in q.split() if t]
+    if not terms:
+        return df
+
+    # Build a single lowercase search blob per row across key columns
+    cols = [c for c in df.columns if c.lower() in {
+        "business_name","provider","category","service","contact_name",
+        "phone","address","website","notes","keywords","website url"
+    }]
+    if not cols:
+        return df
+
+    blob = (
+        df[cols]
+        .fillna("")
+        .astype(str)
+        .agg(" ".join, axis=1)
+        .str.lower()
+    )
+    # AND-match: all terms must appear somewhere in the row
+    mask = pd.Series(True, index=df.index)
+    for t in terms:
+        mask &= blob.str.contains(t, na=False)
+    return df[mask]
+
+
 # -----------------------------
 # Data access + Audit helpers
 # -----------------------------
