@@ -243,7 +243,9 @@ def _fetch_df() -> pd.DataFrame:
     for col in RAW_COLS + AUDIT_COLS:
         if col not in df.columns:
             df[col] = ""
-    return df[[c for c in df.columns if c in (RAW_COLS + AUDIT_COLS)]]
+    # Preserve column order but tolerate missing audit cols in DB
+    desired = [c for c in (RAW_COLS + AUDIT_COLS) if c in df.columns]
+    return df[desired]
 
 @st.cache_data(ttl=30)
 def _cats_cached():
@@ -467,4 +469,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-PY
