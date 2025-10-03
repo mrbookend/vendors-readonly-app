@@ -1,21 +1,38 @@
 # app_readonly.py
-# Vendors — Read-only view (AG Grid)
-# - Uses st_aggrid (no per-column filters/menus), single global Quick Search
-# - Turso/libSQL first with token; clean fallback to local SQLite vendors.db
-# - Column labels & pixel widths from secrets (with defaults)
-# - Website column rendered as clickable "Open" link
+# Vendors — Read-only (AG Grid)
+# - st_aggrid table with ONE global Quick Search (AND across tokens), NO per-column filters/menus
+# - Turso/libSQL preferred (sqlite+libsql with auth token), clean fallback to local SQLite vendors.db
+# - Column labels & pixel widths from secrets (with sane defaults; partial overrides OK)
+# - Website column rendered as a clickable "Open" link (new tab)
 # - Wide page layout & sidebar state from secrets
-# - CSV download + comprehensive debug/status section
+# - CSV download (respects current quick search) + a thorough debug/status expander
+#
+# Secrets you can set (all optional except DB if using Turso):
+#   page_title, page_max_width_px, sidebar_state,
+#   READONLY_HELP_TITLE, READONLY_HELP_MD,
+#   READONLY_COLUMN_LABELS, COLUMN_WIDTHS_PX_READONLY,
+#   TURSO_DATABASE_URL, TURSO_AUTH_TOKEN
+#
+# Requirements (requirements.txt):
+#   streamlit==1.39.0
+#   pandas==2.2.2
+#   sqlalchemy==2.0.34
+#   streamlit-aggrid==0.3.4.post3
+#   libsql-experimental==0.1.7
+#
+# Optional runtime pin (runtime.txt):
+#   python-3.11.9
 
 from __future__ import annotations
 
 import os
-from typing import Dict, List
+from typing import Dict, List, Tuple
 
 import pandas as pd
 import streamlit as st
 from sqlalchemy import create_engine, text as sql_text
 from sqlalchemy.engine import Engine
+
 from st_aggrid import (
     AgGrid,
     GridOptionsBuilder,
@@ -28,6 +45,7 @@ from st_aggrid import (
 # Early secret/env access
 # =========================
 def _read_secret_early(name: str, default=None):
+    """Read from st.secrets if available, else environment, else default."""
     try:
         if name in st.secrets:
             return st.secrets[name]
@@ -73,12 +91,12 @@ def _apply_page_width_css():
 _apply_page_width_css()
 
 # =========================
-# Config/labels/widths
+# Help content & column config
 # =========================
 HELP_TITLE = _read_secret_early("READONLY_HELP_TITLE", "Provider Help / Tips")
 HELP_MD = _read_secret_early(
     "READONLY_HELP_MD",
-    "Use the global Quick Search to find vendors by any word(s). Click any header to sort."
+    "Use the global Quick Search (below) for partial word matches; tokens are ANDed. Click headers to sort."
 )
 
 # Default DB→Display label mapping
@@ -97,6 +115,7 @@ DEFAULT_LABELS: Dict[str, str] = {
 LABEL_OVERRIDES = _read_secret_early("READONLY_COLUMN_LABELS", {})
 DISPLAY_LABELS = {**DEFAULT_LABELS, **LABEL_OVERRIDES} if isinstance(LABEL_OVERRIDES, dict) else DEFAULT_LABELS
 
+# Pixel widths per DB column key
 DEFAULT_WIDTHS_PX: Dict[str, int] = {
     "id": 60,
     "business_name": 300,
@@ -112,7 +131,7 @@ DEFAULT_WIDTHS_PX: Dict[str, int] = {
 WIDTHS_RAW = _read_secret_early("COLUMN_WIDTHS_PX_READONLY", None)
 COLUMN_WIDTHS_PX: Dict[str, int] = {**DEFAULT_WIDTHS_PX, **WIDTHS_RAW} if isinstance(WIDTHS_RAW, dict) else DEFAULT_WIDTHS_PX
 
-# Display order (no sticky columns requested)
+# Preferred display order (URL right after Address; ID last)
 DISPLAY_ORDER = [
     "category", "business_name", "contact_name", "phone",
     "address", "website", "notes", "keywords", "id"
@@ -120,9 +139,10 @@ DISPLAY_ORDER = [
 DISPLAY_ORDER = [c for c in DISPLAY_ORDER if c in DEFAULT_LABELS]
 
 # =========================
-# DB Engine
+# DB Engine (Turso → SQLite)
 # =========================
-def build_engine() -> tuple[Engine, dict]:
+def build_engine() -> Tuple[Engine, dict]:
+    """Create SQLAlchemy engine preferring Turso/libSQL; fallback to local SQLite."""
     libsql_url = _read_secret_early("TURSO_DATABASE_URL", None)
     if not libsql_url:
         raw = _read_secret_early("LIBSQL_URL", None)
@@ -133,6 +153,7 @@ def build_engine() -> tuple[Engine, dict]:
     if libsql_url and libsql_url.startswith("libsql://"):
         libsql_url = "sqlite+libsql://" + libsql_url[len("libsql://"):]
 
+    # Try remote first
     if libsql_url and auth_token:
         try:
             eng = create_engine(libsql_url, connect_args={"auth_token": auth_token})
@@ -142,6 +163,7 @@ def build_engine() -> tuple[Engine, dict]:
         except Exception as e:
             st.warning(f"Turso connection failed ({e!r}). Falling back to local SQLite vendors.db.")
 
+    # Local SQLite fallback (portable path detection)
     candidates = [
         os.path.join(os.getcwd(), "vendors.db"),
         "/mount/src/vendors-readonly-app/vendors.db",
@@ -167,9 +189,10 @@ def load_vendors(_engine: Engine) -> pd.DataFrame:
         available = set(info["name"].tolist())
         select_cols = [c for c in cols if c in available]
         if not select_cols:
-            raise RuntimeError("vendors table exists but no expected columns were found.")
+            raise RuntimeError("vendors table exists but none of the expected columns were found.")
         df = pd.read_sql(sql_text(f"SELECT {', '.join(select_cols)} FROM vendors"), conn)
 
+    # Normalize types
     for c in df.columns:
         if c != "id":
             df[c] = df[c].astype("string").fillna("")
@@ -185,23 +208,30 @@ except Exception as e:
 # UI — Header & Help
 # =========================
 st.title(PAGE_TITLE)
-if st.button("Open Help / Tips", key="open_help"):
-    with st.modal(HELP_TITLE, max_width=800):
+
+# Show Help/Tips via popover if available, else expander
+try:
+    with st.popover(HELP_TITLE):  # Streamlit >= 1.30
+        st.markdown(HELP_MD or "_No help content configured._")
+except AttributeError:
+    with st.expander(HELP_TITLE, expanded=False):
         st.markdown(HELP_MD or "_No help content configured._")
 
 # =========================
-# Quick Search (global, AND across words, partials)
+# Global Quick Search (under Help)
 # =========================
 def _tokenize(q: str) -> List[str]:
     return [t.strip() for t in q.split() if t.strip()]
 
 search_query = st.text_input(
-    "Quick Search (all partial words; AND across words). e.g., `plumb repair`",
+    "Quick Search (partial words; AND across words). e.g., `plumb repair`",
     key="quick_search",
-    help="Searches across all text fields. Case-insensitive partial matches; tokens are ANDed."
+    help="Applies to all visible columns. Case-insensitive partial matches; tokens are ANDed."
 ).strip()
 
-def filter_df(df: pd.DataFrame, query: str) -> pd.DataFrame:
+# We'll use AG Grid's built-in quickFilter for display AND also filter in Python
+# so that the CSV download matches the search results exactly.
+def py_filter(df: pd.DataFrame, query: str) -> pd.DataFrame:
     if not query:
         return df
     tokens = _tokenize(query.lower())
@@ -217,7 +247,7 @@ def filter_df(df: pd.DataFrame, query: str) -> pd.DataFrame:
         mask &= joined.str.contains(t, na=False)
     return df2[mask]
 
-df_filtered = filter_df(df_raw, search_query)
+df_filtered = py_filter(df_raw, search_query)
 
 # =========================
 # Prepare display frame (labels + order)
@@ -235,25 +265,24 @@ def apply_labels_and_order(df: pd.DataFrame) -> pd.DataFrame:
 df_display = apply_labels_and_order(df_filtered)
 st.caption(f"{len(df_display):,} vendor(s) shown")
 
-# =========================
-# AG Grid setup (no per-column filters/menus)
-# =========================
-# Reverse map labels -> DB keys
+# Reverse map labels -> DB keys (used for widths)
 label_to_key = {DISPLAY_LABELS.get(k, k): k for k in DISPLAY_LABELS}
 
-# Custom JS renderer for website column to show "Open" and click out
+# =========================
+# AG Grid setup (NO per-column filters/menus)
+# =========================
+# Renderer for Website links
 link_renderer = JsCode(
     """
     class LinkRenderer {
       init(params) {
-        const url = params.value || '';
-        const text = 'Open';
-        const e = document.createElement('a');
-        e.href = url;
-        e.target = '_blank';
-        e.rel = 'noopener noreferrer';
-        e.innerText = (url && url.trim().length > 0) ? text : '';
-        this.eGui = e;
+        const url = (params.value || '').trim();
+        const a = document.createElement('a');
+        a.href = url || '#';
+        a.target = '_blank';
+        a.rel = 'noopener noreferrer';
+        a.innerText = url ? 'Open' : '';
+        this.eGui = a;
       }
       getGui() { return this.eGui; }
     }
@@ -262,20 +291,21 @@ link_renderer = JsCode(
 
 g = GridOptionsBuilder.from_dataframe(df_display)
 
-# Default col def: no filters, no menus, sorting on, resizable, wrap + autoHeight
+# Global defaults: no per-column filters, no menus, sorting & resizing on, wrap text
 g.configure_default_column(
-    filter=False,              # disable per-column filter
+    filter=False,               # disable per-column filter UI
     sortable=True,
     resizable=True,
-    menuTabs=[],               # hide column menu entirely
     wrapText=True,
     autoHeight=True,
+    suppressMenu=True,          # hide the column menu
 )
 
 # Column widths + special Website renderer
 for disp_col in df_display.columns:
     db_key = label_to_key.get(disp_col, disp_col)
     width_px = COLUMN_WIDTHS_PX.get(db_key, None)
+
     if db_key == "website":
         g.configure_column(
             disp_col,
@@ -290,11 +320,10 @@ for disp_col in df_display.columns:
             suppressSizeToFit=True,
         )
 
-# Global quick filter text (kept in sync with our st.text_input)
 grid_options = g.build()
+# Wire the grid's built-in quick filter to our search box
 grid_options["quickFilterText"] = search_query
 
-# Render grid
 AgGrid(
     df_display,
     gridOptions=grid_options,
@@ -307,7 +336,7 @@ AgGrid(
 )
 
 # =========================
-# Download (CSV uses DB keys)
+# Download (CSV uses DB keys; respects Quick Search)
 # =========================
 csv_bytes = df_filtered.to_csv(index=False).encode("utf-8")
 st.download_button(
