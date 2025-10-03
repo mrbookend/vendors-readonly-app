@@ -2,7 +2,7 @@
 # Tabs: View | Categories | Services | Changelog
 # - No top-level Streamlit renders; init happens inside main()
 # - Read-only: NEVER mutates DB (no schema changes, no writes)
-# - Hardened debug (gated via ADMIN_DEBUG), safe prints (no None)
+# - Debug panel gated via ADMIN_DEBUG (secrets/env)
 # - Cross-platform timestamp formatting, CSS widths/sticky, link column
 # - Cached lookups for categories/services
 
@@ -29,7 +29,7 @@ eng: Engine | None = None
 def _read_secret(name: str, default=None):
     """
     Read from Streamlit secrets first (if available), then environment.
-    Guarded to avoid errors when st.secrets is unavailable.
+    Robust to missing st.secrets.
     """
     try:
         s = getattr(st, "secrets", None)
@@ -38,10 +38,7 @@ def _read_secret(name: str, default=None):
                 if name in s:
                     return s[name]
             except Exception:
-                try:
-                    return s[name]
-                except Exception:
-                    pass
+                pass
     except Exception:
         pass
     return os.environ.get(name, default)
@@ -57,8 +54,31 @@ def _now_iso() -> str:
     # UTC ISO 8601 (seconds precision)
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
 
-def _nz(x, default=""):
-    return default if x is None else x
+def _digits_only(s: str) -> str:
+    return re.sub(r"[^0-9]", "", s or "")
+
+def _format_phone_10(digits: str) -> str:
+    d = _digits_only(digits)
+    if len(d) != 10:
+        return ""
+    return f"({d[0:3]}) {d[3:6]}-{d[6:10]}"
+
+def _normalize_url(u: str) -> str:
+    """Return normalized URL or empty string if invalid."""
+    s = (u or "").strip()
+    if not s:
+        return ""
+    if not s.lower().startswith(("http://", "https://")):
+        s = "http://" + s
+    try:
+        p = urlparse(s)
+        if p.scheme not in ("http", "https"):
+            return ""
+        if not p.netloc or "." not in p.netloc:
+            return ""
+        return s
+    except Exception:
+        return ""
 
 # -----------------------------
 # Page config
@@ -105,8 +125,8 @@ HELP_DEBUG: bool = _get_bool(
     _get_bool(LABEL_OVERRIDES.get("readonly_help_debug"), False),
 )
 
-# Gate the debug panel (A)
-SHOW_DEBUG = bool(_read_secret("ADMIN_DEBUG", False))
+# Gate the debug panel (strict boolean parsing)
+SHOW_DEBUG = _get_bool(_read_secret("ADMIN_DEBUG", False), False)
 
 # Columns expected from vendors table
 RAW_COLS = [
@@ -143,6 +163,7 @@ def _engine() -> Engine:
                 c.execute(sql_text("SELECT 1"))
             return eng_local
         except Exception as e:
+            # Don’t crash—fall back to local file if present
             st.warning(f"Turso connection failed ({e}). Falling back to local SQLite vendors.db.")
     local = "/mount/src/vendors-readonly-app/vendors.db"
     if not os.path.exists(local):
@@ -150,7 +171,7 @@ def _engine() -> Engine:
     return create_engine(f"sqlite:///{local}")
 
 # -----------------------------
-# CSS widths / sticky (same as Admin)
+# CSS widths / sticky
 # -----------------------------
 def _apply_css(field_order: List[str]):
     rules = []
@@ -189,35 +210,6 @@ def _apply_css(field_order: List[str]):
         """,
         unsafe_allow_html=True,
     )
-
-# -----------------------------
-# URL + phone helpers (validators/formatters)
-# -----------------------------
-def _normalize_url(u: str) -> str:
-    """Return normalized URL or empty string if invalid."""
-    s = (u or "").strip()
-    if not s:
-        return ""
-    if not s.lower().startswith(("http://", "https://")):
-        s = "http://" + s
-    try:
-        p = urlparse(s)
-        if p.scheme not in ("http", "https"):
-            return ""
-        if not p.netloc or "." not in p.netloc:
-            return ""
-        return s
-    except Exception:
-        return ""
-
-def _digits_only(s: str) -> str:
-    return re.sub(r"[^0-9]", "", s or "")
-
-def _format_phone_10(digits: str) -> str:
-    d = _digits_only(digits)
-    if len(d) != 10:
-        return ""
-    return f"({d[0:3]}) {d[3:6]}-{d[6:10]}"
 
 # -----------------------------
 # Help (single expander; Markdown)
@@ -306,12 +298,16 @@ def tab_view():
             url_col = f"{website_key} URL" if website_key.lower() != "website" else "Website URL"
             w_idx = _df.columns.get_loc(website_key)
             _df.insert(w_idx + 1, url_col, norm)
-            st.dataframe(
-                _df.assign(**{website_key: norm}),
-                use_container_width=True,
-                hide_index=True,
-                column_config={website_key: st.column_config.LinkColumn(display_text="Website")},
-            )
+            # Use LinkColumn if available (Streamlit >=1.29), else plain dataframe
+            try:
+                st.dataframe(
+                    _df.assign(**{website_key: norm}),
+                    use_container_width=True,
+                    hide_index=True,
+                    column_config={website_key: st.column_config.LinkColumn(display_text="Website")},
+                )
+            except Exception:
+                st.dataframe(_df, use_container_width=True, hide_index=True)
         except Exception:
             st.dataframe(_df, use_container_width=True, hide_index=True)
     else:
