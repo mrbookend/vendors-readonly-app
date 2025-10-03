@@ -468,5 +468,3 @@ def main():
 if __name__ == "__main__":
     main()
 PY
-
-python3 -m py_compile app_readonly.py && echo "Syntax OK"
