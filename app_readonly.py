@@ -1,19 +1,20 @@
 # app_readonly.py
 # Read-only Vendors view with:
-# - True pixel widths from secrets (COLUMN_WIDTHS_PX_READONLY or fallback to COLUMN_WIDTHS_PX)
+# - Pixel widths from secrets (COLUMN_WIDTHS_PX_READONLY or fallback)
 # - Wrapped cells; rows auto-grow in height
-# - Click-to-sort on every column (client-side)
-# - Quick filter (client-side)
-# - Optional sticky first column (id) — default OFF
-# - Wide page layout with configurable max width via secrets
-# - Help section via st.expander (no modal/iframe)
-# - CSV download button for the entire dataset
+# - Client-side sort on headers
+# - Client-side quick filter (matches any column)
+# - Optional sticky first column via secrets
+# - Wide layout; width from secrets
+# - Help via st.expander (no modal/iframe)
+# - CSV download button (entire dataset)
+# - Optional display label overrides via [READONLY_COLUMN_LABELS] in secrets
 
 from __future__ import annotations
 
 import os
 import re
-import html as py_html  # avoid name clash with HTML strings
+import html as py_html
 from typing import List, Dict, Optional
 
 import pandas as pd
@@ -86,6 +87,37 @@ def _get_bool_secret(name: str, default: bool) -> bool:
         return False
     return default
 
+def _get_column_labels() -> Dict[str, str]:
+    """
+    Optional display label overrides for headers.
+    Provide in secrets as:
+      [READONLY_COLUMN_LABELS]
+      business_name = "Provider"
+      category      = "Service Category"
+      service       = "Specialty"
+    Or JSON string under READONLY_COLUMN_LABELS.
+    """
+    import json
+    from collections.abc import Mapping
+    raw = _get_secret("READONLY_COLUMN_LABELS", None)
+    labels: Dict[str, str] = {}
+    if raw is None:
+        return labels
+    if isinstance(raw, Mapping):
+        for k, v in raw.items():
+            labels[str(k).strip().lower()] = str(v)
+        return labels
+    if isinstance(raw, str):
+        s = raw.strip()
+        try:
+            obj = json.loads(s)
+            if isinstance(obj, Mapping):
+                for k, v in obj.items():
+                    labels[str(k).strip().lower()] = str(v)
+        except Exception:
+            pass
+    return labels
+
 # -----------------------------
 # DB engine
 # -----------------------------
@@ -135,7 +167,6 @@ engine = get_engine()
 # Column widths loader
 # -----------------------------
 def _width_value_to_px(val) -> int:
-    """Convert size words or ints/strings to px."""
     if isinstance(val, int):
         return max(20, val)
     s = str(val).strip().lower()
@@ -158,23 +189,16 @@ def _coerce_map(obj) -> Dict[str, int]:
     return out
 
 def _get_column_widths_px() -> Dict[str, int]:
-    """
-    Prefer COLUMN_WIDTHS_PX_READONLY; fallback to COLUMN_WIDTHS_PX.
-    Accepts Streamlit AttrDict mapping, JSON mapping string, or key/val mapping text.
-    """
     import json
     from collections.abc import Mapping
-
     def _load_block(name: str):
         try:
             return st.secrets.get(name, None)
         except Exception:
             return None
-
     raw = _load_block("COLUMN_WIDTHS_PX_READONLY")
     if raw is None:
         raw = _load_block("COLUMN_WIDTHS_PX")
-
     mapping: Dict[str, int] = {}
     if isinstance(raw, Mapping):
         mapping = _coerce_map(raw)
@@ -197,11 +221,9 @@ def _get_column_widths_px() -> Dict[str, int]:
             mapping = local_map
     else:
         mapping = {}
-
     website_w = _get_int_secret("WEBSITE_COL_WIDTH_PX", 0)
     if website_w and "website" not in mapping:
         mapping["website"] = website_w
-
     return mapping
 
 def _sticky_first_col_enabled() -> bool:
@@ -252,16 +274,22 @@ def _render_sortable_wrapped_table(
     sticky_first_col: bool = False,
 ) -> None:
     if df.empty:
-        st.info("No vendors found.")
+        st.info("No records found.")
         return
 
     cols = list(df.columns)
+    label_map = _get_column_labels()
 
     def _px(col: str) -> int:
         try:
             return px_map.get(col, 140)
         except Exception:
             return 140
+
+    def _label(col: str) -> str:
+        if col in label_map:
+            return py_html.escape(label_map[col])
+        return py_html.escape(col.replace("_", " ").title())
 
     head_css = f"""
     <style>
@@ -340,7 +368,7 @@ def _render_sortable_wrapped_table(
 
     thead = ["<thead><tr>"]
     for idx, c in enumerate(cols):
-        label = py_html.escape(c.replace("_", " ").title())
+        label = _label(c)
         th_classes = ' class="sticky-col sticky-shadow"' if (sticky_first_col and idx == 0) else ""
         thead.append(
             f'<th{th_classes} data-col="{py_html.escape(c)}">'
@@ -365,7 +393,6 @@ def _render_sortable_wrapped_table(
         tbody.append("</tr>")
     tbody.append("</tbody>")
 
-    # (plain triple-quoted string — no f-string, so braces are fine)
     script = """
     <script>
       (function() {
@@ -439,51 +466,8 @@ def _render_sortable_wrapped_table(
     components.html(html_doc, height=height_px, scrolling=True)
 
 # -----------------------------
-# Help content (expander, no modal)
+# Help (expander)
 # -----------------------------
-DEFAULT_HELP_HTML = """
-<div style="line-height:1.55;">
-  <h2 style="margin:0 0 10px;">Vendors — How to Use</h2>
-  <h3 style="margin:14px 0 6px;">Sorting</h3>
-  <ul>
-    <li>Click a column header to sort ascending; click again for descending (▲ / ▼).</li>
-    <li>Numeric columns sort numerically; others sort A→Z.</li>
-  </ul>
-  <h3 style="margin:14px 0 6px;">Filtering</h3>
-  <ul>
-    <li>Use the <strong>Quick filter</strong> box above the table.</li>
-    <li>It matches text across <em>all</em> columns.</li>
-  </ul>
-  <h3 style="margin:14px 0 6px;">Viewing Long Text</h3>
-  <ul>
-    <li>Cells wrap automatically; row height expands to fit content.</li>
-    <li>Scroll horizontally if a column is off-screen.</li>
-  </ul>
-  <h3 style="margin:14px 0 6px;">Copy & Links</h3>
-  <ul>
-    <li>Select text in any cell and press Ctrl/Cmd+C to copy.</li>
-    <li>Website values are clickable and open in a new tab.</li>
-  </ul>
-  <h3 style="margin:14px 0 6px;">Column Widths</h3>
-  <ul>
-    <li>Set pixel widths in <code>[COLUMN_WIDTHS_PX_READONLY]</code> in secrets.</li>
-    <li>Example: <code>address = 220</code>, <code>notes = 320</code>.</li>
-  </ul>
-</div>
-"""
-
-def _load_help_html() -> str:
-    html_from_secrets = _get_secret("READONLY_HELP_HTML", None)
-    if html_from_secrets and str(html_from_secrets).strip():
-        return str(html_from_secrets)
-
-    md = _get_secret("READONLY_HELP_MD", None)
-    if md and str(md).strip():
-        # Render markdown directly in Streamlit
-        return None  # Signal that we should use st.markdown(md)
-
-    return DEFAULT_HELP_HTML
-
 def render_help_expander():
     title = _get_secret("READONLY_HELP_TITLE", "Help / Tips")
     md = _get_secret("READONLY_HELP_MD", None)
@@ -491,18 +475,46 @@ def render_help_expander():
         if md and str(md).strip():
             st.markdown(str(md))
         else:
-            html_block = _load_help_html()
-            if html_block:  # HTML fallback
-                st.markdown(html_block, unsafe_allow_html=True)
-            else:
-                st.info("No help text configured.")
+            st.info("No help text configured.")
 
 # -----------------------------
-# App UI
+# App UI (no page title)
 # -----------------------------
-st.title("Vendors (Read-only)")
 render_help_expander()
 
+# Load and render data
+df = load_vendors_df()
+desired = ["business_name","category","service","contact_name","phone","address","website","notes","keywords"]
+show_cols = [c for c in df.columns if c in desired]
+columns_order = (["id"] + show_cols) if "id" in df.columns else show_cols
+
+if df.empty:
+    st.info("No records found.")
+else:
+    df_view = df[columns_order].copy()
+    widths_px = _get_column_widths_px()
+
+    # CSV Download (entire dataset) — updated label & filename
+    csv_bytes = df_view.to_csv(index=False).encode("utf-8-sig")
+    st.download_button(
+        label="Download providers as CSV",   # changed
+        data=csv_bytes,
+        file_name="providers.csv",           # changed
+        mime="text/csv",
+        use_container_width=True,
+    )
+
+    # Render grid
+    _render_sortable_wrapped_table(
+        df_view,
+        widths_px,
+        height_px=720,
+        sticky_first_col=_sticky_first_col_enabled(),
+    )
+
+# -----------------------------
+# Debug at bottom
+# -----------------------------
 with st.expander("Status & Secrets (debug)", expanded=False):
     st.write("**DB**", current_db_info())
     try:
@@ -524,35 +536,6 @@ with st.expander("Status & Secrets (debug)", expanded=False):
         st.write("**Loaded column widths (effective)**")
         st.json(_get_column_widths_px())
         st.write("**Sticky first col enabled**:", _sticky_first_col_enabled())
+        st.write("**Column label overrides (if any)**", _get_column_labels())
     except Exception as e:
         st.write("Debug error:", str(e))
-
-# Load and render data
-df = load_vendors_df()
-desired = ["business_name","category","service","contact_name","phone","address","website","notes","keywords"]
-show_cols = [c for c in df.columns if c in desired]
-columns_order = (["id"] + show_cols) if "id" in df.columns else show_cols
-
-if df.empty:
-    st.info("No vendors found.")
-else:
-    df_view = df[columns_order].copy()
-    widths_px = _get_column_widths_px()
-
-    # --- Download button (entire dataset) ---
-    csv_bytes = df_view.to_csv(index=False).encode("utf-8-sig")
-    st.download_button(
-        label="Download vendors as CSV",
-        data=csv_bytes,
-        file_name="vendors.csv",
-        mime="text/csv",
-        use_container_width=True,
-    )
-
-    # Render grid
-    _render_sortable_wrapped_table(
-        df_view,
-        widths_px,
-        height_px=720,
-        sticky_first_col=_sticky_first_col_enabled(),
-    )
