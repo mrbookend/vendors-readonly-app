@@ -1,3 +1,7 @@
+cd ~/vendors-readonly-app
+cp app_readonly.py app_readonly.py.bak 2>/dev/null || true
+
+cat > app_readonly.py <<'PY'
 # app_readonly.py — Providers Read-Only (v3.6)
 # Tabs: View | Categories | Services | Changelog
 # - No top-level Streamlit renders; init happens inside main()
@@ -243,7 +247,7 @@ def _fetch_df() -> pd.DataFrame:
     for col in RAW_COLS + AUDIT_COLS:
         if col not in df.columns:
             df[col] = ""
-    return df[ [c for c in df.columns if c in (RAW_COLS + AUDIT_COLS)] ]
+    return df[[c for c in df.columns if c in (RAW_COLS + AUDIT_COLS)]]
 
 @st.cache_data(ttl=30)
 def _cats_cached():
@@ -369,7 +373,7 @@ def tab_changelog():
                 ORDER BY vc.changed_at DESC, vc.id DESC
             """
             df = pd.read_sql_query(sql_text(q), c)
-        except Exception as e:
+        except Exception:
             st.info("No changelog available (vendor_changes table missing or inaccessible).")
             return
 
@@ -467,3 +471,6 @@ def main():
 
 if __name__ == "__main__":
     main()
+PY
+
+python3 -m py_compile app_readonly.py && echo "Syntax OK"
