@@ -448,36 +448,46 @@ def _render_sortable_wrapped_table(
 def render_help_expander():
     title = _get_secret("READONLY_HELP_TITLE", "Providers Help / Tips")
     raw_md = _get_secret("READONLY_HELP_MD", "")
+    debug_help = str(_get_secret("READONLY_HELP_DEBUG", "0")).strip().lower() in {"1","true","yes","on"}
 
-    # Normalize and trim duplicate leading line if it matches the title
+    # Coerce to string and normalize newlines
     md = str(raw_md or "")
     md = md.replace("\r\n", "\n").replace("\r", "\n")
 
     # Remove BOM & surrounding whitespace
     md = md.lstrip("\ufeff").strip()
 
-    # If the very first non-empty line equals the title, drop it
+    # Drop a duplicated first line if it matches the title (case & spacing aware)
     lines = md.split("\n")
     first_nonempty_idx = next((i for i, L in enumerate(lines) if L.strip() != ""), None)
     if first_nonempty_idx is not None:
         if lines[first_nonempty_idx].strip() == title.strip():
-            lines[first_nonempty_idx] = ""  # blank it
-            # also remove next blank line if present (avoids double spacing)
+            lines[first_nonempty_idx] = ""
+            # also remove next blank line to avoid double spacing
             j = first_nonempty_idx + 1
             if j < len(lines) and lines[j].strip() == "":
                 lines[j] = ""
-        md = "\n".join(lines).strip()
+    # Collapse runs of blank lines
+    cleaned_lines = []
+    last_blank = False
+    for L in lines:
+        is_blank = (L.strip() == "")
+        if is_blank and last_blank:
+            continue
+        cleaned_lines.append(L)
+        last_blank = is_blank
+    md = "\n".join(cleaned_lines).strip()
 
     with st.expander(title, expanded=False):
         if md:
-            # Render your markdown
             st.markdown(md)
-
-            # Debug line just below to verify what was read (remove after it’s correct)
-            with st.expander("Help MD (raw preview)", expanded=False):
-                st.code((raw_md[:400] + ("…" if len(raw_md) > 400 else "")) or "(empty)", language="text")
+            if debug_help:
+                with st.expander("Help MD (raw preview)", expanded=False):
+                    st.write(f"Length: {len(str(raw_md))} chars")
+                    st.code((str(raw_md)[:400] + ("…" if len(str(raw_md)) > 400 else "")) or "(empty)", language="text")
         else:
-            st.write(title)  # quiet fallback
+            # Quiet fallback — title already shown in the expander label
+            st.write(title)
 
 # -----------------------------
 # App UI (no page title)
