@@ -501,191 +501,178 @@ DEFAULT_HELP_HTML = """
 </div>
 """
 
-DEFAULT_HELP_MD = """
-**How to use this table**
-- **Sort**: Click any column header; click again to reverse (▲ / ▼).
-- **Filter**: Use the Quick filter above the table (matches any column).
-- **Wrap**: Long text wraps; rows grow in height automatically.
-- **Copy**: Select & press Ctrl/Cmd+C. Links open in a new tab.
-"""
+# ---- Help modal (large content friendly) ----
+import uuid, streamlit.components.v1 as components
 
-# Choose help content: prefer full HTML from secrets; fallback to MD; else default HTML
-HELP_HTML = st.secrets.get("READONLY_HELP_HTML", None)
-if not HELP_HTML:
-    HELP_MD = st.secrets.get("READONLY_HELP_MD", DEFAULT_HELP_MD)
-    # very light "markdown" support
-    HELP_HTML = f"""
-    <div style="line-height:1.55;">
-      {HELP_MD.replace('**', '<strong>').replace('__','<u>').replace('*','')}
-    </div>
+def _get_secret(name, default=None):
+    try:
+        if name in st.secrets:
+            return st.secrets[name]
+    except Exception:
+        pass
+    return os.environ.get(name, default)
+
+def _help_sizes_from_secrets():
+    def _int(name, default):
+        val = _get_secret(name, default)
+        try:
+            return int(val)
+        except Exception:
+            return default
+    width_px   = _int("READONLY_HELP_WIDTH_PX", 900)
+    max_h_vh   = _int("READONLY_HELP_MAX_H_VH", 90)
+    font_px    = _int("READONLY_HELP_FONT_PX", 14)
+    # One height is enough; components.html cannot resize after render.
+    # Use a large height here so the modal isn't clipped.
+    iframe_h   = _int("READONLY_HELP_IFRAME_H_PX", 1000)
+    return width_px, max_h_vh, font_px, iframe_h
+
+def _load_help_html():
+    # 1) Prefer explicit HTML from secrets
+    html_from_secrets = _get_secret("READONLY_HELP_HTML", None)
+    if html_from_secrets and str(html_from_secrets).strip():
+        return str(html_from_secrets)
+
+    # 2) Or convert a simple Markdown block to HTML
+    md = _get_secret("READONLY_HELP_MD", None)
+    if md and str(md).strip():
+        text = str(md)
+
+        # minimal, safe-ish conversion (no external libs):
+        # headings
+        lines = []
+        for line in text.split("\n"):
+            if line.startswith("### "):
+                lines.append(f"<h3>{html.escape(line[4:])}</h3>")
+            elif line.startswith("## "):
+                lines.append(f"<h2>{html.escape(line[3:])}</h2>")
+            elif line.startswith("# "):
+                lines.append(f"<h1>{html.escape(line[2:])}</h1>")
+            else:
+                lines.append(html.escape(line))
+        text2 = "\n".join(lines)
+        # bold/italic (very light-touch)
+        text2 = text2.replace("**", "<strong>").replace("__", "<u>")
+        # paragraph breaks on blank lines
+        paras = [f"<p>{p.strip()}</p>" for p in text2.split("\n\n") if p.strip()]
+        return "\n".join(paras)
+
+    # 3) Fallback default
+    return """
+    <h2>Vendors Help</h2>
+    <p>Use the Quick filter to find vendors fast. Click a column header to sort; click again to reverse.</p>
+    <ul>
+      <li>Long text wraps; rows grow in height automatically.</li>
+      <li>Copy any cell (Ctrl/Cmd+C). Website opens in a new tab.</li>
+      <li>Widths come from <code>[COLUMN_WIDTHS_PX_READONLY]</code> in secrets.</li>
+    </ul>
     """
-if not HELP_HTML:
-    HELP_HTML = DEFAULT_HELP_HTML
 
-def _help_modal_dims_from_secrets():
-    def _get(name, default):
-        try:
-            if name in st.secrets:
-                return st.secrets[name]
-        except Exception:
-            pass
-        return default
-    try:    width_px = int(_get("READONLY_HELP_WIDTH_PX", 900))   # modal width cap
-    except: width_px = 900
-    try:    max_h_vh = int(_get("READONLY_HELP_MAX_H_VH", 90))    # modal max height in vh
-    except: max_h_vh = 90
-    try:    font_px  = int(_get("READONLY_HELP_FONT_PX", 14))     # body font size
-    except: font_px  = 14
-    return width_px, max_h_vh, font_px
-
-def _render_help(style: str = "modal"):
-    style = (style or "modal").strip().lower()
+def _render_help_modal():
+    style = str(_get_secret("READONLY_HELP_STYLE", "modal")).strip().lower()
     if style != "modal":
-        # fallback to expander or popover if desired
-        try:
-            if style == "popover" and hasattr(st, "popover"):
-                with st.popover("Help"):
-                    st.markdown(HELP_HTML, unsafe_allow_html=True)
-                return
-        except Exception:
-            pass
+        # non-modal fallback (popover/expander)
+        if style == "popover" and hasattr(st, "popover"):
+            with st.popover("Help"):
+                st.markdown(_get_secret("READONLY_HELP_MD", "No help text configured."))
+            return
         with st.expander("Help / Tips", expanded=False):
-            st.markdown(HELP_HTML, unsafe_allow_html=True)
+            st.markdown(_get_secret("READONLY_HELP_MD", "No help text configured."))
         return
 
-    # Modal implementation (HTML/CSS/JS) — dynamic iframe height
-    import uuid
-    w, mh, fs = _help_modal_dims_from_secrets()
     uid = f"help_{uuid.uuid4().hex[:8]}"
+    w, mh, fs, iframe_h = _help_sizes_from_secrets()
+    body_html = _load_help_html()
 
-    # Closed/open iframe heights (can be overridden via secrets)
-    try:
-        closed_h = int(st.secrets.get("READONLY_HELP_IFRAME_H_CLOSED_PX", 56))
-    except Exception:
-        closed_h = 56
-    try:
-        open_h = int(st.secrets.get("READONLY_HELP_IFRAME_H_PX", 1000))
-    except Exception:
-        open_h = 1000
-
-    components.html(
-        f'''
-<div id="{uid}_root">
-  <button id="{uid}_open" class="help-btn">Help</button>
-  <div id="{uid}_overlay" class="help-overlay" style="display:none;">
-    <div class="help-modal" role="dialog" aria-modal="true" aria-labelledby="{uid}_title" tabindex="-1">
-      <div class="help-header">
-        <span id="{uid}_title">Help</span>
-        <div class="help-actions">
-          <button id="{uid}_copy" class="act-btn" title="Copy all">Copy</button>
-          <button id="{uid}_print" class="act-btn" title="Print">Print</button>
-          <button id="{uid}_close" class="close-btn" aria-label="Close">&times;</button>
+    html_doc = f"""
+    <div id="{uid}_root">
+      <button id="{uid}_open" class="help-btn">Help</button>
+      <div id="{uid}_overlay" class="help-overlay" style="display:none;">
+        <div class="help-modal" role="dialog" aria-modal="true" aria-labelledby="{uid}_title" tabindex="-1">
+          <div class="help-header">
+            <span id="{uid}_title">Help</span>
+            <div class="help-actions">
+              <button id="{uid}_copy" class="act-btn" title="Copy all">Copy</button>
+              <button id="{uid}_print" class="act-btn" title="Print">Print</button>
+              <button id="{uid}_close" class="close-btn" aria-label="Close">&times;</button>
+            </div>
+          </div>
+          <div id="{uid}_body" class="help-body">{body_html}</div>
         </div>
       </div>
-      <div id="{uid}_body" class="help-body">{HELP_HTML}</div>
     </div>
-  </div>
-</div>
-<style>
-  .help-btn {{
-    padding: 6px 10px; border: 1px solid #ddd; border-radius: 6px; background:#fff; cursor:pointer;
-  }}
-  .help-overlay {{
-    position: fixed; inset: 0; background: rgba(0,0,0,0.35);
-    display: none; align-items: center; justify-content: center; z-index: 9999;
-  }}
-  .help-modal {{
-    background:#fff; border-radius:10px; width: min({w}px, 96vw);
-    max-height: {mh}vh; overflow:auto; box-shadow: 0 10px 30px rgba(0,0,0,0.25);
-  }}
-  .help-header {{
-    padding: 10px 14px; border-bottom: 1px solid #eee; display:flex; justify-content: space-between; align-items:center;
-    position: sticky; top:0; background:#fff; z-index: 1;
-  }}
-  .help-actions {{ display:flex; gap:8px; align-items:center; }}
-  .act-btn {{
-    padding: 4px 8px; border: 1px solid #ddd; border-radius: 6px; background:#fafafa; cursor:pointer; font-size: 13px;
-  }}
-  .close-btn {{
-    font-size: 22px; line-height: 1; padding: 2px 8px; border:none; background:transparent; cursor:pointer;
-  }}
-  .help-body {{ padding: 14px; font-size: {fs}px; }}
-  .help-body p {{ margin: 0 0 10px 0; }}
-  .help-body ul {{ margin: 0 0 10px 22px; }}
-  .help-body li {{ margin: 4px 0; }}
-</style>
-<script>
-  (function(){{
-    const overlay = document.getElementById("{uid}_overlay");
-    const openBtn = document.getElementById("{uid}_open");
-    const closeBtn = document.getElementById("{uid}_close");
-    const modal = overlay.querySelector(".help-modal");
-    const body = document.getElementById("{uid}_body");
-    const copyBtn = document.getElementById("{uid}_copy");
-    const printBtn = document.getElementById("{uid}_print");
-
-    const CLOSED_H = {closed_h};
-    const OPEN_H   = {open_h};
-
-    function setFrameHeight(h) {{
-      try {{
-        window.parent.postMessage({{ isStreamlitMessage: true, type: "setFrameHeight", height: h }}, "*");
-      }} catch (e) {{}}
-    }}
-
-    function openModal() {{
-      overlay.style.display = "flex";
-      setFrameHeight(OPEN_H);
-      modal.focus();
-    }}
-    function closeModal() {{
-      overlay.style.display = "none";
-      setFrameHeight(CLOSED_H);
-      openBtn.focus();
-    }}
-
-    // Ensure closed on first load
-    closeModal();
-
-    openBtn.addEventListener("click", openModal);
-    closeBtn.addEventListener("click", closeModal);
-    overlay.addEventListener("click", (e) => {{ if (e.target === overlay) closeModal(); }});
-    document.addEventListener("keydown", (e) => {{ if (e.key === "Escape") closeModal(); }});
-
-    copyBtn.addEventListener("click", async () => {{
-      try {{
-        const txt = body.textContent || "";
-        await navigator.clipboard.writeText(txt);
-        copyBtn.textContent = "Copied";
-        setTimeout(()=> copyBtn.textContent = "Copy", 1200);
-      }} catch (err) {{
-        alert("Copy failed");
+    <style>
+      .help-btn {{
+        padding: 6px 10px; border: 1px solid #ddd; border-radius: 6px; background:#fff; cursor:pointer;
       }}
-    }});
+      .help-overlay {{
+        position: fixed; inset: 0; background: rgba(0,0,0,0.35);
+        display: none; align-items: center; justify-content: center; z-index: 9999;
+      }}
+      .help-modal {{
+        background:#fff; border-radius:10px; width: min({w}px, 96vw);
+        max-height: {mh}vh; overflow:auto; box-shadow: 0 10px 30px rgba(0,0,0,0.25);
+      }}
+      .help-header {{
+        padding: 10px 14px; border-bottom: 1px solid #eee; display:flex; justify-content: space-between; align-items:center;
+        position: sticky; top:0; background:#fff; z-index: 1;
+      }}
+      .help-actions {{ display:flex; gap:8px; align-items:center; }}
+      .act-btn {{
+        padding: 4px 8px; border: 1px solid #ddd; border-radius: 6px; background:#fafafa; cursor:pointer; font-size: 13px;
+      }}
+      .close-btn {{
+        font-size: 22px; line-height: 1; padding: 2px 8px; border:none; background:transparent; cursor:pointer;
+      }}
+      .help-body {{ padding: 14px; font-size: {fs}px; color:#111; }}
+      .help-body p {{ margin: 0 0 10px 0; }}
+      .help-body ul {{ margin: 0 0 10px 22px; }}
+      .help-body li {{ margin: 4px 0; }}
+    </style>
+    <script>
+      (function(){{
+        const overlay  = document.getElementById("{uid}_overlay");
+        const openBtn  = document.getElementById("{uid}_open");
+        const closeBtn = document.getElementById("{uid}_close");
+        const modal    = overlay.querySelector(".help-modal");
+        const body     = document.getElementById("{uid}_body");
+        const copyBtn  = document.getElementById("{uid}_copy");
+        const printBtn = document.getElementById("{uid}_print");
 
-    printBtn.addEventListener("click", () => {{
-      const w = window.open("", "_blank");
-      w.document.write("<html><head><title>Help</title></head><body>" + body.innerHTML + "</body></html>");
-      w.document.close();
-      w.focus();
-      w.print();
-      setTimeout(()=> w.close(), 250);
-    }});
-  }})();
-</script>
-''',
-        height=56,   # compact when closed (just the button visible)
-        scrolling=False,
-    )
+        function openModal() {{ overlay.style.display = "flex"; modal.focus(); }}
+        function closeModal(){{ overlay.style.display = "none"; openBtn.focus(); }}
 
-# -----------------------------
-# App UI
-# -----------------------------
-st.title("Vendors (Read-only)")
+        openBtn.addEventListener("click", openModal);
+        closeBtn.addEventListener("click", closeModal);
+        overlay.addEventListener("click", (e) => {{ if (e.target === overlay) closeModal(); }});
+        document.addEventListener("keydown", (e) => {{ if (e.key === "Escape") closeModal(); }});
 
-# Help control via secrets (defaults to modal)
-_help_style = str(st.secrets.get("READONLY_HELP_STYLE", "modal")).lower()
-_render_help(_help_style)
+        copyBtn.addEventListener("click", async () => {{
+          try {{
+            const txt = body.textContent || "";
+            await navigator.clipboard.writeText(txt);
+            copyBtn.textContent = "Copied";
+            setTimeout(()=> copyBtn.textContent = "Copy", 1200);
+          }} catch (err) {{ alert("Copy failed"); }}
+        }});
+
+        printBtn.addEventListener("click", () => {{
+          const w = window.open("", "_blank");
+          w.document.write("<html><head><title>Help</title></head><body>" + body.innerHTML + "</body></html>");
+          w.document.close(); w.focus(); w.print(); setTimeout(()=> w.close(), 250);
+        }});
+      }})();
+    </script>
+    """
+
+    # IMPORTANT: actually use the tall height from secrets
+    components.html(html_doc, height=iframe_h, scrolling=False)
+    # Optional: tiny debug line so you can verify the effective height
+    st.caption(f"Help iframe height in use: {iframe_h}px")
+
+# Render the Help button+modal
+_render_help_modal()
+# ---- end Help modal ----
 
 with st.expander("Status & Secrets (debug)", expanded=False):
     st.write("**DB**", current_db_info())
