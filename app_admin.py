@@ -5,7 +5,8 @@
 # - Clear success notices on Add/Edit/Delete
 # - Capitalization & trimming on save; Maintenance tab to normalize
 # - Turso/libSQL via sqlite+libsql://…?secure=true with connect_args={"auth_token": ...}
-# - Column widths via secrets: [COLUMN_WIDTHS_PX] as px or "small|medium|large"
+# - Column widths via secrets: [COLUMN_WIDTHS_PX] -> TRUE PIXEL WIDTHS via CSS override
+# - Cells in selected columns ALWAYS wrap; row height grows to show full content
 
 from __future__ import annotations
 
@@ -212,16 +213,16 @@ def title_address(s: Optional[str]) -> Optional[str]:
     return t
 
 # -----------------------------
-# Column width configuration (robust)
+# Column width configuration (robust loader)
 # -----------------------------
 def _get_column_widths_px() -> Dict[str, int]:
     """
     Load COLUMN_WIDTHS_PX from secrets. Accepts:
-      - any Mapping (Streamlit may return an AttrDict/Secrets mapping)
-      - a string containing JSON (e.g. '{"website":120}')
+      - any Mapping (Streamlit returns an AttrDict/Secrets mapping)
+      - a string containing JSON
       - a string containing simple 'key = value' lines
 
-    Maps 'small'/'medium'/'large' to sentinels (-1/-2/-3) for later conversion.
+    Maps 'small'/'medium'/'large' to sentinels (-1/-2/-3); CSS converter turns those into px.
     """
     import json
     from collections.abc import Mapping
@@ -232,39 +233,31 @@ def _get_column_widths_px() -> Dict[str, int]:
             return out
         for k, v in obj.items():
             key = str(k).strip().lower()
-            # allow "small|medium|large"
             if isinstance(v, str) and v.strip().lower() in {"small", "medium", "large"}:
                 out[key] = {"small": -1, "medium": -2, "large": -3}[v.strip().lower()]
                 continue
-            # allow ints or "120"
             try:
                 out[key] = int(str(v).strip())
             except Exception:
                 pass
         return out
 
-    # 1) Read from secrets
     try:
         raw = st.secrets.get("COLUMN_WIDTHS_PX", None)
     except Exception:
         raw = None
 
-    # 2) Accept Mapping directly (dict, AttrDict, etc.)
     if isinstance(raw, Mapping):
         mapping = _coerce_map(raw)
-
-    # 3) If it's a string, try JSON then naive "key = value" lines
     elif isinstance(raw, str):
         s = raw.strip()
         mapping = {}
-        # JSON attempt
         try:
             obj = json.loads(s)
             if isinstance(obj, Mapping):
                 mapping = _coerce_map(obj)
         except Exception:
             pass
-        # naive "key = value" lines
         if not mapping:
             for line in s.splitlines():
                 line = line.strip()
@@ -283,13 +276,66 @@ def _get_column_widths_px() -> Dict[str, int]:
     else:
         mapping = {}
 
-    # 4) Back-compat: WEBSITE_COL_WIDTH_PX scalar override
     website_w = _get_int_secret("WEBSITE_COL_WIDTH_PX", 0)
     if website_w and "website" not in mapping:
         mapping["website"] = website_w
 
     return mapping
 
+# -----------------------------
+# TRUE PIXEL WIDTHS + ALWAYS-WRAP CSS
+# -----------------------------
+def _width_value_to_px(val) -> int:
+    """Convert secrets values/sentinels to pixel widths; supports ints and size words."""
+    if isinstance(val, int):
+        if val in (-1, -2, -3):   # small/medium/large
+            return { -1: 100, -2: 160, -3: 240 }[val]
+        return max(20, val)
+    try:
+        s = str(val).strip().lower()
+        return {"small": 100, "s": 100, "medium": 160, "m": 160, "large": 240, "l": 240}.get(s, 140)
+    except Exception:
+        return 140
+
+def _apply_true_px_widths_always_wrap(
+    columns_order: list[str],
+    px_map: dict[str, int],
+    wrap_columns: list[str],
+) -> None:
+    """
+    Enforce exact pixel widths (via !important) AND always wrap specified columns.
+    Row height grows to show full contents for those columns.
+    """
+    sels = ['[data-testid="stDataFrame"]', '[data-testid="stDataEditor"]']
+    rules = []
+
+    # Fixed table layout so widths are honored
+    for sel in sels:
+        rules.append(f"""{sel} table {{ table-layout: fixed !important; }}""")
+
+    # Per-column width base (nowrap by default)
+    for idx, col in enumerate(columns_order, start=1):
+        px = _width_value_to_px(px_map.get(col, 140))
+        base = (
+            f"width: {px}px !important;"
+            f"min-width: {px}px !important;"
+            f"max-width: {px}px !important;"
+            "overflow: hidden !important;"
+            "text-overflow: ellipsis !important;"
+            "white-space: nowrap !important;"
+        )
+        for sel in sels:
+            rules.append(f"""{sel} th:nth-child({idx}), {sel} td:nth-child({idx}) {{ {base} }}""")
+
+    # Now, ALWAYS wrap these columns (body cells only; headers stay single-line)
+    wrap_set = {c.lower() for c in wrap_columns}
+    for idx, col in enumerate(columns_order, start=1):
+        if col.lower() in wrap_set:
+            wrap_rules = "white-space: normal !important; word-break: break-word !important; text-overflow: clip !important;"
+            for sel in sels:
+                rules.append(f"""{sel} tbody td:nth-child({idx}) {{ {wrap_rules} }}""")
+
+    st.markdown("<style>" + "\n".join(rules) + "</style>", unsafe_allow_html=True)
 
 # -----------------------------
 # Categories/Services: lists & orphans
@@ -573,16 +619,16 @@ with st.expander("Database Status & Schema (debug)", expanded=False):
     st.write("**Schema**")
     st.json(status)
 
-    # -------- Secrets debug (safe & self-contained) --------
+    # Secrets debug — useful to verify what widths were loaded
     try:
         st.write("**Secrets keys (debug)**", sorted(list(st.secrets.keys())))
         if "COLUMN_WIDTHS_PX" in st.secrets:
             st.write("**Raw COLUMN_WIDTHS_PX (debug)**")
             raw = st.secrets.get("COLUMN_WIDTHS_PX", None)
             st.write("type:", type(raw).__name__)
-            if isinstance(raw, dict):
+            try:
                 st.json(raw)
-            else:
+            except Exception:
                 st.code(repr(raw))
         else:
             st.warning("COLUMN_WIDTHS_PX not found in st.secrets")
@@ -608,47 +654,31 @@ with tab_view:
                "phone","address","website","notes","keywords"]
     show_cols = [c for c in df.columns if c in desired]
 
-    # px -> size mapping
-    def _size_from_px(v: int) -> str:
-        if v <= 120:
-            return "small"
-        elif v <= 200:
-            return "medium"
-        return "large"
+    # Column order MUST match the frame we pass to data_editor
+    columns_order = (["id"] + show_cols) if "id" in df.columns else show_cols
 
-    def _normalize_width_value(raw) -> Optional[str]:
-        """
-        Accept ints (px) -> S/M/L, 'small'/'medium'/'large', or sentinels -1/-2/-3.
-        """
-        if raw is None:
-            return None
-        if isinstance(raw, int) and raw in {-1, -2, -3}:
-            return {-1: "small", -2: "medium", -3: "large"}[raw]
-        s = str(raw).strip().lower()
-        if s in {"small", "medium", "large"}:
-            return s
-        try:
-            return _size_from_px(int(s))
-        except Exception:
-            return None
+    # Load secrets widths (px or size words); CSS will enforce exact px
+    _raw_widths = _get_column_widths_px()
 
-    _col_widths = _get_column_widths_px()
+    # Choose columns that should ALWAYS wrap (row height grows)
+    wrappable_cols = [c for c in ["business_name","contact_name","address","website","notes","keywords"] if c in columns_order]
 
+    # Inject CSS to force true px + always-wrap for selected columns
+    _apply_true_px_widths_always_wrap(columns_order, _raw_widths, wrap_columns=wrappable_cols)
+
+    # Build column_config (no width set; CSS controls widths)
     col_cfg: Dict[str, st.column_config.Column] = {}
-    cols_for_cfg = (["id"] + show_cols) if "id" in df.columns else show_cols
-    for c in cols_for_cfg:
+    for c in columns_order:
         label = c.replace("_", " ").title()
-        width_setting = _normalize_width_value(_col_widths.get(c))
         if c == "id":
-            width_setting = width_setting or "small"
-            col_cfg[c] = st.column_config.NumberColumn(label, width=width_setting)
+            col_cfg[c] = st.column_config.NumberColumn(label)
         elif c == "website":
-            col_cfg[c] = st.column_config.LinkColumn(label, width=width_setting)
+            col_cfg[c] = st.column_config.LinkColumn(label)
         else:
-            col_cfg[c] = st.column_config.TextColumn(label, width=width_setting)
+            col_cfg[c] = st.column_config.TextColumn(label)
 
     st.data_editor(
-        df[["id"] + show_cols] if "id" in df.columns else df[show_cols],
+        df[columns_order],
         use_container_width=True,
         hide_index=True,
         column_config=col_cfg,
@@ -808,7 +838,6 @@ with tab_cat:
     if not table_exists("categories") or "name" not in get_columns("categories"):
         st.info("Table 'categories(name)' not found. You can still assign Category text directly in vendors.")
 
-    # Add
     new_cat = st.text_input("Add a new Category", help="Creates it in the categories table (smart Title Case applied).")
     if st.button("Add Category", key="btn_add_cat"):
         if not new_cat.strip():
@@ -833,7 +862,6 @@ with tab_cat:
         "Notes: Categories marked **[orphan]** exist only on vendor rows (no categories-table entry)."
     )
 
-    # Manage / Delete with orphans
     st.divider()
     cats_tbl = list_categories_table()
     cats_vendors = list_categories_from_vendors()
@@ -869,7 +897,6 @@ with tab_cat:
             st.caption("First 15 impacted vendors:")
             st.write(", ".join([f"{name} (#{vid})" for vid, name in preview]))
 
-        # Target selection
         target_options = ["(choose)"] + cats_tbl
         cols = st.columns([1,1])
         with cols[0]:
@@ -944,7 +971,6 @@ with tab_cat:
                     except Exception as ex:
                         act.error(f"Reassign+Delete failed: {ex}")
 
-        # Delete-only (only when usage is 0)
         if use_count == 0:
             confirm_delete_only = st.checkbox(
                 "Confirm: Delete this unused category entry (if present).",
@@ -973,7 +999,6 @@ with tab_svc:
     if not table_exists("services") or "name" not in get_columns("services"):
         st.info("Table 'services(name)' not found. You can still leave Service blank for vendors, or type free-form in vendors.service if you later add the column.")
 
-    # Add
     new_svc = st.text_input("Add a new Service", help="Creates it in the services table (smart Title Case applied).")
     if st.button("Add Service", key="btn_add_svc"):
         if not new_svc.strip():
@@ -999,7 +1024,6 @@ with tab_svc:
         "Notes: Services marked **[orphan]** exist only on vendor rows (no services-table entry)."
     )
 
-    # Manage / Delete with orphans
     st.divider()
     svcs_tbl = list_services_table()
     svcs_vendors = list_services_from_vendors()
