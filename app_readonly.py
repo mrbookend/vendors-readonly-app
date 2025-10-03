@@ -528,6 +528,15 @@ def _render_help(style: str = "modal"):
     uid = f"help_{uuid.uuid4().hex[:8]}"
     _page_h = int(st.secrets.get("READONLY_HELP_IFRAME_H_PX", 900))
 
+        # Modal implementation (HTML/CSS/JS) — dynamic iframe height
+    import uuid
+    w, mh, fs = _help_modal_dims_from_secrets()
+    uid = f"help_{uuid.uuid4().hex[:8]}"
+
+    # Closed/open iframe heights (can be overridden via secrets)
+    closed_h = int(st.secrets.get("READONLY_HELP_IFRAME_H_CLOSED_PX", 56))   # just the button
+    open_h   = int(st.secrets.get("READONLY_HELP_IFRAME_H_PX", 900))         # tall when modal open
+
     components.html(
         f'''
 <div id="{uid}_root">
@@ -584,14 +593,28 @@ def _render_help(style: str = "modal"):
     const copyBtn = document.getElementById("{uid}_copy");
     const printBtn = document.getElementById("{uid}_print");
 
+    const CLOSED_H = {closed_h};
+    const OPEN_H   = {open_h};
+
+    function setFrameHeight(h) {{
+      try {{
+        window.parent.postMessage({{ isStreamlitMessage: true, type: "setFrameHeight", height: h }}, "*");
+      }} catch (e) {{}}
+    }}
+
     function openModal() {{
       overlay.style.display = "flex";
+      setFrameHeight(OPEN_H);
       modal.focus();
     }}
     function closeModal() {{
       overlay.style.display = "none";
+      setFrameHeight(CLOSED_H);
       openBtn.focus();
     }}
+
+    // Ensure closed on first load
+    closeModal();
 
     openBtn.addEventListener("click", openModal);
     closeBtn.addEventListener("click", closeModal);
@@ -620,9 +643,10 @@ def _render_help(style: str = "modal"):
   }})();
 </script>
 ''',
-        height=_page_h,
+        height=closed_h,   # compact when closed
         scrolling=False,
     )
+
 
 # Choose style via secrets (defaults to modal)
 _help_style = str(st.secrets.get("READONLY_HELP_STYLE", "modal")).lower()
