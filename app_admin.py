@@ -1,24 +1,25 @@
 # app_admin.py
 # Vendors Admin — Category REQUIRED, Service optional (blank display if missing)
-# - Categories/Services Admin surfaces **orphans** (values used by vendors but missing from ref tables)
+# - Categories/Services Admin surfaces **orphans**
 # - All comparisons use lower(trim(...))
 # - Clear success notices on Add/Edit/Delete
 # - Capitalization & trimming on save; Maintenance tab to normalize
 # - Turso/libSQL via sqlite+libsql://…?secure=true with connect_args={"auth_token": ...}
-# - Column widths via secrets: [COLUMN_WIDTHS_PX] -> TRUE PIXEL WIDTHS via CSS override
-# - Cells in selected columns ALWAYS wrap; row height grows to show full content
+# - VIEW TAB: Sortable HTML grid (true px widths + variable row height via wrapping)
 
 from __future__ import annotations
 
 import os
 import re
 import time
+import html
 from typing import List, Dict, Optional, Tuple
 
 import pandas as pd
 import streamlit as st
 from sqlalchemy import create_engine, text as sql_text
 from sqlalchemy.engine import Engine
+import streamlit.components.v1 as components
 
 # Optional layout helper
 try:
@@ -96,7 +97,7 @@ def get_engine() -> Engine:
         connect_args = {}
         token = (_get_secret("LIBSQL_AUTH_TOKEN") or _get_secret("TURSO_AUTH_TOKEN"))
         if token:
-            connect_args["auth_token"] = token  # sqlalchemy-libsql expects snake_case
+            connect_args["auth_token"] = token
         return create_engine(info["dsn"], connect_args=connect_args, pool_pre_ping=True, future=True)
     return create_engine(info["dsn"], future=True)
 
@@ -218,11 +219,10 @@ def title_address(s: Optional[str]) -> Optional[str]:
 def _get_column_widths_px() -> Dict[str, int]:
     """
     Load COLUMN_WIDTHS_PX from secrets. Accepts:
-      - any Mapping (Streamlit returns an AttrDict/Secrets mapping)
-      - a string containing JSON
-      - a string containing simple 'key = value' lines
-
-    Maps 'small'/'medium'/'large' to sentinels (-1/-2/-3); CSS converter turns those into px.
+      - Mapping (Streamlit secrets AttrDict)
+      - JSON string
+      - simple 'key = value' string
+    Maps 'small'/'medium'/'large' to sentinels (-1/-2/-3); converter turns those into px.
     """
     import json
     from collections.abc import Mapping
@@ -282,9 +282,6 @@ def _get_column_widths_px() -> Dict[str, int]:
 
     return mapping
 
-# -----------------------------
-# TRUE PIXEL WIDTHS + ALWAYS-WRAP CSS
-# -----------------------------
 def _width_value_to_px(val) -> int:
     """Convert secrets values/sentinels to pixel widths; supports ints and size words."""
     if isinstance(val, int):
@@ -297,45 +294,217 @@ def _width_value_to_px(val) -> int:
     except Exception:
         return 140
 
-def _apply_true_px_widths_always_wrap(
-    columns_order: list[str],
-    px_map: dict[str, int],
-    wrap_columns: list[str],
-) -> None:
+# -----------------------------
+# HTML GRID (sortable + wrap + true px widths)
+# -----------------------------
+def _render_sortable_wrapped_table(df: pd.DataFrame, px_map: dict[str, int], height_px: int = 700) -> None:
     """
-    Enforce exact pixel widths (via !important) AND always wrap specified columns.
-    Row height grows to show full contents for those columns.
+    Render a client-side sortable table with:
+      - true pixel widths via <colgroup>
+      - row auto-height via wrapping
+      - sticky header, hover highlight
+      - quick filter box (client-side)
+    Sorting by clicking any header (toggles asc/desc).
     """
-    sels = ['[data-testid="stDataFrame"]', '[data-testid="stDataEditor"]']
-    rules = []
+    if df.empty:
+        st.info("No vendors found.")
+        return
 
-    # Fixed table layout so widths are honored
-    for sel in sels:
-        rules.append(f"""{sel} table {{ table-layout: fixed !important; }}""")
+    cols = list(df.columns)
 
-    # Per-column width base (nowrap by default)
-    for idx, col in enumerate(columns_order, start=1):
-        px = _width_value_to_px(px_map.get(col, 140))
-        base = (
-            f"width: {px}px !important;"
-            f"min-width: {px}px !important;"
-            f"max-width: {px}px !important;"
-            "overflow: hidden !important;"
-            "text-overflow: ellipsis !important;"
-            "white-space: nowrap !important;"
-        )
-        for sel in sels:
-            rules.append(f"""{sel} th:nth-child({idx}), {sel} td:nth-child({idx}) {{ {base} }}""")
+    def _px(col: str) -> int:
+        try:
+            v = px_map.get(col, 140)
+            return _width_value_to_px(v)
+        except Exception:
+            return 140
 
-    # Now, ALWAYS wrap these columns (body cells only; headers stay single-line)
-    wrap_set = {c.lower() for c in wrap_columns}
-    for idx, col in enumerate(columns_order, start=1):
-        if col.lower() in wrap_set:
-            wrap_rules = "white-space: normal !important; word-break: break-word !important; text-overflow: clip !important;"
-            for sel in sels:
-                rules.append(f"""{sel} tbody td:nth-child({idx}) {{ {wrap_rules} }}""")
+    # Build HTML
+    head_css = f"""
+    <style>
+    .tbl-container {{
+        border: 1px solid #e6e6e6;
+        border-radius: 8px;
+        overflow: hidden;
+        box-shadow: 0 1px 2px rgba(0,0,0,0.04);
+    }}
+    .tbl-toolbar {{
+        padding: 8px 10px;
+        border-bottom: 1px solid #eee;
+        background: #fafafa;
+        display: flex;
+        gap: 8px;
+        align-items: center;
+        font-size: 14px;
+    }}
+    .tbl-filter {{
+        flex: 1;
+        padding: 6px 8px;
+        border: 1px solid #ddd;
+        border-radius: 6px;
+        outline: none;
+    }}
+    .tbl-viewport {{
+        max-height: {height_px - 46}px;
+        overflow: auto;
+    }}
+    table.tbl {{
+        table-layout: fixed;
+        width: 100%;
+        border-collapse: collapse;
+        font-size: 14px;
+    }}
+    .tbl th, .tbl td {{
+        border-bottom: 1px solid #f0f0f0;
+        padding: 6px 8px;
+        vertical-align: top;
+    }}
+    .tbl thead th {{
+        position: sticky;
+        top: 0;
+        background: #ffffff;
+        z-index: 2;
+        cursor: pointer;
+        user-select: none;
+    }}
+    .tbl tbody tr:hover {{
+        background: #fcfcfc;
+    }}
+    .tbl td {{
+        white-space: normal;        /* allow wrapping */
+        word-break: break-word;
+        text-overflow: clip;
+        overflow: visible;
+    }}
+    .th-inner {{
+        display: inline-flex;
+        align-items: center;
+        gap: 6px;
+    }}
+    .sort-arrow {{
+        font-size: 12px;
+        color: #888;
+        visibility: hidden;
+    }}
+    th.sorted .sort-arrow {{
+        visibility: visible;
+    }}
+    .text-right {{ text-align: right; }}
+    .text-center {{ text-align: center; }}
+    </style>
+    """
 
-    st.markdown("<style>" + "\n".join(rules) + "</style>", unsafe_allow_html=True)
+    # colgroup with explicit widths
+    colgroup = ["<colgroup>"] + [f'<col style="width:{_px(c)}px">' for c in cols] + ["</colgroup>"]
+
+    # header (clickable)
+    thead = ["<thead><tr>"]
+    for c in cols:
+        label = html.escape(c.replace("_", " ").title())
+        thead.append(f'<th data-col="{html.escape(c)}"><span class="th-inner">{label}<span class="sort-arrow">▲</span></span></th>')
+    thead.append("</tr></thead>")
+
+    # body
+    tbody = ["<tbody>"]
+    for _, row in df.iterrows():
+        tbody.append("<tr>")
+        for c in cols:
+            val = row[c]
+            if c == "website" and isinstance(val, str) and val.strip():
+                safe_url = html.escape(val)
+                safe_text = html.escape(val)
+                tbody.append(f'<td><a href="{safe_url}" target="_blank" rel="noopener noreferrer">{safe_text}</a></td>')
+            else:
+                safe = "" if pd.isna(val) else str(val)
+                tbody.append(f"<td>{html.escape(safe)}</td>")
+        tbody.append("</tr>")
+    tbody.append("</tbody>")
+
+    # quick filter + sorting JS
+    script = f"""
+    <script>
+    (function() {{
+        const container = document.currentScript.closest('.tbl-container');
+        const input = container.querySelector('.tbl-filter');
+        const table = container.querySelector('table.tbl');
+        const thead = table.tHead;
+        const tbody = table.tBodies[0];
+        const headers = Array.from(thead.rows[0].cells);
+        let sortState = {{}}; // colIndex -> 'asc'|'desc'
+
+        function getCellText(td) {{
+            return (td.textContent || td.innerText || '').trim();
+        }}
+
+        function compare(a, b, idx, asc) {{
+            const ta = getCellText(a.cells[idx]);
+            const tb = getCellText(b.cells[idx]);
+            // try numeric compare
+            const na = parseFloat(ta.replace(/[^0-9.-]/g, ''));
+            const nb = parseFloat(tb.replace(/[^0-9.-]/g, ''));
+            const bothNumeric = !isNaN(na) && !isNaN(nb) && ta !== '' && tb !== '';
+            let cmp = 0;
+            if (bothNumeric) {{
+                cmp = na - nb;
+            }} else {{
+                cmp = ta.localeCompare(tb, undefined, {{ sensitivity: 'base' }});
+            }}
+            return asc ? cmp : -cmp;
+        }}
+
+        headers.forEach((th, idx) => {{
+            th.addEventListener('click', () => {{
+                // toggle sort dir
+                const dir = sortState[idx] === 'asc' ? 'desc' : 'asc';
+                sortState = {{}}; sortState[idx] = dir;
+
+                // visual arrow
+                headers.forEach(h => h.classList.remove('sorted'));
+                th.classList.add('sorted');
+                const arrow = th.querySelector('.sort-arrow');
+                if (arrow) arrow.textContent = dir === 'asc' ? '▲' : '▼';
+
+                // sort rows
+                const rows = Array.from(tbody.rows);
+                rows.sort((ra, rb) => compare(ra, rb, idx, dir === 'asc'));
+                rows.forEach(r => tbody.appendChild(r));
+            }});
+        }});
+
+        // quick filter: match any cell
+        input.addEventListener('input', () => {{
+            const q = input.value.toLowerCase();
+            Array.from(tbody.rows).forEach(tr => {{
+                const text = tr.innerText.toLowerCase();
+                tr.style.display = text.includes(q) ? '' : 'none';
+            }});
+        }});
+    }})();
+    </script>
+    """
+
+    toolbar = """
+    <div class="tbl-toolbar">
+      <input class="tbl-filter" placeholder="Quick filter (matches any column)…" />
+    </div>
+    """
+
+    html_doc = (
+        '<div class="tbl-container">'
+        + head_css
+        + toolbar
+        + '<div class="tbl-viewport"><table class="tbl">'
+        + "".join(colgroup)
+        + "".join(thead)
+        + "".join(tbody)
+        + "</table></div>"
+        + script
+        + "</div>"
+    )
+
+    # Render inside an iframe so JS works (Streamlit sanitizes <script> in markdown)
+    components.html(html_doc, height=height_px, scrolling=True)
+    # Note: 'height_px' controls the viewport; table itself expands row height as needed.
 
 # -----------------------------
 # Categories/Services: lists & orphans
@@ -619,7 +788,6 @@ with st.expander("Database Status & Schema (debug)", expanded=False):
     st.write("**Schema**")
     st.json(status)
 
-    # Secrets debug — useful to verify what widths were loaded
     try:
         st.write("**Secrets keys (debug)**", sorted(list(st.secrets.keys())))
         if "COLUMN_WIDTHS_PX" in st.secrets:
@@ -632,7 +800,6 @@ with st.expander("Database Status & Schema (debug)", expanded=False):
                 st.code(repr(raw))
         else:
             st.warning("COLUMN_WIDTHS_PX not found in st.secrets")
-
         st.write("**Loaded column widths (debug)**")
         st.json(_get_column_widths_px())
     except Exception as _e:
@@ -644,7 +811,7 @@ tab_view, tab_add, tab_edit, tab_delete, tab_cat, tab_svc, tab_maint = st.tabs(
 )
 
 # -----------------------------
-# View tab
+# View tab (HTML grid)
 # -----------------------------
 with tab_view:
     st.subheader("Browse Vendors")
@@ -653,37 +820,17 @@ with tab_view:
     desired = ["business_name","category","service","contact_name",
                "phone","address","website","notes","keywords"]
     show_cols = [c for c in df.columns if c in desired]
-
-    # Column order MUST match the frame we pass to data_editor
     columns_order = (["id"] + show_cols) if "id" in df.columns else show_cols
 
-    # Load secrets widths (px or size words); CSS will enforce exact px
-    _raw_widths = _get_column_widths_px()
+    # Reorder the frame to match what we'll show
+    df_view = df[columns_order].copy()
 
-    # Choose columns that should ALWAYS wrap (row height grows)
-    wrappable_cols = [c for c in ["business_name","contact_name","address","website","notes","keywords"] if c in columns_order]
+    # Load exact px widths from secrets
+    widths_px = _get_column_widths_px()
 
-    # Inject CSS to force true px + always-wrap for selected columns
-    _apply_true_px_widths_always_wrap(columns_order, _raw_widths, wrap_columns=wrappable_cols)
-
-    # Build column_config (no width set; CSS controls widths)
-    col_cfg: Dict[str, st.column_config.Column] = {}
-    for c in columns_order:
-        label = c.replace("_", " ").title()
-        if c == "id":
-            col_cfg[c] = st.column_config.NumberColumn(label)
-        elif c == "website":
-            col_cfg[c] = st.column_config.LinkColumn(label)
-        else:
-            col_cfg[c] = st.column_config.TextColumn(label)
-
-    st.data_editor(
-        df[columns_order],
-        use_container_width=True,
-        hide_index=True,
-        column_config=col_cfg,
-        disabled=True,  # read-only
-    )
+    # Render sortable, wrapping HTML grid
+    # Adjust height_px as you like (viewport height; table rows expand freely)
+    _render_sortable_wrapped_table(df_view, widths_px, height_px=720)
 
 # -----------------------------
 # Add tab — persistent success
