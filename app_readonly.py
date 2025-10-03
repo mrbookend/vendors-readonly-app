@@ -460,12 +460,6 @@ def _render_sortable_wrapped_table(
         + "</div>"
     )
 
- # Before (likely 60)
-# components.html(f""" ... """, height=60, scrolling=False)
-
-# After (secret-driven, with sensible default)
-_page_h = int(st.secrets.get("READONLY_HELP_IFRAME_H_PX", 900))
-components.html(f""" ... """, height=_page_h, scrolling=False)
 
 # -----------------------------
 # App UI
@@ -616,7 +610,10 @@ def _render_help(style: str = "modal"):
         }});
       }})();
     </script>
-    """, height=60, scrolling=False)
+   _page_h = int(st.secrets.get("READONLY_HELP_IFRAME_H_PX", 900))
+components.html(f"""
+    ... the same modal HTML/CSS/JS above ...
+    """, height=_page_h, scrolling=False)
 
 # Choose style via secrets (defaults to modal)
 _help_style = str(st.secrets.get("READONLY_HELP_STYLE", "modal")).lower()
