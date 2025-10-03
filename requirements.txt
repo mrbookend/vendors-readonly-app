@@ -2,7 +2,7 @@ pip==24.2
 setuptools==72.1.0
 wheel==0.44.0
 
-# App deps (SQLite-only)
+# App deps
 streamlit==1.36.0
 pandas==2.2.2
 numpy==1.26.4
@@ -10,4 +10,9 @@ SQLAlchemy==2.0.30
 
 # Streamlit tends to pull protobuf; this avoids odd newest-major issues
 protobuf<5
+
+# Turso/libSQL dialect (keeps sqlite+libsql working)
 sqlalchemy-libsql
+
+# AgGrid for real auto-expand rows
+streamlit-aggrid>=0.3.4
