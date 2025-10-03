@@ -7,6 +7,7 @@
 # - Optional sticky first column (id) — default OFF
 # - Wide page layout with configurable max width via secrets
 # - Help section via st.expander (no modal/iframe)
+# - CSV download button for the entire dataset
 
 from __future__ import annotations
 
@@ -537,6 +538,18 @@ if df.empty:
 else:
     df_view = df[columns_order].copy()
     widths_px = _get_column_widths_px()
+
+    # --- Download button (entire dataset) ---
+    csv_bytes = df_view.to_csv(index=False).encode("utf-8-sig")
+    st.download_button(
+        label="Download vendors as CSV",
+        data=csv_bytes,
+        file_name="vendors.csv",
+        mime="text/csv",
+        use_container_width=True,
+    )
+
+    # Render grid
     _render_sortable_wrapped_table(
         df_view,
         widths_px,
