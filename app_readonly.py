@@ -1,4 +1,4 @@
-# app_readonly.py — Read‑Only Vendors (stability‑first v2)
+# app_readonly.py — Read‑Only Vendors (stability‑first v3)
 # 
 # Goals
 # - Preserve the original look/feel and column order (zero surprise)
@@ -8,10 +8,11 @@
 # - Simple, robust quick filter (client‑side contains across all string cols)
 # - Minimal CSS just for wrapping and column widths; no other visual drift
 # - Keep code compact and readable without cleverness
+# - Place "Download Providers (CSV)" and then "Status & Secrets (debug)" at the END of the page
 #
 # Expected schema: vendors(id, category, service, business_name, contact_name, phone, address, website, notes, keywords)
 #
-# Version: 2.0 (2025‑10‑03)
+# Version: 3.0 (2025‑10‑03)
 
 from __future__ import annotations
 
@@ -322,12 +323,17 @@ def render_status_debug():
 
 
 # -----------------------------
+# CSV export helper
+# -----------------------------
+def _to_csv_bytes(df: pd.DataFrame) -> bytes:
+    return df.to_csv(index=False).encode("utf-8")
+
+
+# -----------------------------
 # Main app
 # -----------------------------
 
 def main():
-    render_status_debug()  # debug panel first, collapsed by default
-
     # Load data (robust to minor schema drift)
     try:
         df = load_vendors()
@@ -352,6 +358,18 @@ def main():
 
     # Show table
     st.dataframe(df_filtered, use_container_width=True, hide_index=True)
+
+    # --- Download CSV button just before debug section ---
+    st.download_button(
+        label="Download Providers (CSV)",
+        data=_to_csv_bytes(df_filtered),
+        file_name="providers.csv",
+        mime="text/csv",
+        help="Exports exactly what you see (after filter and label overrides).",
+    )
+
+    # --- Debug panel LAST on the page ---
+    render_status_debug()
 
 
 if __name__ == "__main__":
