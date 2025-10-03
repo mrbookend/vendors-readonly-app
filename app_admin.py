@@ -750,6 +750,7 @@ def render_status_debug():
 # Main
 # -----------------------------
 def main():
+    st.text("TOP-SENTINEL")  # ← add this line
     render_help()
 
     tabs = st.tabs([
