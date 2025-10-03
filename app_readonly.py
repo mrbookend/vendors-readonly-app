@@ -1,51 +1,37 @@
-# app_readonly.py
-# Vendors — Read-only (AG Grid)
-# - st_aggrid table with ONE global Quick Search (AND across tokens), NO per-column filters/menus
-# - Turso/libSQL preferred (sqlite+libsql with auth token), clean fallback to local SQLite vendors.db
-# - Column labels & pixel widths from secrets (with sane defaults; partial overrides OK)
-# - Website column rendered as a clickable "Open" link (new tab)
-# - Wide page layout & sidebar state from secrets
-# - CSV download (respects current quick search) + a thorough debug/status expander
+# app_readonly.py — Read‑Only Vendors (stability‑first v3.2)
+# 
+# Goals
+# - Preserve original look/feel and column order (zero surprise)
+# - Secrets control labels, widths, sticky first column, help text
+# - Fix Help crash (no nested expanders; Markdown rendering)
+# - Turso (libSQL) primary DB, local SQLite fallback
+# - Simple quick filter (client‑side contains across all string cols)
+# - Minimal CSS for wrapping/widths; no other visual drift
+# - Download CSV button; Status & Secrets (debug) pinned at END
+# - Website: clickable link (display text = "Website") only when URL is valid,
+#   and a full URL text column immediately to the right.
 #
-# Secrets you can set (all optional except DB if using Turso):
-#   page_title, page_max_width_px, sidebar_state,
-#   READONLY_HELP_TITLE, READONLY_HELP_MD,
-#   READONLY_COLUMN_LABELS, COLUMN_WIDTHS_PX_READONLY,
-#   TURSO_DATABASE_URL, TURSO_AUTH_TOKEN
+# Expected schema: vendors(id, category, service, business_name, contact_name, phone, address, website, notes, keywords)
 #
-# Requirements (requirements.txt):
-#   streamlit==1.39.0
-#   pandas==2.2.2
-#   sqlalchemy==2.0.34
-#   streamlit-aggrid==0.3.4.post3
-#   libsql-experimental==0.1.7
-#
-# Optional runtime pin (runtime.txt):
-#   python-3.11.9
+# Version: 3.2 (2025‑10‑03)
 
 from __future__ import annotations
 
 import os
-from typing import Dict, List, Tuple
+from typing import Dict, List
 
 import pandas as pd
 import streamlit as st
 from sqlalchemy import create_engine, text as sql_text
 from sqlalchemy.engine import Engine
+from urllib.parse import urlparse
 
-from st_aggrid import (
-    AgGrid,
-    GridOptionsBuilder,
-    GridUpdateMode,
-    JsCode,
-    ColumnsAutoSizeMode,
-)
 
-# =========================
-# Early secret/env access
-# =========================
+# -----------------------------
+# Early secret/env helpers
+# -----------------------------
+
 def _read_secret_early(name: str, default=None):
-    """Read from st.secrets if available, else environment, else default."""
     try:
         if name in st.secrets:
             return st.secrets[name]
@@ -53,349 +39,403 @@ def _read_secret_early(name: str, default=None):
         pass
     return os.environ.get(name, default)
 
-# =========================
-# Page config (must be early)
-# =========================
-PAGE_TITLE = _read_secret_early("page_title", "Vendors (Read-only)")
-SIDEBAR_STATE = (_read_secret_early("sidebar_state", "auto") or "auto").lower()
-if SIDEBAR_STATE not in {"auto", "expanded", "collapsed"}:
-    SIDEBAR_STATE = "auto"
-st.set_page_config(page_title=PAGE_TITLE, layout="wide", initial_sidebar_state=SIDEBAR_STATE)
 
-def _apply_page_width_css():
-    max_width_px = _read_secret_early("page_max_width_px", None)
+def _get_secret_bool(val, default=False) -> bool:
+    if isinstance(val, bool):
+        return val
+    if isinstance(val, str):
+        return val.strip().lower() in ("1", "true", "yes", "on")
+    return bool(default)
+
+
+# -----------------------------
+# Page layout (must run first)
+# -----------------------------
+
+def _apply_page_layout():
+    title = _read_secret_early("page_title", "HCR Vendors (Read‑Only)")
+    sidebar_state = _read_secret_early("sidebar_state", "expanded")
+    max_width = _read_secret_early("page_max_width_px", 2300)
+
+    st.set_page_config(page_title=title, layout="wide", initial_sidebar_state=sidebar_state)
+
     try:
-        max_width_px = int(max_width_px) if max_width_px is not None else None
+        max_width = int(max_width)
     except Exception:
-        max_width_px = None
+        max_width = 2300
 
-    css = ["<style>"]
-    if max_width_px:
-        css.append(
-            f""".block-container {{
-                    max-width: {max_width_px}px;
-                }}"""
-        )
-    # Ensure cells wrap inside AG Grid
-    css.append(
-        """
-        .ag-theme-streamlit .ag-cell {
-            white-space: normal !important;
-            line-height: 1.25rem !important;
-        }
-        """
+    st.markdown(
+        f"""
+        <style>
+        .block-container {{ max-width: {max_width}px; }}
+        </style>
+        """,
+        unsafe_allow_html=True,
     )
-    css.append("</style>")
-    st.markdown("\n".join(css), unsafe_allow_html=True)
 
-_apply_page_width_css()
 
-# =========================
-# Help content & column config
-# =========================
-HELP_TITLE = _read_secret_early("READONLY_HELP_TITLE", "Provider Help / Tips")
-HELP_MD = _read_secret_early(
-    "READONLY_HELP_MD",
-    "Use the global Quick Search (below) for partial word matches; tokens are ANDed. Click headers to sort."
+_apply_page_layout()
+
+
+# -----------------------------
+# Secrets-driven config
+# -----------------------------
+
+COLUMN_WIDTHS_PX: Dict[str, int] = _read_secret_early("COLUMN_WIDTHS_PX_READONLY", {}) or {}
+LABEL_OVERRIDES: Dict[str, str] = _read_secret_early("READONLY_COLUMN_LABELS", {}) or {}
+STICKY_FIRST = _get_secret_bool(_read_secret_early("READONLY_STICKY_FIRST_COL", False), False)
+
+HELP_TITLE = (
+    _read_secret_early("READONLY_HELP_TITLE")
+    or LABEL_OVERRIDES.get("readonly_help_title")
+    or "Providers Help / Tips"
+)
+HELP_MD = (
+    _read_secret_early("READONLY_HELP_MD")
+    or LABEL_OVERRIDES.get("readonly_help_md")
+    or ""
+)
+HELP_DEBUG = _get_secret_bool(
+    _read_secret_early("READONLY_HELP_DEBUG"),
+    _get_secret_bool(LABEL_OVERRIDES.get("readonly_help_debug"), False),
 )
 
-# Default DB→Display label mapping
-DEFAULT_LABELS: Dict[str, str] = {
-    "id": "ID",
-    "category": "Category",
-    "service": "Service",
-    "business_name": "Business Name",
-    "contact_name": "Contact Name",
-    "phone": "Phone",
-    "address": "Address",
-    "website": "Website",
-    "notes": "Notes",
-    "keywords": "Keywords",
-}
-LABEL_OVERRIDES = _read_secret_early("READONLY_COLUMN_LABELS", {})
-DISPLAY_LABELS = {**DEFAULT_LABELS, **LABEL_OVERRIDES} if isinstance(LABEL_OVERRIDES, dict) else DEFAULT_LABELS
-
-# Pixel widths per DB column key
-DEFAULT_WIDTHS_PX: Dict[str, int] = {
-    "id": 60,
-    "business_name": 300,
-    "category": 220,
-    "service": 220,
-    "contact_name": 160,
-    "phone": 140,
-    "address": 300,
-    "website": 240,
-    "notes": 320,
-    "keywords": 140,
-}
-WIDTHS_RAW = _read_secret_early("COLUMN_WIDTHS_PX_READONLY", None)
-COLUMN_WIDTHS_PX: Dict[str, int] = {**DEFAULT_WIDTHS_PX, **WIDTHS_RAW} if isinstance(WIDTHS_RAW, dict) else DEFAULT_WIDTHS_PX
-
-# Preferred display order (URL right after Address; ID last)
-DISPLAY_ORDER = [
-    "category", "business_name", "contact_name", "phone",
-    "address", "website", "notes", "keywords", "id"
+# Optional column order override via secrets; default to canonical order
+DEFAULT_ORDER = [
+    "id",
+    "business_name",
+    "category",
+    "service",
+    "contact_name",
+    "phone",
+    "address",
+    "website",
+    "notes",
+    "keywords",
 ]
-DISPLAY_ORDER = [c for c in DISPLAY_ORDER if c in DEFAULT_LABELS]
+RAW_OVERRIDE_ORDER = _read_secret_early("READONLY_COLUMN_ORDER", None)
+COLUMN_ORDER: List[str] = (
+    [c.strip() for c in RAW_OVERRIDE_ORDER] if isinstance(RAW_OVERRIDE_ORDER, (list, tuple)) else DEFAULT_ORDER
+)
 
-# =========================
-# DB Engine (Turso → SQLite)
-# =========================
-def build_engine() -> Tuple[Engine, dict]:
-    """Create SQLAlchemy engine preferring Turso/libSQL; fallback to local SQLite."""
-    libsql_url = _read_secret_early("TURSO_DATABASE_URL", None)
-    if not libsql_url:
-        raw = _read_secret_early("LIBSQL_URL", None)
-        if raw and raw.startswith("libsql://"):
-            libsql_url = f"sqlite+libsql://{raw[len('libsql://'):]}"
-    auth_token = _read_secret_early("TURSO_AUTH_TOKEN", _read_secret_early("LIBSQL_AUTH_TOKEN", None))
 
-    if libsql_url and libsql_url.startswith("libsql://"):
-        libsql_url = "sqlite+libsql://" + libsql_url[len("libsql://"):]
+# -----------------------------
+# Database engine
+# -----------------------------
 
-    # Try remote first
-    if libsql_url and auth_token:
+def _make_engine() -> Engine:
+    url = _read_secret_early(
+        "TURSO_DATABASE_URL",
+        "sqlite+libsql://vendors-prod-mrbookend.aws-us-west-2.turso.io?secure=true",
+    )
+    token = _read_secret_early("TURSO_AUTH_TOKEN", None)
+
+    if isinstance(url, str) and url.startswith("sqlite+libsql://"):
+        connect_args = {"auth_token": token} if token else {}
         try:
-            eng = create_engine(libsql_url, connect_args={"auth_token": auth_token})
+            eng = create_engine(url, connect_args=connect_args, pool_pre_ping=True)
             with eng.connect() as conn:
                 conn.execute(sql_text("SELECT 1"))
-            return eng, {"using_remote": True, "engine_url": libsql_url, "driver": "libsql"}
+            return eng
         except Exception as e:
-            st.warning(f"Turso connection failed ({e!r}). Falling back to local SQLite vendors.db.")
+            st.warning(f"Turso connection failed ({e}). Falling back to local SQLite vendors.db.")
 
-    # Local SQLite fallback (portable path detection)
-    candidates = [
-        os.path.join(os.getcwd(), "vendors.db"),
-        "/mount/src/vendors-readonly-app/vendors.db",
-        "/app/vendors-readonly-app/vendors.db",
-    ]
-    db_path = next((p for p in candidates if os.path.exists(p)), candidates[0])
-    eng = create_engine(f"sqlite:///{db_path}")
-    return eng, {"using_remote": False, "engine_url": f"sqlite:///{db_path}", "driver": "sqlite"}
+    # Fallback local path (Streamlit Cloud mount or repo root)
+    local_path = "/mount/src/vendors-readonly-app/vendors.db"
+    if not os.path.exists(local_path):
+        local_path = "vendors.db"
+    return create_engine(f"sqlite:///{local_path}")
 
-engine, engine_info = build_engine()
 
-# =========================
-# Data Load
-# =========================
-@st.cache_data(show_spinner=False)
-def load_vendors(_engine: Engine) -> pd.DataFrame:
-    cols = [
-        "id", "category", "service", "business_name", "contact_name",
-        "phone", "address", "website", "notes", "keywords"
-    ]
-    with _engine.begin() as conn:
-        info = pd.read_sql(sql_text("PRAGMA table_info(vendors)"), conn)
-        available = set(info["name"].tolist())
-        select_cols = [c for c in cols if c in available]
-        if not select_cols:
-            raise RuntimeError("vendors table exists but none of the expected columns were found.")
-        df = pd.read_sql(sql_text(f"SELECT {', '.join(select_cols)} FROM vendors"), conn)
+engine = _make_engine()
 
-    # Normalize types
-    for c in df.columns:
-        if c != "id":
-            df[c] = df[c].astype("string").fillna("")
+
+# -----------------------------
+# Data access
+# -----------------------------
+
+EXPECTED_COLS = set(DEFAULT_ORDER)
+
+
+def _effective_order(df_cols: List[str]) -> List[str]:
+    # Keep requested order but only include columns that exist; append any extra columns at the end
+    order = [c for c in COLUMN_ORDER if c in df_cols]
+    extras = [c for c in df_cols if c not in order]
+    return order + extras
+
+
+def load_vendors() -> pd.DataFrame:
+    # Select only columns that likely exist; if not, select * and reorder later
+    try:
+        query = f"SELECT {', '.join(DEFAULT_ORDER)} FROM vendors"
+        with engine.connect() as conn:
+            df = pd.read_sql_query(sql_text(query), conn)
+    except Exception:
+        # Fallback to SELECT * then trim/reorder
+        with engine.connect() as conn:
+            df = pd.read_sql_query(sql_text("SELECT * FROM vendors"), conn)
+
+    # Ensure all expected columns exist (fill in empty if missing), but do not coerce user data
+    for col in DEFAULT_ORDER:
+        if col not in df.columns:
+            df[col] = ""
+
+    # Reorder columns with optional override, without dropping unknown columns
+    df = df[_effective_order(df.columns.tolist())]
+
     return df
 
-try:
-    df_raw = load_vendors(engine)
-except Exception as e:
-    st.error(f"Error loading vendors: {e}")
-    st.stop()
 
-# =========================
-# UI — Header & Help
-# =========================
-st.title(PAGE_TITLE)
+# -----------------------------
+# CSS: wrapping, widths, optional sticky first column
+# -----------------------------
 
-# Show Help/Tips via popover if available, else expander
-try:
-    with st.popover(HELP_TITLE):  # Streamlit >= 1.30
-        st.markdown(HELP_MD or "_No help content configured._")
-except AttributeError:
+def _apply_table_css(field_order: List[str], widths_px: Dict[str, int], sticky_first: bool):
+    width_rules = []
+    # Build nth-child selectors aligned to the *visible* order
+    for idx, field in enumerate(field_order, start=1):
+        px = widths_px.get(field)
+        if not px:
+            continue
+        width_rules.append(
+            f"""
+            /* {idx}: {field} width */
+            div[data-testid='stDataFrame'] table thead tr th:nth-child({idx}),
+            div[data-testid='stDataFrame'] table tbody tr td:nth-child({idx}) {{
+                min-width: {px}px !important;
+                max-width: {px}px !important;
+                width: {px}px !important;
+                white-space: normal !important;
+                overflow-wrap: anywhere !important;
+                word-break: break-word !important;
+            }}
+            """
+        )
+
+    sticky_rule = ""
+    if sticky_first and field_order:
+        sticky_rule = f"""
+        /* Sticky first column */
+        div[data-testid='stDataFrame'] table thead tr th:nth-child(1),
+        div[data-testid='stDataFrame'] table tbody tr td:nth-child(1) {{
+            position: sticky; left: 0; z-index: 2; background: var(--background-color, white);
+            box-shadow: 1px 0 0 0 rgba(0,0,0,0.06);
+        }}
+        div[data-testid='stDataFrame'] table thead tr th:nth-child(1) {{ z-index: 3; }}
+        """
+
+    st.markdown(
+        f"""
+        <style>
+        div[data-testid='stDataFrame'] table {{ table-layout: fixed !important; }}
+        div[data-testid='stDataFrame'] table td, div[data-testid='stDataFrame'] table th {{
+            white-space: normal !important; overflow-wrap: anywhere !important; word-break: break-word !important;
+        }}
+        {''.join(width_rules)}
+        {sticky_rule}
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+# -----------------------------
+# Column label overrides (display only)
+# -----------------------------
+
+def _apply_label_overrides(df: pd.DataFrame, overrides: Dict[str, str]) -> pd.DataFrame:
+    if not overrides:
+        return df
+    mapping = {k: v for k, v in overrides.items() if k in df.columns and isinstance(v, str) and v}
+    return df.rename(columns=mapping)
+
+
+# -----------------------------
+# Quick filter
+# -----------------------------
+
+def _quick_filter(df: pd.DataFrame) -> pd.DataFrame:
+    st.subheader("Browse Providers")
+    q = st.text_input("Quick filter (matches any column)", value="", placeholder="e.g., plumb, roof, 78245…").strip()
+    if not q:
+        return df
+
+    ql = q.lower()
+    mask = pd.Series(False, index=df.index)
+    for c in df.columns:
+        if pd.api.types.is_object_dtype(df[c]) or pd.api.types.is_string_dtype(df[c]):
+            mask = mask | df[c].fillna("").astype(str).str.lower().str.contains(ql, na=False)
+    return df[mask]
+
+
+# -----------------------------
+# Help (single expander, Markdown; optional raw debug)
+# -----------------------------
+
+def render_help():
     with st.expander(HELP_TITLE, expanded=False):
-        st.markdown(HELP_MD or "_No help content configured._")
+        if HELP_MD:
+            st.markdown(HELP_MD)
+            if HELP_DEBUG:
+                st.caption("Raw help (debug preview)")
+                st.code(HELP_MD, language=None)
+        else:
+            st.info("No help content has been configured yet.")
 
-# =========================
-# Global Quick Search (under Help)
-# =========================
-def _tokenize(q: str) -> List[str]:
-    return [t.strip() for t in q.split() if t.strip()]
 
-search_query = st.text_input(
-    "Quick Search (partial words; AND across words). e.g., `plumb repair`",
-    key="quick_search",
-    help="Applies to all visible columns. Case-insensitive partial matches; tokens are ANDed."
-).strip()
+# -----------------------------
+# Debug panel (kept concise)
+# -----------------------------
 
-# We'll use AG Grid's built-in quickFilter for display AND also filter in Python
-# so that the CSV download matches the search results exactly.
-def py_filter(df: pd.DataFrame, query: str) -> pd.DataFrame:
-    if not query:
-        return df
-    tokens = _tokenize(query.lower())
-    if not tokens:
-        return df
-    text_cols = [c for c in df.columns if c != "id"]
-    df2 = df.copy()
-    for c in text_cols:
-        df2[c] = df2[c].astype("string").fillna("")
-    joined = df2[text_cols].agg(" ".join, axis=1).str.lower()
-    mask = pd.Series(True, index=df2.index)
-    for t in tokens:
-        mask &= joined.str.contains(t, na=False)
-    return df2[mask]
-
-df_filtered = py_filter(df_raw, search_query)
-
-# =========================
-# Prepare display frame (labels + order)
-# =========================
-def apply_labels_and_order(df: pd.DataFrame) -> pd.DataFrame:
-    for c in DEFAULT_LABELS:
-        if c not in df.columns:
-            df[c] = "" if c != "id" else pd.NA
-    cols = [c for c in DISPLAY_ORDER if c in df.columns]
-    dfx = df[cols].copy()
-    rename_map = {c: DISPLAY_LABELS.get(c, c) for c in cols}
-    dfx.rename(columns=rename_map, inplace=True)
-    return dfx
-
-df_display = apply_labels_and_order(df_filtered)
-st.caption(f"{len(df_display):,} vendor(s) shown")
-
-# Reverse map labels -> DB keys (used for widths)
-label_to_key = {DISPLAY_LABELS.get(k, k): k for k in DISPLAY_LABELS}
-
-# =========================
-# AG Grid setup (NO per-column filters/menus)
-# =========================
-# Renderer for Website links
-link_renderer = JsCode(
-    """
-    class LinkRenderer {
-      init(params) {
-        const url = (params.value || '').trim();
-        const a = document.createElement('a');
-        a.href = url || '#';
-        a.target = '_blank';
-        a.rel = 'noopener noreferrer';
-        a.innerText = url ? 'Open' : '';
-        this.eGui = a;
-      }
-      getGui() { return this.eGui; }
-    }
-    """
+DEBUG_KEYS = (
+    "COLUMN_WIDTHS_PX_READONLY",
+    "READONLY_COLUMN_LABELS",
+    "READONLY_STICKY_FIRST_COL",
+    "READONLY_HELP_TITLE",
+    "READONLY_HELP_MD",
+    "READONLY_HELP_DEBUG",
+    "READONLY_COLUMN_ORDER",
+    "page_title",
+    "page_max_width_px",
+    "sidebar_state",
+    "TURSO_DATABASE_URL",
 )
 
-g = GridOptionsBuilder.from_dataframe(df_display)
 
-# Global defaults: no per-column filters, no menus, sorting & resizing on, wrap text
-g.configure_default_column(
-    filter=False,               # disable per-column filter UI
-    sortable=True,
-    resizable=True,
-    wrapText=True,
-    autoHeight=True,
-    suppressMenu=True,          # hide the column menu
-)
+def render_status_debug():
+    with st.expander("Status & Secrets (debug)", expanded=False):
+        try:
+            keys = list(st.secrets.keys())
+        except Exception:
+            keys = []
 
-# Column widths + special Website renderer
-for disp_col in df_display.columns:
-    db_key = label_to_key.get(disp_col, disp_col)
-    width_px = COLUMN_WIDTHS_PX.get(db_key, None)
-
-    if db_key == "website":
-        g.configure_column(
-            disp_col,
-            width=width_px,
-            cellRenderer=link_renderer,
-            suppressSizeToFit=True,
+        backend = (
+            "libsql" if str(_read_secret_early("TURSO_DATABASE_URL", "")).startswith("sqlite+libsql://") else "sqlite"
         )
-    else:
-        g.configure_column(
-            disp_col,
-            width=width_px,
-            suppressSizeToFit=True,
-        )
+        dsn = _read_secret_early("TURSO_DATABASE_URL", "")
+        auth = "token_set" if bool(_read_secret_early("TURSO_AUTH_TOKEN", None)) else "none"
 
-grid_options = g.build()
-# Wire the grid's built-in quick filter to our search box
-grid_options["quickFilterText"] = search_query
+        st.write("DB")
+        st.code({"backend": backend, "dsn": dsn, "auth": auth})
 
-AgGrid(
-    df_display,
-    gridOptions=grid_options,
-    update_mode=GridUpdateMode.NO_UPDATE,
-    allow_unsafe_jscode=True,
-    theme="streamlit",
-    height=600,
-    fit_columns_on_grid_load=False,
-    columns_auto_size_mode=ColumnsAutoSizeMode.NO_AUTOSIZE,
-)
+        st.write("Secrets keys (present)")
+        st.code(keys)
 
-# =========================
-# Download (CSV uses DB keys; respects Quick Search)
-# =========================
-csv_bytes = df_filtered.to_csv(index=False).encode("utf-8")
-st.download_button(
-    "Download providers CSV",
-    data=csv_bytes,
-    file_name="vendors_readonly_export.csv",
-    mime="text/csv"
-)
+        st.write("Help MD:", "present" if bool(HELP_MD) else "(missing or empty)")
+        st.write("Sticky first col enabled:", STICKY_FIRST)
 
-# =========================
-# Debug / Status
-# =========================
-with st.expander("Status & Secrets (debug)", expanded=False):
-    st.subheader("DB")
-    st.code({
-        "backend": engine_info.get("driver"),
-        "dsn": engine_info.get("engine_url"),
-        "auth": "token_set" if _read_secret_early("TURSO_AUTH_TOKEN", _read_secret_early("LIBSQL_AUTH_TOKEN")) else "none"
-    }, language="json")
+        st.write("Raw COLUMN_WIDTHS_PX_READONLY (type)", type(COLUMN_WIDTHS_PX).__name__)
+        st.code(COLUMN_WIDTHS_PX)
 
-    keys_present = []
+        st.write("Column label overrides (if any)")
+        st.code(LABEL_OVERRIDES)
+
+        st.write("Effective column order")
+        st.code(COLUMN_ORDER)
+
+
+# -----------------------------
+# URL normalize + validate (for Website)
+# -----------------------------
+
+def _normalize_url(u: str) -> str:
+    """Return a normalized http(s) URL or empty string if invalid.
+    - Adds http:// if scheme missing
+    - Validates scheme is http(s) and netloc has a dot
+    """
+    s = (u or "").strip()
+    if not s:
+        return ""
+    if not isinstance(s, str):
+        s = str(s)
+    if not s.lower().startswith(("http://", "https://")):
+        s = "http://" + s
     try:
-        keys_present = list(st.secrets.keys())
+        p = urlparse(s)
+        if p.scheme not in ("http", "https"):
+            return ""
+        if not p.netloc or "." not in p.netloc:
+            return ""
+        return s
     except Exception:
-        pass
+        return ""
 
-    st.subheader("Secrets keys (present)")
-    st.write(keys_present if keys_present else "No st.secrets or cannot enumerate in this environment.")
 
-    st.subheader("Help Content")
-    st.write({"title": HELP_TITLE, "md_len": len(HELP_MD or "")})
+# -----------------------------
+# CSV export helper
+# -----------------------------
 
-    st.subheader("Raw column widths (from secrets, merged with defaults)")
-    st.code(COLUMN_WIDTHS_PX, language="json")
+def _to_csv_bytes(df: pd.DataFrame) -> bytes:
+    return df.to_csv(index=False).encode("utf-8")
 
-    st.subheader("Display labels (merged)")
-    st.code(DISPLAY_LABELS, language="json")
 
-    st.subheader("Database Status & Schema (snapshot)")
+# -----------------------------
+# Main app
+# -----------------------------
+
+def main():
+    # Load data (robust to minor schema drift)
     try:
-        with engine.begin() as conn:
-            try:
-                pragma = pd.read_sql(sql_text("PRAGMA table_info(vendors)"), conn)
-                cols = pragma[["name", "type"]].values.tolist()
-            except Exception:
-                cols = []
-            try:
-                ct = pd.read_sql(sql_text("SELECT COUNT(*) AS c FROM vendors"), conn)["c"].iloc[0]
-            except Exception:
-                ct = None
+        df = load_vendors()
     except Exception as e:
-        cols, ct = [], None
-        st.write(f"Error checking schema/counts: {e!r}")
+        st.error(f"Failed to load vendors: {e}")
+        return
 
-    st.code({
-        "engine_url": engine_info.get("engine_url"),
-        "using_remote": engine_info.get("using_remote"),
-        "page_max_width_px": _read_secret_early("page_max_width_px", None),
-        "displayed_columns": list(df_display.columns),
-        "counts": {"vendors": int(ct) if ct is not None else "unknown"},
-        "vendors_columns": [c for c, _t in cols] if cols else "unknown"
-    }, language="json")
+    # Compute the field order we will *display* (after label overrides)
+    visible_order = _effective_order(df.columns.tolist())
+
+    # CSS for wrapping / widths / optional sticky
+    _apply_table_css(visible_order, COLUMN_WIDTHS_PX, STICKY_FIRST)
+
+    # Help (safe, single expander)
+    render_help()
+
+    # Apply label overrides for display only (no mutation of underlying data)
+    df_display = _apply_label_overrides(df, LABEL_OVERRIDES)
+
+    # Quick filter (client‑side)
+    df_filtered = _quick_filter(df_display)
+
+    # Show table — Website link with display text and adjacent full URL column
+    website_key = LABEL_OVERRIDES.get("website", "website")
+    _df_show = df_filtered.copy()
+
+    if website_key in _df_show.columns:
+        try:
+            # Normalize/validate; empty string means "no link"
+            norm_urls = _df_show[website_key].apply(_normalize_url)
+
+            # Full URL column immediately to the right of Website
+            url_col = f"{website_key} URL" if website_key.lower() != "website" else "Website URL"
+            w_idx = _df_show.columns.get_loc(website_key)
+            _df_show.insert(w_idx + 1, url_col, norm_urls)
+
+            # Render: LinkColumn shows "Website" text only for non-empty URLs
+            st.dataframe(
+                _df_show.assign(**{website_key: norm_urls}),
+                use_container_width=True,
+                hide_index=True,
+                column_config={
+                    website_key: st.column_config.LinkColumn(display_text="Website"),
+                },
+            )
+        except Exception:
+            st.dataframe(_df_show, use_container_width=True, hide_index=True)
+    else:
+        st.dataframe(_df_show, use_container_width=True, hide_index=True)
+
+    # Download CSV button just before debug section
+    st.download_button(
+        label="Download Providers (CSV)",
+        data=_to_csv_bytes(_df_show),
+        file_name="providers.csv",
+        mime="text/csv",
+        help="Exports exactly what you see (after filter and label overrides).",
+    )
+
+    # Debug panel LAST on the page
+    render_status_debug()
+
+
+if __name__ == "__main__":
+    main()
