@@ -1,13 +1,12 @@
 # app_readonly.py
-# Read-only Vendors view with:
+# Read-only Providers/Vendors view with:
 # - Pixel widths from secrets (COLUMN_WIDTHS_PX_READONLY or fallback)
 # - Wrapped cells; rows auto-grow in height
-# - Client-side sort on headers
-# - Client-side quick filter (matches any column)
+# - Client-side sort on headers + quick filter (JS in the embedded table)
 # - Optional sticky first column via secrets
 # - Wide layout; width from secrets
-# - Help via st.expander (no modal/iframe)
-# - CSV download button (entire dataset)
+# - Help via st.expander (reads READONLY_HELP_MD from secrets)
+# - CSV download button at the very bottom (just before debug)
 # - Optional display label overrides via [READONLY_COLUMN_LABELS] in secrets
 
 from __future__ import annotations
@@ -466,16 +465,16 @@ def _render_sortable_wrapped_table(
     components.html(html_doc, height=height_px, scrolling=True)
 
 # -----------------------------
-# Help (expander)
+# Help (expander) — reads Markdown from secrets
 # -----------------------------
 def render_help_expander():
-    title = _get_secret("READONLY_HELP_TITLE", "Help / Tips")
+    title = _get_secret("READONLY_HELP_TITLE", "Providers Help / Tips")
     md = _get_secret("READONLY_HELP_MD", None)
     with st.expander(title, expanded=False):
         if md and str(md).strip():
             st.markdown(str(md))
         else:
-            st.info("No help text configured.")
+            st.write("Providers Help / Tips")
 
 # -----------------------------
 # App UI (no page title)
@@ -493,18 +492,6 @@ if df.empty:
 else:
     df_view = df[columns_order].copy()
     widths_px = _get_column_widths_px()
-
-    # CSV Download (entire dataset) — updated label & filename
-    csv_bytes = df_view.to_csv(index=False).encode("utf-8-sig")
-    st.download_button(
-        label="Download providers as CSV",   # changed
-        data=csv_bytes,
-        file_name="providers.csv",           # changed
-        mime="text/csv",
-        use_container_width=True,
-    )
-
-    # Render grid
     _render_sortable_wrapped_table(
         df_view,
         widths_px,
@@ -513,8 +500,18 @@ else:
     )
 
 # -----------------------------
-# Debug at bottom
+# Bottom section: Download + Debug
 # -----------------------------
+if 'df_view' in locals() and not df_view.empty:
+    csv_bytes = df_view.to_csv(index=False).encode("utf-8-sig")
+    st.download_button(
+        label="Download providers as CSV",
+        data=csv_bytes,
+        file_name="providers.csv",
+        mime="text/csv",
+        use_container_width=True,
+    )
+
 with st.expander("Status & Secrets (debug)", expanded=False):
     st.write("**DB**", current_db_info())
     try:
