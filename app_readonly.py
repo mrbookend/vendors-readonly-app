@@ -1,9 +1,8 @@
-# app_readonly.py — HCR Vendors (Read-Only) v3.4 with st_aggrid auto-height
-# - Labels, widths, Help all come from secrets (same as Admin)
-# - Real auto-expanding rows via st_aggrid (wrapText + autoHeight); falls back to st.dataframe if not installed
-# - Website column shows "Website" (clickable) only if URL is valid; adjacent "Website URL" shows the full link
-# - CSV download; Status & Secrets (debug) at end
-# - No edits/audit here — strictly read-only
+# app_readonly.py — HCR Vendors (Read-Only) v3.5
+# - AgGrid with real auto-expanding rows for long text (no per-column filters)
+# - Quick filter under Help (partial words; AND-match)
+# - Website clickable + adjacent "Website URL"
+# - CSV at bottom; Status & Secrets (debug) at very end
 
 from __future__ import annotations
 
@@ -16,7 +15,7 @@ import streamlit as st
 from sqlalchemy import create_engine
 from sqlalchemy.sql import text as sql_text
 
-# Try to load st_aggrid (auto-expand rows)
+# ---- AgGrid (optional) ----
 try:
     from st_aggrid import AgGrid, GridOptionsBuilder, JsCode, GridUpdateMode, ColumnsAutoSizeMode
     _AGGRID_AVAILABLE = True
@@ -39,7 +38,7 @@ def _get_bool(val, default=False):
     if isinstance(val, bool):
         return val
     if isinstance(val, str):
-        return val.strip().lower() in ("1", "true", "yes", "on")
+        return val.strip().lower() in ("1","true","yes","on")
     return bool(default)
 
 
@@ -57,14 +56,7 @@ def _apply_layout():
         maxw = int(maxw)
     except Exception:
         maxw = 2300
-    st.markdown(
-        f"""
-        <style>
-        .block-container {{ max-width: {maxw}px; }}
-        </style>
-        """,
-        unsafe_allow_html=True,
-    )
+    st.markdown(f"<style>.block-container {{ max-width: {maxw}px; }}</style>", unsafe_allow_html=True)
 
 _apply_layout()
 
@@ -117,14 +109,13 @@ eng = _engine()
 
 
 # -----------------------------
-# CSS (applies to fallback table only; aggrid handles its own)
+# CSS (fallback table only)
 # -----------------------------
 def _apply_css(field_order: List[str]):
     rules = []
     for idx, col in enumerate(field_order, start=1):
         px = COLUMN_WIDTHS.get(col)
-        if not px:
-            continue
+        if not px: continue
         rules.append(
             f"""
             div[data-testid='stDataFrame'] table thead tr th:nth-child({idx}),
@@ -153,42 +144,8 @@ def _apply_css(field_order: List[str]):
         {''.join(rules)}
         {sticky}
         </style>
-        """,
-        unsafe_allow_html=True,
+        """, unsafe_allow_html=True
     )
-# ---------- Quick filter helpers ----------
-def _quick_filter_ui():
-    # Call this immediately AFTER render_help()
-    return st.text_input("Quick filter (type words or parts of words):", "", placeholder="e.g., plumber roof 78240")
-
-def _apply_quick_filter(df: pd.DataFrame, query: str) -> pd.DataFrame:
-    q = (query or "").strip().lower()
-    if not q:
-        return df
-    terms = [t for t in q.split() if t]
-    if not terms:
-        return df
-
-    # Build a single lowercase search blob per row across key columns
-    cols = [c for c in df.columns if c.lower() in {
-        "business_name","provider","category","service","contact_name",
-        "phone","address","website","notes","keywords","website url"
-    }]
-    if not cols:
-        return df
-
-    blob = (
-        df[cols]
-        .fillna("")
-        .astype(str)
-        .agg(" ".join, axis=1)
-        .str.lower()
-    )
-    # AND-match: all terms must appear somewhere in the row
-    mask = pd.Series(True, index=df.index)
-    for t in terms:
-        mask &= blob.str.contains(t, na=False)
-    return df[mask]
 
 
 # -----------------------------
@@ -196,23 +153,20 @@ def _apply_quick_filter(df: pd.DataFrame, query: str) -> pd.DataFrame:
 # -----------------------------
 def _normalize_url(u: str) -> str:
     s = (u or "").strip()
-    if not s:
-        return ""
+    if not s: return ""
     if not s.lower().startswith(("http://","https://")):
         s = "http://" + s
     try:
         p = urlparse(s)
-        if p.scheme not in ("http","https"):
-            return ""
-        if not p.netloc or "." not in p.netloc:
-            return ""
+        if p.scheme not in ("http","https"): return ""
+        if not p.netloc or "." not in p.netloc: return ""
         return s
     except Exception:
         return ""
 
 
 # -----------------------------
-# Help
+# Help + Quick filter
 # -----------------------------
 def render_help():
     with st.expander(HELP_TITLE, expanded=False):
@@ -223,6 +177,28 @@ def render_help():
                 st.code(HELP_MD, language=None)
         else:
             st.info("No help content has been configured yet.")
+
+def _quick_filter_ui():
+    return st.text_input("Quick filter (type words or parts of words):", "", placeholder="e.g., plumber roof 78240")
+
+def _apply_quick_filter(df: pd.DataFrame, query: str) -> pd.DataFrame:
+    q = (query or "").strip().lower()
+    if not q:
+        return df
+    terms = [t for t in q.split() if t]
+    if not terms:
+        return df
+    cols = [c for c in df.columns if c.lower() in {
+        "business_name","provider","category","service","contact_name",
+        "phone","address","website","notes","keywords","website url"
+    }]
+    if not cols:
+        return df
+    blob = df[cols].fillna("").astype(str).agg(" ".join, axis=1).str.lower()
+    mask = pd.Series(True, index=df.index)
+    for t in terms:
+        mask &= blob.str.contains(t, na=False)
+    return df[mask]
 
 
 # -----------------------------
@@ -244,43 +220,36 @@ def _apply_labels(df: pd.DataFrame) -> pd.DataFrame:
 
 
 # -----------------------------
-# AG Grid renderer (autoHeight)
+# AgGrid renderer (no per-column filters; long text autoHeight)
 # -----------------------------
 def _aggrid_view(df_show: pd.DataFrame, website_label: str = "website"):
-    """AgGrid with wrapped cells and autoHeight ONLY on long-text columns, using a normal scrollable grid."""
     if df_show.empty:
         st.info("No rows to display.")
         return
 
-    # Detect displayed website column (handles label overrides)
     website_key = website_label if website_label in df_show.columns else next((c for c in df_show.columns if c.lower()=="website"), None)
 
-    # Build display DF + normalized URL column to the right of website
     _df = df_show.copy()
     url_col = None
     if website_key:
-        norm = _df.get("website", _df[website_key]).map(_normalize_url)
+        raw_guess = "website"
+        norm = _df[raw_guess].map(_normalize_url) if raw_guess in _df.columns else _df[website_key].map(_normalize_url)
         url_col = f"{website_key} URL" if website_key.lower() != "website" else "Website URL"
         widx = _df.columns.get_loc(website_key)
         _df.insert(widx + 1, url_col, norm)
 
     gob = GridOptionsBuilder.from_dataframe(_df)
 
-    # Base column config
+    # Disable per-column filters; keep sort/resize
     gob.configure_default_column(
         resizable=True,
         sortable=True,
-        filter=True,
-        wrapText=False,      # default: no wrap (keeps rows compact)
-        autoHeight=False,    # default: fixed row height
+        filter=False,
+        wrapText=False,
+        autoHeight=False,
     )
 
-    # Columns that should wrap and auto-height
-    long_cols = {"notes", "address"}
-    if url_col:
-        long_cols.add(url_col)
-
-    # Map raw width config to displayed names
+    # Widths from secrets (map displayed -> raw if renamed)
     display_to_raw = {disp: raw for raw, disp in LABEL_OVERRIDES.items() if isinstance(disp, str) and disp}
     for col in _df.columns:
         raw_key = display_to_raw.get(col, col)
@@ -288,15 +257,19 @@ def _aggrid_view(df_show: pd.DataFrame, website_label: str = "website"):
         if px:
             gob.configure_column(col, width=px)
 
-        # Enable wrapping/autoHeight only on long text columns
+    # Long text columns auto-expand
+    long_cols = {"notes","address"}
+    if url_col:
+        long_cols.add(url_col)
+    for col in list(_df.columns):
         if col.lower() in long_cols:
             gob.configure_column(col, wrapText=True, autoHeight=True, cellStyle={"white-space": "normal"})
 
-    # Clickable "Website" label (only if we created URL column)
+    # Clickable "Website"
     if website_key and url_col:
         link_renderer = JsCode(f"""
             function(params){{
-                const url = params.data["{url_col}"] || "";
+                const url = params.data && params.data["{url_col}"] ? params.data["{url_col}"] : "";
                 if (!url) return "";
                 return `<a href="${{url}}" target="_blank" rel="noopener noreferrer">Website</a>`;
             }}
@@ -304,9 +277,9 @@ def _aggrid_view(df_show: pd.DataFrame, website_label: str = "website"):
         gob.configure_column(website_key, cellRenderer=link_renderer)
 
     grid_options = gob.build()
+    grid_options["floatingFilter"] = False
+    grid_options["suppressMenuHide"] = True
 
-    # IMPORTANT: use normal layout (scroll inside grid) so heights are stable
-    # We also set a reasonable grid height; adjust if you want more/less visible rows
     AgGrid(
         _df,
         gridOptions=grid_options,
@@ -315,19 +288,26 @@ def _aggrid_view(df_show: pd.DataFrame, website_label: str = "website"):
         allow_unsafe_jscode=True,
         enable_enterprise_modules=False,
         columns_auto_size_mode=ColumnsAutoSizeMode.FIT_CONTENTS,
-        height=600,     # scrollable grid; no domLayout:'autoHeight'
+        height=600,
         theme="streamlit",
     )
 
 
 # -----------------------------
-# View body
+# View body (quick filter; CSV at bottom)
 # -----------------------------
-def render_view():
+def render_view(query: str):
     df = _fetch_df()
     df_show = _apply_labels(df)
+    df_show = _apply_quick_filter(df_show, query)
 
-    # CSV download (first; grid can be tall)
+    if _AGGRID_AVAILABLE:
+        _aggrid_view(df_show, website_label=LABEL_OVERRIDES.get("website", "website"))
+    else:
+        st.warning("`streamlit-aggrid` not installed — showing basic table.")
+        _apply_css(df.columns.tolist())
+        st.dataframe(df_show, use_container_width=True, hide_index=True)
+
     st.download_button(
         label="Download Providers (CSV)",
         data=df_show.to_csv(index=False).encode("utf-8"),
@@ -335,61 +315,25 @@ def render_view():
         mime="text/csv",
     )
 
-    if _AGGRID_AVAILABLE:
-        _aggrid_view(df_show, website_label=LABEL_OVERRIDES.get("website", "website"))
-    else:
-        # Fallback table (no true auto-height)
-        st.warning("`streamlit-aggrid` not installed — showing basic table without auto-expanding rows.")
-        website_key = LABEL_OVERRIDES.get("website", "website")
-        _df = df_show.copy()
-        if website_key in _df.columns:
-            try:
-                base_col = "website" if "website" in df.columns else website_key
-                norm = df[base_col].apply(_normalize_url) if base_col in df.columns else _df[website_key].apply(_normalize_url)
-                url_col = f"{website_key} URL" if website_key.lower() != "website" else "Website URL"
-                w_idx = _df.columns.get_loc(website_key)
-                _df.insert(w_idx + 1, url_col, norm)
-                _apply_css(df.columns.tolist())
-                st.dataframe(
-                    _df.assign(**{website_key: norm}),
-                    use_container_width=True,
-                    hide_index=True,
-                    column_config={website_key: st.column_config.LinkColumn(display_text="Website")},
-                )
-            except Exception:
-                _apply_css(df.columns.tolist())
-                st.dataframe(_df, use_container_width=True, hide_index=True)
-        else:
-            _apply_css(df.columns.tolist())
-            st.dataframe(_df, use_container_width=True, hide_index=True)
-
 
 # -----------------------------
 # Status & Secrets (debug) — END
 # -----------------------------
 def render_status_debug():
     with st.expander("Status & Secrets (debug)", expanded=False):
-        backend = "libsql" if str(_read_secret("TURSO_DATABASE_URL", "")).startswith("sqlite+libsql://") else "sqlite"
+        backend = "libsql" if str(_read_secret("TURSO_DATABASE_URL","")).startswith("sqlite+libsql://") else "sqlite"
         st.write("DB")
-        st.code(
-            {
-                "backend": backend,
-                "dsn": _read_secret("TURSO_DATABASE_URL",""),
-                "auth": "token_set" if bool(_read_secret("TURSO_AUTH_TOKEN")) else "none",
-            }
-        )
+        st.code({"backend": backend, "dsn": _read_secret("TURSO_DATABASE_URL",""),
+                 "auth": "token_set" if bool(_read_secret("TURSO_AUTH_TOKEN")) else "none"})
         try:
             keys = list(st.secrets.keys())
         except Exception:
             keys = []
-        st.write("Secrets keys (present)")
-        st.code(keys)
+        st.write("Secrets keys (present)"); st.code(keys)
         st.write("Help MD:", "present" if bool(HELP_MD) else "(missing or empty)")
         st.write("Sticky first col enabled:", STICKY_FIRST)
-        st.write("Raw COLUMN_WIDTHS_PX_READONLY (type)", type(COLUMN_WIDTHS).__name__)
-        st.code(COLUMN_WIDTHS)
-        st.write("Column label overrides (if any)")
-        st.code(LABEL_OVERRIDES)
+        st.write("Raw COLUMN_WIDTHS_PX_READONLY (type)", type(COLUMN_WIDTHS).__name__); st.code(COLUMN_WIDTHS)
+        st.write("Column label overrides (if any)"); st.code(LABEL_OVERRIDES)
 
 
 # -----------------------------
@@ -397,11 +341,12 @@ def render_status_debug():
 # -----------------------------
 def main():
     render_help()
-    st.header("View", anchor=False)
-    render_view()
+    q = _quick_filter_ui()
 
-    # Debug LAST
-    render_status_debug()
+    st.header("View", anchor=False)
+    render_view(q)
+
+    render_status_debug()  # LAST
 
 if __name__ == "__main__":
     main()
