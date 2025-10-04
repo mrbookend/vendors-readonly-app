@@ -192,77 +192,35 @@ def load_vendors_df() -> pd.DataFrame:
 # Write helpers
 # -----------------------------
 
-def _vendors_has(cols: list[str]) -> bool:
-    """Return True if all requested columns exist on the vendors table."""
-    with engine.begin() as conn:
-        rows = conn.execute(sql_text("PRAGMA table_info(vendors)")).fetchall()
-        have = {r[1] for r in rows}
-    return all(c in have for c in cols)
-
-def _current_username() -> str:
-    """Pick a default username for updated_by when none is supplied."""
-    try:
-        val = (st.secrets.get("UPDATED_BY_DEFAULT") or os.environ.get("UPDATED_BY_DEFAULT") or "admin").strip()
-        return val or "admin"
-    except Exception:
-        return os.environ.get("UPDATED_BY_DEFAULT", "admin").strip()
-
-
 def add_vendor(data: Dict[str, Optional[str]]) -> int:
-    use_meta = _vendors_has(["created_at", "updated_at", "updated_by"])
-    if use_meta:
-        sql = """
-            INSERT INTO vendors (
-                category, service, business_name, contact_name, phone, address, website, notes, keywords,
-                created_at, updated_at, updated_by
-            )
-            VALUES (
-                :category, :service, :business_name, :contact_name, :phone, :address, :website, :notes, :keywords,
-                CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, :updated_by
-            )
-        """
-        params = {**data, "updated_by": _current_username()}
-    else:
-        sql = """
-            INSERT INTO vendors (
-                category, service, business_name, contact_name, phone, address, website, notes, keywords
-            ) VALUES (
-                :category, :service, :business_name, :contact_name, :phone, :address, :website, :notes, :keywords
-            )
-        """
-        params = data
-
     with engine.begin() as conn:
-        res = conn.execute(sql_text(sql), params)
+        res = conn.execute(
+            sql_text(
+                """
+                INSERT INTO vendors (category, service, business_name, contact_name, phone, address, website, notes, keywords)
+                VALUES (:category, :service, :business_name, :contact_name, :phone, :address, :website, :notes, :keywords)
+                """
+            ),
+            data,
+        )
         new_id = res.lastrowid if hasattr(res, "lastrowid") else None
     return int(new_id or 0)
 
 
-
 def update_vendor(vid: int, data: Dict[str, Optional[str]]) -> None:
-    use_meta = _vendors_has(["updated_at", "updated_by"])
-    if use_meta:
-        sql = """
-            UPDATE vendors
-               SET category=:category, service=:service, business_name=:business_name,
-                   contact_name=:contact_name, phone=:phone, address=:address,
-                   website=:website, notes=:notes, keywords=:keywords,
-                   updated_at=CURRENT_TIMESTAMP, updated_by=:updated_by
-             WHERE id=:id
-        """
-        params = {"id": vid, **data, "updated_by": _current_username()}
-    else:
-        sql = """
-            UPDATE vendors
-               SET category=:category, service=:service, business_name=:business_name,
-                   contact_name=:contact_name, phone=:phone, address=:address,
-                   website=:website, notes=:notes, keywords=:keywords
-             WHERE id=:id
-        """
-        params = {"id": vid, **data}
-
     with engine.begin() as conn:
-        conn.execute(sql_text(sql), params)
+        conn.execute(
+            sql_text(
+                """
+                UPDATE vendors
+                   SET category=:category, service=:service, business_name=:business_name,
+                       contact_name=:contact_name, phone=:phone, address=:address,
+                       website=:website, notes=:notes, keywords=:keywords
+                 WHERE id=:id
+                """
+            ),
+            {"id": vid, **data},
+        )
 
 
 def delete_vendor(vid: int) -> None:
@@ -340,10 +298,7 @@ def repair_services_table() -> str:
 # -----------------------------
 
 def tab_browse():
-    st.subheader("Browse Vendors")
-    st.caption("Global search across all fields (non-FTS, case-insensitive; matches partial words).")
-
-    df = load_vendors_df()
+            df = load_vendors_df()
 
     q = st.text_input("Search", placeholder="e.g., plumb returns any record with 'plumb' anywhere")
     if q:
@@ -641,9 +596,7 @@ def tab_debug():
 # -----------------------------
 
 def main():
-    st.title(PAGE_TITLE)
-
-    tabs = st.tabs([
+        tabs = st.tabs([
         "Browse",
         "Add",
         "Edit",
