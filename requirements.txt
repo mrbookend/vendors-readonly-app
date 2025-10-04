@@ -1,5 +1,6 @@
-streamlit==1.39.0
-pandas==2.2.2
-sqlalchemy==2.0.34
-streamlit-aggrid==0.3.4.post3
-libsql-experimental==0.1.7
+streamlit
+pandas
+SQLAlchemy>=2
+st-aggrid==0.3.5
+sqlalchemy-libsql
+libsql
