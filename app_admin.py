@@ -519,6 +519,99 @@ def _aggrid_view(df_show: pd.DataFrame, website_label: str = "website"):
     grid_options["floatingFilter"] = False
     grid_options["suppressMenuHide"] = True
     grid_options["domLayout"] = "normal"
+
+    # --- Temporary width badge above header while resizing ---
+    # Header component shows a small "123px" badge above the header text for the column being resized.
+    header_with_width = JsCode("""
+        class WidthHeader {
+          init(params){
+            this.params = params;
+            const colId = params.column.getColId();
+
+            // Root
+            const root = document.createElement('div');
+            root.style.display = 'flex';
+            root.style.flexDirection = 'column';
+            root.style.alignItems = 'center';
+            root.style.gap = '2px';
+
+            // Badge (hidden unless resizing this column)
+            const badge = document.createElement('div');
+            badge.style.fontSize = '11px';
+            badge.style.padding = '1px 6px';
+            badge.style.borderRadius = '10px';
+            badge.style.background = 'rgba(0,0,0,0.08)';
+            badge.style.color = 'inherit';
+            badge.style.display = 'none';
+            badge.style.lineHeight = '14px';
+            this.badge = badge;
+
+            // Title (normal header text)
+            const title = document.createElement('div');
+            title.textContent = params.displayName || colId;
+            title.style.whiteSpace = 'nowrap';
+            this.title = title;
+
+            root.appendChild(badge);
+            root.appendChild(title);
+            this.eGui = root;
+
+            this.refresh(params);
+          }
+
+          getGui(){ return this.eGui; }
+
+          refresh(params){
+            // Show badge only if this column is the one being resized, for a short time after finish.
+            const go = params.api && params.api.gridOptionsWrapper ? params.api.gridOptionsWrapper.gridOptions : {};
+            const resizingId = go && go.context ? go.context._resizingColId : null;
+            const show = resizingId === params.column.getColId();
+            if (show){
+              const w = Math.round(params.column.getActualWidth());
+              this.badge.textContent = w + 'px';
+              this.badge.style.display = 'inline-block';
+            } else {
+              this.badge.style.display = 'none';
+            }
+            return true;
+          }
+        }
+    """)
+
+    # Make sure context exists; used to track which column is being resized
+    grid_options.setdefault("context", {})
+
+    # Use our header component by default
+    grid_options["defaultColDef"]["headerComponent"] = header_with_width
+
+    # When a column is resized, mark it and refresh headers; clear after ~0.8s
+    grid_options["onColumnResized"] = JsCode("""
+        function(event){
+          if (!event || !event.column || !event.api) return;
+          const api = event.api;
+          const col = event.column;
+
+          // Track which column shows the badge
+          const go = api.gridOptionsWrapper.gridOptions;
+          if (!go.context) go.context = {};
+          go.context._resizingColId = col.getColId();
+
+          // Refresh headers so the badge updates while dragging
+          api.refreshHeader();
+
+          // After finishing, keep badge briefly then clear
+          if (event.finished) {
+            const showMs = 800; // how long to keep after release
+            setTimeout(function(){
+              if (go.context && go.context._resizingColId === col.getColId()) {
+                go.context._resizingColId = null;
+                api.refreshHeader();
+              }
+            }, showMs);
+          }
+        }
+    """)
+
     
     # Improve copy behavior (formatted values; avoid whole-row highlight/selection)
     grid_options["ensureDomOrder"] = True
