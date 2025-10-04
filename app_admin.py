@@ -435,31 +435,30 @@ def _aggrid_view(df_show: pd.DataFrame, website_label: str = "website"):
         st.info("No rows to display.")
         return
 
-    website_key = website_label if website_label in df_show.columns else next((c for c in df_show.columns if c.lower()=="website"), None)
+    website_key = website_label if website_label in df_show.columns else next((c for c in df_show.columns if c.lower() == "website"), None)
 
     _df = df_show.copy()
 
-    # Add normalized URL helper column next to website column
+    # Insert normalized URL helper column immediately after the website column
     url_col = None
     if website_key:
-        raw_guess = "website"
-        norm = _df[raw_guess].map(_normalize_url) if raw_guess in _df.columns else _df[website_key].map(_normalize_url)
+        norm = _df[website_key].map(_normalize_url) if website_key in _df.columns else ""
         url_col = f"{website_key} URL" if website_key.lower() != "website" else "Website URL"
         widx = _df.columns.get_loc(website_key)
         _df.insert(widx + 1, url_col, norm)
 
     gob = GridOptionsBuilder.from_dataframe(_df)
 
-    # Default: wrap + autoHeight ON (we'll turn OFF for notes/keywords only)
+    # Defaults: enable wrapping/autoHeight everywhere (we'll turn OFF for notes/keywords)
     gob.configure_default_column(
         resizable=True,
         sortable=True,
-        filter=False,
+        filter=False,         # no per-column filters
         wrapText=True,
         autoHeight=True,
     )
 
-    # Apply fixed widths from secrets (map displayed -> raw if renamed)
+    # Fixed widths via secrets; map displayed->raw if renamed
     display_to_raw = {disp: raw for raw, disp in LABEL_OVERRIDES.items() if isinstance(disp, str) and disp}
     for col in _df.columns:
         raw_key = display_to_raw.get(col, col)
@@ -467,115 +466,78 @@ def _aggrid_view(df_show: pd.DataFrame, website_label: str = "website"):
         if px:
             gob.configure_column(col, width=px)
 
-    # Remove filter/menu on the id column header (keeps sorting by default)
-    if "id" in _df.columns:
-        gob.configure_column("id", filter=False, suppressMenu=True)
-
-    
-    # Turn OFF wrap/autoHeight for notes & keywords only
+    # Turn OFF wrap/autoHeight only for notes & keywords (single-line, ellipsis)
     for col in _df.columns:
         low = col.lower()
-        raw_match = low in {"notes","keywords"}
-        renamed_match = any((k in {"notes","keywords"}) and (LABEL_OVERRIDES.get(k, k) == col) for k in ["notes","keywords"])
+        raw_match = low in {"notes", "keywords"}
+        renamed_match = any((k in {"notes", "keywords"}) and (LABEL_OVERRIDES.get(k, k) == col) for k in ["notes", "keywords"])
         if raw_match or renamed_match:
             gob.configure_column(
                 col,
                 wrapText=False,
                 autoHeight=False,
-                cellStyle={"whiteSpace": "nowrap", "textOverflow": "ellipsis", "overflow": "hidden"}
+                cellStyle={"whiteSpace": "nowrap", "textOverflow": "ellipsis", "overflow": "hidden"},
             )
 
-    # Website column — show literal "Website"; underline+pointer; no HTML/DOM renderers
+    # Make Website column clickable (return HTML STRING, not DOM node — prevents React invariant #31)
     if website_key and url_col:
-        label_formatter = JsCode(f"""
-            function(params){{
-                const url = (params.data && params.data["{url_col}"]) || "";
-                return url ? "Website" : "";
+        link_renderer = JsCode(f"""
+            function(params) {{
+                const url = params.data && params.data["{url_col}"] ? params.data["{url_col}"] : "";
+                if (!url) return "";
+                // HTML string only; inline stopPropagation so selection/copy still works
+                return '<a href="' + url + '" target="_blank" rel="noopener noreferrer" onclick="event.stopPropagation();" '
+                       + 'style="text-decoration:underline; cursor:pointer;">Website</a>';
             }}
+        """)
+        # Provide a formatted label so clipboard picks "Website" when copying formatted value
+        label_formatter = JsCode("""
+            function(params) {
+                if (params && params.data) {
+                    // show the literal label if a valid URL exists
+                    const url = params.data[params.colDef.urlField];
+                    return (url && typeof url === 'string' && url.length > 0) ? 'Website' : '';
+                }
+                return '';
+            }
         """)
         gob.configure_column(
             website_key,
+            cellRenderer=link_renderer,
             valueFormatter=label_formatter,
-            tooltipField=url_col,  # hover shows full URL
-            cellStyle={"textDecoration": "underline", "cursor": "pointer"}  # make it look like a link
         )
+
+    # Remove filter/menu on 'id' column header (sorting stays)
+    if "id" in _df.columns:
+        gob.configure_column("id", filter=False, suppressMenu=True)
 
     grid_options = gob.build()
 
-    # Whole-word wrapping by default (Ag-Grid): no mid-word breaks
+    # Whole-word wrapping everywhere by default (notes/keywords already overridden above)
     grid_options.setdefault("defaultColDef", {})
     grid_options["defaultColDef"]["cellStyle"] = {
         "whiteSpace": "normal",     # allow wrapping
         "overflowWrap": "normal",   # wrap at word boundaries
         "wordBreak": "normal",      # no mid-word breaks
-        "hyphens": "auto"           # optional hyphenation for super-long words
+        "hyphens": "auto",          # optional hyphenation for very long tokens
     }
+
+    # Tell Website formatter which hidden field holds the URL
+    if website_key and url_col:
+        # attach a custom key on the columnDef so JS formatter can find it
+        for coldef in grid_options.get("columnDefs", []):
+            if coldef.get("field") == website_key:
+                coldef["urlField"] = url_col
+                break
 
     grid_options["floatingFilter"] = False
     grid_options["suppressMenuHide"] = True
     grid_options["domLayout"] = "normal"
 
-        # --- Show column width in header text while resizing, then restore ---
-    grid_options.setdefault("context", {})
-
-    # Capture original header names once
-    grid_options["onGridReady"] = JsCode("""
-        function(params){
-          const api = params.api, colApi = params.columnApi;
-          const go = api.gridOptionsWrapper.gridOptions;
-          if (!go.context) go.context = {};
-          const map = go.context._origHeaderNames = {};
-          const cols = colApi.getAllGridColumns();
-          cols.forEach(c => {
-            const def = c.getColDef();
-            const id  = c.getColId();
-            map[id] = (def.headerName != null ? def.headerName : (def.field || id));
-          });
-        }
-    """)
-
-    grid_options["onColumnResized"] = JsCode("""
-        function(event){
-          if (!event || !event.api || !event.column) return;
-          const api = event.api, colApi = api.columnApi, col = event.column;
-          const go = api.gridOptionsWrapper.gridOptions;
-          if (!go.context) go.context = {};
-          if (!go.context._origHeaderNames) go.context._origHeaderNames = {};
-
-          const id  = col.getColId();
-          const def = col.getColDef();
-          const orig = go.context._origHeaderNames[id] != null
-                         ? go.context._origHeaderNames[id]
-                         : (def.headerName != null ? def.headerName : (def.field || id));
-          const w = Math.round(col.getActualWidth());
-
-          // Mutate the headerName live to include width
-          def.headerName = orig + " \u2022 " + w + "px"; // " • 123px"
-          api.refreshHeader();
-
-          // When finished, restore after a short delay
-          if (event.finished) {
-            setTimeout(function(){
-              try {
-                const colObj = colApi.getColumn(id);
-                const def2 = colObj ? colObj.getColDef() : def;
-                def2.headerName = orig;
-                api.refreshHeader();
-              } catch (e) {}
-            }, 800);
-          }
-        }
-    """)
-
-    # (Optional) give headers a touch more height so the text never feels cramped
-    grid_options["headerHeight"] = 42
-
-
-    # --- Column width HUD: pinned top row showing widths during resize ---
-    # Start with no HUD row
+    # --- Live column width HUD (pinned top row while resizing) ---
     grid_options["pinnedTopRowData"] = []
+    grid_options["pinnedTopRowHeight"] = 22  # slim HUD row
 
-    # Visual style for the HUD row (small, subtle)
     st.markdown("""
     <style>
       .ag-theme-streamlit .ag-pinned-top .ag-row {
@@ -587,297 +549,67 @@ def _aggrid_view(df_show: pd.DataFrame, website_label: str = "website"):
         padding-top: 0 !important;
         padding-bottom: 0 !important;
         text-align: center;
-        color: rgba(0,0,0,0.7);
+        color: rgba(0,0,0,0.75);
         user-select: none;
       }
     </style>
     """, unsafe_allow_html=True)
 
-    # Helper: build an object whose keys are the displayed colIds and values are "123px"
-    grid_options["getPinnedWidthRow"] = JsCode("""
-        function(api){
-          const row = {};
-          const cols = api.getColumnDefs ? api.getColumnDefs() : [];
-          // Fallback when getColumnDefs() is unavailable: use displayed columns
-          const displayed = api.getColumnDefs ? cols : (api.columnApi ? api.columnApi.getAllDisplayedColumns() : []);
-          if (Array.isArray(displayed)) {
-            displayed.forEach(c => {
-              const colId = c.colId || (c.getColId && c.getColId()) || c.field || '';
-              if (!colId) return;
-              const col = api.columnApi ? api.columnApi.getColumn(colId) : null;
-              const w = col ? Math.round(col.getActualWidth()) : null;
-              row[colId] = w ? (w + 'px') : '';
-            });
-          }
-          return row;
-        }
-    """)
-
-    # Track which column is resizing; show/hide HUD row accordingly
     grid_options.setdefault("context", {})
-    grid_options["onColumnResized"] = JsCode("""
-        function(event){
-          if (!event || !event.api) return;
-          const api = event.api;
-          const go = api.gridOptionsWrapper.gridOptions;
-          if (!go.context) go.context = {};
+    grid_options["context"]["_widthHudMs"] = 700  # keep HUD this long after release
 
-          // Mark that we're in resize mode
-          go.context._resizingActive = true;
-
-          // Show/update the HUD top row with current widths
-          try {
-            const builder = go.getPinnedWidthRow || (go.getPinnedWidthRow = function(apiRef){ return {}; });
-            const row = builder(api);
-            api.setPinnedTopRowData([row]);
-          } catch(e) {}
-
-          // After finishing, hide after a short delay
-          if (event.finished) {
-            setTimeout(function(){
-              try {
-                go.context._resizingActive = false;
-                api.setPinnedTopRowData([]);  // hide HUD
-              } catch(e) {}
-            }, 800);
-          }
-        }
-    """)
-
-    # Also refresh the HUD once at grid ready (helpful after first render)
     grid_options["onGridReady"] = JsCode("""
         function(params){
-          const api = params.api;
+          const api = params.api, colApi = params.columnApi;
           const go = api.gridOptionsWrapper.gridOptions;
-          // Keep a callable on gridOptions so our onColumnResized can reach it
-          go.getPinnedWidthRow = function(apiRef){
+          go._buildWidthHudRow = function(){
             const row = {};
-            const displayed = apiRef.columnApi.getAllDisplayedColumns();
-            displayed.forEach(c => {
-              const id = c.getColId();
-              row[id] = Math.round(c.getActualWidth()) + 'px';
-            });
+            const cols = colApi.getAllDisplayedColumns();
+            if (cols && cols.forEach){
+              cols.forEach(c => {
+                const id = c.getColId();
+                const w  = Math.round(c.getActualWidth());
+                row[id]  = w ? (w + 'px') : '';
+              });
+            }
             return row;
           };
         }
     """)
 
-
-        # --- Temporary width badge above header while resizing (registered component) ---
-    header_with_width = JsCode("""
-        class WidthHeader {
-          init(params){
-            this.params = params;
-
-            // Root container
-            const root = document.createElement('div');
-            root.style.display = 'flex';
-            root.style.flexDirection = 'column';
-            root.style.alignItems = 'center';
-            root.style.gap = '2px';
-            root.style.width = '100%';
-
-            // Badge (hidden unless resizing this column)
-            const badge = document.createElement('div');
-            badge.style.fontSize = '11px';
-            badge.style.padding = '1px 6px';
-            badge.style.borderRadius = '10px';
-            badge.style.background = 'rgba(0,0,0,0.08)';
-            badge.style.color = 'inherit';
-            badge.style.display = 'none';
-            badge.style.lineHeight = '14px';
-            badge.style.userSelect = 'none';
-            this.badge = badge;
-
-            // Title (header text)
-            const title = document.createElement('div');
-            title.textContent = params.displayName || params.column.getColId();
-            title.style.whiteSpace = 'nowrap';
-            title.style.overflow = 'hidden';
-            title.style.textOverflow = 'ellipsis';
-            this.title = title;
-
-            root.appendChild(badge);
-            root.appendChild(title);
-            this.eGui = root;
-
-            this.refresh(params);
-          }
-
-          getGui(){ return this.eGui; }
-
-          refresh(params){
-            // Show badge only if this column is currently being resized (tracked in gridOptions.context)
-            const go = params.api && params.api.gridOptionsWrapper ? params.api.gridOptionsWrapper.gridOptions : {};
-            const resizingId = go && go.context ? go.context._resizingColId : null;
-            const isThis = resizingId === params.column.getColId();
-            if (isThis){
-              const w = Math.round(params.column.getActualWidth());
-              this.badge.textContent = w + 'px';
-              this.badge.style.display = 'inline-block';
-            } else {
-              this.badge.style.display = 'none';
-            }
-            return true;
-          }
-        }
-    """)
-
-    # Ensure context + components registry exist
-    grid_options.setdefault("context", {})
-    grid_options.setdefault("components", {})
-
-    # Register and assign the header component by name
-    grid_options["components"]["widthHeader"] = header_with_width
-    grid_options.setdefault("defaultColDef", {})
-    grid_options["defaultColDef"]["headerComponent"] = "widthHeader"
-
-    # Make room for the badge above the title
-    grid_options["headerHeight"] = 52
-    grid_options["groupHeaderHeight"] = 28
-
-    # Update badge while resizing, then hide ~0.8s after release
     grid_options["onColumnResized"] = JsCode("""
         function(event){
-          if (!event || !event.column || !event.api) return;
-          const api = event.api;
-          const col = event.column;
-          const go = api.gridOptionsWrapper.gridOptions;
-
-          if (!go.context) go.context = {};
-          go.context._resizingColId = col.getColId();
-
-          api.refreshHeader();
-
-          if (event.finished) {
-            setTimeout(function(){
-              if (go.context && go.context._resizingColId === col.getColId()) {
-                go.context._resizingColId = null;
-                api.refreshHeader();
-              }
-            }, 800);
-          }
-        }
-    """)
-
-    # Safety: in case theme still clips second line, ensure header allows our 2-line flex
-    st.markdown(
-        "<style>.ag-theme-streamlit .ag-header-cell-label { overflow: visible !important; }</style>",
-        unsafe_allow_html=True,
-    )
-
-
-    # --- Temporary width badge above header while resizing ---
-    # Header component shows a small "123px" badge above the header text for the column being resized.
-    header_with_width = JsCode("""
-        class WidthHeader {
-          init(params){
-            this.params = params;
-            const colId = params.column.getColId();
-
-            // Root
-            const root = document.createElement('div');
-            root.style.display = 'flex';
-            root.style.flexDirection = 'column';
-            root.style.alignItems = 'center';
-            root.style.gap = '2px';
-
-            // Badge (hidden unless resizing this column)
-            const badge = document.createElement('div');
-            badge.style.fontSize = '11px';
-            badge.style.padding = '1px 6px';
-            badge.style.borderRadius = '10px';
-            badge.style.background = 'rgba(0,0,0,0.08)';
-            badge.style.color = 'inherit';
-            badge.style.display = 'none';
-            badge.style.lineHeight = '14px';
-            this.badge = badge;
-
-            // Title (normal header text)
-            const title = document.createElement('div');
-            title.textContent = params.displayName || colId;
-            title.style.whiteSpace = 'nowrap';
-            this.title = title;
-
-            root.appendChild(badge);
-            root.appendChild(title);
-            this.eGui = root;
-
-            this.refresh(params);
-          }
-
-          getGui(){ return this.eGui; }
-
-          refresh(params){
-            // Show badge only if this column is the one being resized, for a short time after finish.
-            const go = params.api && params.api.gridOptionsWrapper ? params.api.gridOptionsWrapper.gridOptions : {};
-            const resizingId = go && go.context ? go.context._resizingColId : null;
-            const show = resizingId === params.column.getColId();
-            if (show){
-              const w = Math.round(params.column.getActualWidth());
-              this.badge.textContent = w + 'px';
-              this.badge.style.display = 'inline-block';
-            } else {
-              this.badge.style.display = 'none';
+            if (!event || !event.api || !event.column) return;
+            const api = event.api;
+            const go  = api.gridOptionsWrapper.gridOptions;
+            const build = (go && go._buildWidthHudRow) ? go._buildWidthHudRow : function(){ return {}; };
+            try {
+                const row = build();
+                api.setPinnedTopRowData([row]);
+            } catch(e) {}
+            if (event.finished) {
+                const delay = (go && go.context && go.context._widthHudMs) ? go.context._widthHudMs : 700;
+                setTimeout(function(){ try { api.setPinnedTopRowData([]); } catch(e) {} }, delay);
             }
-            return true;
-          }
         }
     """)
 
-    # Make sure context exists; used to track which column is being resized
-    grid_options.setdefault("context", {})
-
-    # Use our header component by default
-    grid_options["defaultColDef"]["headerComponent"] = header_with_width
-
-    # When a column is resized, mark it and refresh headers; clear after ~0.8s
-    grid_options["onColumnResized"] = JsCode("""
-        function(event){
-          if (!event || !event.column || !event.api) return;
-          const api = event.api;
-          const col = event.column;
-
-          // Track which column shows the badge
-          const go = api.gridOptionsWrapper.gridOptions;
-          if (!go.context) go.context = {};
-          go.context._resizingColId = col.getColId();
-
-          // Refresh headers so the badge updates while dragging
-          api.refreshHeader();
-
-          // After finishing, keep badge briefly then clear
-          if (event.finished) {
-            const showMs = 800; // how long to keep after release
-            setTimeout(function(){
-              if (go.context && go.context._resizingColId === col.getColId()) {
-                go.context._resizingColId = null;
-                api.refreshHeader();
-              }
-            }, showMs);
-          }
-        }
-    """)
-
-    
-    # Improve copy behavior (formatted values; avoid whole-row highlight/selection)
+    # Improve copy behavior: copy exactly the selected cell(s)/range; prefer formatted value
     grid_options["ensureDomOrder"] = True
-    grid_options["enableRangeSelection"] = True          # drag to select ranges
-    grid_options["enableCellTextSelection"] = True       # single-cell text selection works
-    grid_options["suppressCopySingleCellRanges"] = False # allow copying a single focused cell
+    grid_options["enableRangeSelection"] = True           # drag to select ranges
+    grid_options["enableCellTextSelection"] = True        # single-cell text selection
+    grid_options["suppressCopySingleCellRanges"] = False  # allow copying a single focused cell
 
-    # Disable row selection via click and row hover highlight (keeps cell/range copy clean)
+    # Avoid whole-row selection/hover highlight
     grid_options["rowSelection"] = "single"
     grid_options["rowMultiSelectWithClick"] = False
     grid_options["suppressRowClickSelection"] = True
     grid_options["suppressRowHoverHighlight"] = True
 
-    # Clipboard defaults: copy only what’s selected (not whole row)
-    grid_options["suppressCopyRowsToClipboard"] = False  # keep normal copy behavior for selections
-    grid_options["clipboardDelimiter"] = "\t"            # set to "," for CSV if you prefer
-    grid_options["copyHeadersToClipboard"] = False       # set True if you want headers included
-
-    # Copy the displayed (formatted) value when present; fallback to raw value
+    # Clipboard defaults: TSV; no headers; formatted value if available
+    grid_options["suppressCopyRowsToClipboard"] = False
+    grid_options["clipboardDelimiter"] = "\t"
+    grid_options["copyHeadersToClipboard"] = False
     grid_options["processCellForClipboard"] = JsCode("""
         function(params) {
           return (params && params.valueFormatted != null) ? String(params.valueFormatted) :
@@ -885,64 +617,83 @@ def _aggrid_view(df_show: pd.DataFrame, website_label: str = "website"):
         }
     """)
 
-
-    # Open URL on click for the Website column (guard: only on real mouse click, and not while editing)
-    if website_key and url_col:
-        grid_options["onCellClicked"] = JsCode(f"""
-            function(event){{
-                if (!(event && event.colDef && event.colDef.field === "{website_key}")) return;
-                const url = (event.data && event.data["{url_col}"]) || "";
-                if (!url) return;
-
-                // Guard: do not open while any cell is being edited
-                const isEditing = event.api ? event.api.getEditingCells().length > 0 : false;
-                if (isEditing) return;
-
-                // Guard: only react to actual mouse clicks (ignore Enter/keyboard)
-                const ev = event.event;
-                if (ev && ev.type && ev.type !== "click") return;
-
-                window.open(url, "_blank", "noopener,noreferrer");
-            }}
-        """)
-
-    # Context menu items incl. Copy row (TSV)
-    grid_options["getContextMenuItems"] = JsCode("""
-        function(params) {
+    # Context menu: default copy + copy row (TSV) + copy Website URL + copy selection as CSV
+    grid_options["getContextMenuItems"] = JsCode(f"""
+        function(params) {{
           const res = ['copy', 'copyWithHeaders', 'paste'];
           const node = params.node;
-          if (node && node.data) {
-            res.push({
+          const cols = params.columnApi.getAllDisplayedColumns();
+
+          // Copy row (TSV)
+          if (node && node.data) {{
+            res.push({{
               name: 'Copy row (TSV)',
-              action: () => {
+              action: () => {{
                 const vals = [];
-                const cols = params.columnApi.getAllDisplayedColumns();
-                cols.forEach(c => {
+                cols.forEach(c => {{
                   const id = c.getColId();
                   if (id === '__copy__') return;
                   const v = node.data[id] != null ? String(node.data[id]) : '';
                   vals.push(v);
-                });
+                }});
                 const txt = vals.join('\\t');
-                if (navigator && navigator.clipboard && navigator.clipboard.writeText) {
+                if (navigator.clipboard && navigator.clipboard.writeText) {{
                   navigator.clipboard.writeText(txt);
-                } else {
+                }} else {{
                   const ta = document.createElement('textarea');
                   ta.value = txt; document.body.appendChild(ta);
                   ta.select(); document.execCommand('copy'); document.body.removeChild(ta);
-                }
-              }
-            });
-          }
-          return res;
-        }
-    """)
+                }}
+              }}
+            }});
+          }}
 
-    # Optional: hard override any leftover hover styling if theme ignores suppressRowHoverHighlight
-    st.markdown(
-        "<style>.ag-theme-streamlit .ag-row-hover { background-color: transparent !important; }</style>",
-        unsafe_allow_html=True,
-    )
+          // Copy Website URL (only if right-clicking Website column and URL exists)
+          try {{
+            const websiteField = {json.dumps(website_key) if website_key else 'null'};
+            const urlField = {json.dumps(url_col) if url_col else 'null'};
+            if (websiteField && urlField && params && params.column && params.node && params.node.data) {{
+              const colId = params.column.getColId();
+              if (colId === websiteField) {{
+                const url = params.node.data[urlField] || "";
+                if (url) {{
+                  res.push({{
+                    name: 'Copy Website URL',
+                    action: () => {{
+                      if (navigator.clipboard && navigator.clipboard.writeText) {{
+                        navigator.clipboard.writeText(url);
+                      }} else {{
+                        const ta = document.createElement('textarea');
+                        ta.value = url; document.body.appendChild(ta);
+                        ta.select(); document.execCommand('copy'); document.body.removeChild(ta);
+                      }}
+                    }}
+                  }});
+                }}
+              }}
+            }}
+          }} catch(e) {{}}
+
+          // Copy selection as CSV
+          res.push({{
+            name: 'Copy selection as CSV',
+            action: () => {{
+              const csv = params.api.getDataAsCsv({{ suppressQuotes: true, onlySelected: true }});
+              if (csv) {{
+                if (navigator.clipboard && navigator.clipboard.writeText) {{
+                  navigator.clipboard.writeText(csv);
+                }} else {{
+                  const ta = document.createElement('textarea');
+                  ta.value = csv; document.body.appendChild(ta);
+                  ta.select(); document.execCommand('copy'); document.body.removeChild(ta);
+                }}
+              }}
+            }}
+          }});
+
+          return res;
+        }}
+    """)
 
     AgGrid(
         _df,
