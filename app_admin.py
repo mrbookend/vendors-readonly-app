@@ -515,10 +515,109 @@ def _aggrid_view(df_show: pd.DataFrame, website_label: str = "website"):
     grid_options["suppressMenuHide"] = True
     grid_options["domLayout"] = "normal"
 
-    
-    grid_options["floatingFilter"] = False
-    grid_options["suppressMenuHide"] = True
-    grid_options["domLayout"] = "normal"
+        # --- Temporary width badge above header while resizing (registered component) ---
+    header_with_width = JsCode("""
+        class WidthHeader {
+          init(params){
+            this.params = params;
+
+            // Root container
+            const root = document.createElement('div');
+            root.style.display = 'flex';
+            root.style.flexDirection = 'column';
+            root.style.alignItems = 'center';
+            root.style.gap = '2px';
+            root.style.width = '100%';
+
+            // Badge (hidden unless resizing this column)
+            const badge = document.createElement('div');
+            badge.style.fontSize = '11px';
+            badge.style.padding = '1px 6px';
+            badge.style.borderRadius = '10px';
+            badge.style.background = 'rgba(0,0,0,0.08)';
+            badge.style.color = 'inherit';
+            badge.style.display = 'none';
+            badge.style.lineHeight = '14px';
+            badge.style.userSelect = 'none';
+            this.badge = badge;
+
+            // Title (header text)
+            const title = document.createElement('div');
+            title.textContent = params.displayName || params.column.getColId();
+            title.style.whiteSpace = 'nowrap';
+            title.style.overflow = 'hidden';
+            title.style.textOverflow = 'ellipsis';
+            this.title = title;
+
+            root.appendChild(badge);
+            root.appendChild(title);
+            this.eGui = root;
+
+            this.refresh(params);
+          }
+
+          getGui(){ return this.eGui; }
+
+          refresh(params){
+            // Show badge only if this column is currently being resized (tracked in gridOptions.context)
+            const go = params.api && params.api.gridOptionsWrapper ? params.api.gridOptionsWrapper.gridOptions : {};
+            const resizingId = go && go.context ? go.context._resizingColId : null;
+            const isThis = resizingId === params.column.getColId();
+            if (isThis){
+              const w = Math.round(params.column.getActualWidth());
+              this.badge.textContent = w + 'px';
+              this.badge.style.display = 'inline-block';
+            } else {
+              this.badge.style.display = 'none';
+            }
+            return true;
+          }
+        }
+    """)
+
+    # Ensure context + components registry exist
+    grid_options.setdefault("context", {})
+    grid_options.setdefault("components", {})
+
+    # Register and assign the header component by name
+    grid_options["components"]["widthHeader"] = header_with_width
+    grid_options.setdefault("defaultColDef", {})
+    grid_options["defaultColDef"]["headerComponent"] = "widthHeader"
+
+    # Make room for the badge above the title
+    grid_options["headerHeight"] = 52
+    grid_options["groupHeaderHeight"] = 28
+
+    # Update badge while resizing, then hide ~0.8s after release
+    grid_options["onColumnResized"] = JsCode("""
+        function(event){
+          if (!event || !event.column || !event.api) return;
+          const api = event.api;
+          const col = event.column;
+          const go = api.gridOptionsWrapper.gridOptions;
+
+          if (!go.context) go.context = {};
+          go.context._resizingColId = col.getColId();
+
+          api.refreshHeader();
+
+          if (event.finished) {
+            setTimeout(function(){
+              if (go.context && go.context._resizingColId === col.getColId()) {
+                go.context._resizingColId = null;
+                api.refreshHeader();
+              }
+            }, 800);
+          }
+        }
+    """)
+
+    # Safety: in case theme still clips second line, ensure header allows our 2-line flex
+    st.markdown(
+        "<style>.ag-theme-streamlit .ag-header-cell-label { overflow: visible !important; }</style>",
+        unsafe_allow_html=True,
+    )
+
 
     # --- Temporary width badge above header while resizing ---
     # Header component shows a small "123px" badge above the header text for the column being resized.
