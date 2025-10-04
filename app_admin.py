@@ -465,6 +465,11 @@ def _aggrid_view(df_show: pd.DataFrame, website_label: str = "website"):
         if px:
             gob.configure_column(col, width=px)
 
+    # Remove filter/menu on the id column header (keeps sorting by default)
+    if "id" in _df.columns:
+        gob.configure_column("id", filter=False, suppressMenu=True)
+
+    
     # Turn OFF wrap/autoHeight for notes & keywords only
     for col in _df.columns:
         low = col.lower()
