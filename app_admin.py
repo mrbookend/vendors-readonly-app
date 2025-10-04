@@ -10,13 +10,12 @@
 #       * Phone must be 10 digits (US) or blank; normalized to ########## on save
 #       * Immediate page refresh after any mutation
 # - Category Admin & Service Admin:
-#       * Add, Rename, Delete (with guardrails)
-#       * Orphan surfacing (values used by vendors but missing from libs)
-#       * Usage counts
+#       * Add, Rename, Delete (with guardrails), Usage counts, Orphan surfacing
 # - Maintenance tab:
-#       * "Repair services table" one-click safety (ensures schema=id,name; migrates from old shapes)
-#       * Normalize phones, trim/title business names
-# - Debug tab at bottom with engine status and schema snapshot
+#       * Repair services table (ensures schema=id,name; migrates from old shapes)
+#       * Normalize phones; Trim/Title business names
+#       * Backfill audit columns (created_at / updated_at / updated_by) if present
+# - Debug tab with engine status and schema snapshot
 
 from __future__ import annotations
 
@@ -85,7 +84,7 @@ def _normalize_turso_sqlalchemy_url(raw: str) -> str:
     if "://" not in raw:
         raw = "libsql://" + raw
 
-    # Only convert scheme if it *starts with* libsql:// (avoid double 'sqlite+')
+    # Only convert scheme if it starts with libsql:// (avoid double 'sqlite+')
     if raw.startswith("libsql://"):
         raw = raw.replace("libsql://", "sqlite+libsql://", 1)
     elif raw.startswith("sqlite+libsql://"):
@@ -220,83 +219,30 @@ def fetch_services(db: Engine) -> List[str]:
         rows = conn.execute(sql_text("SELECT name FROM services ORDER BY name COLLATE NOCASE ASC;")).fetchall()
     return [r[0] for r in rows]
 
-def add_category(db: Engine, name: str) -> Tuple[bool, str]:
-    name = name.strip()
-    if not name:
-        return False, "Category name cannot be blank."
-    try:
-        with db.begin() as conn:
-            conn.execute(sql_text("INSERT OR IGNORE INTO categories(name) VALUES(:n);"), {"n": name})
-        return True, f"Category '{name}' added (or already existed)."
-    except Exception as e:
-        return False, f"Error adding category: {e}"
+# =========================
+# Audit-aware helpers
+# =========================
 
-def rename_category(db: Engine, old: str, new: str) -> Tuple[bool, str]:
-    old, new = old.strip(), new.strip()
-    if not new:
-        return False, "New category name cannot be blank."
-    try:
-        with db.begin() as conn:
-            conn.execute(sql_text("UPDATE vendors SET category=:new WHERE lower(trim(category))=lower(trim(:old));"),
-                         {"new": new, "old": old})
-            conn.execute(sql_text("INSERT OR IGNORE INTO categories(name) VALUES(:n);"), {"n": new})
-            if old.lower() != new.lower():
-                conn.execute(sql_text("DELETE FROM categories WHERE lower(trim(name))=lower(trim(:old));"),
-                             {"old": old})
-        return True, f"Category '{old}' renamed to '{new}'."
-    except Exception as e:
-        return False, f"Error renaming category: {e}"
+def _table_has_column(db: Engine, table: str, col: str) -> bool:
+    with db.begin() as conn:
+        cols = conn.execute(sql_text(f"PRAGMA table_info({table});")).mappings().all()
+    return any(c["name"] == col for c in cols)
 
-def delete_category(db: Engine, name: str) -> Tuple[bool, str]:
-    try:
-        with db.begin() as conn:
-            count = conn.execute(sql_text("SELECT COUNT(*) FROM vendors WHERE lower(trim(category))=lower(trim(:n));"),
-                                 {"n": name}).scalar()
-            if count and count > 0:
-                return False, f"Cannot delete '{name}': {count} vendor(s) still use it."
-            conn.execute(sql_text("DELETE FROM categories WHERE lower(trim(name))=lower(trim(:n));"), {"n": name})
-        return True, f"Category '{name}' deleted."
-    except Exception as e:
-        return False, f"Error deleting category: {e}"
+def _vendor_audit_caps(db: Engine) -> Dict[str, bool]:
+    # Detect audit columns on vendors table
+    return {
+        "created_at": _table_has_column(db, "vendors", "created_at"),
+        "updated_at": _table_has_column(db, "vendors", "updated_at"),
+        "updated_by": _table_has_column(db, "vendors", "updated_by"),
+    }
 
-def add_service(db: Engine, name: str) -> Tuple[bool, str]:
-    name = name.strip()
-    if not name:
-        return False, "Service name cannot be blank."
-    try:
-        with db.begin() as conn:
-            conn.execute(sql_text("INSERT OR IGNORE INTO services(name) VALUES(:n);"), {"n": name})
-        return True, f"Service '{name}' added (or already existed)."
-    except Exception as e:
-        return False, f"Error adding service: {e}"
+def _admin_user() -> str:
+    # Change source of actor if desired (cookie, auth, etc.). Defaults to 'admin'.
+    return str(_read_secret_early("ADMIN_USERNAME", "admin")).strip() or "admin"
 
-def rename_service(db: Engine, old: str, new: str) -> Tuple[bool, str]:
-    old, new = old.strip(), new.strip()
-    if not new:
-        return False, "New service name cannot be blank."
-    try:
-        with db.begin() as conn:
-            conn.execute(sql_text("UPDATE vendors SET service=:new WHERE lower(trim(service))=lower(trim(:old));"),
-                         {"new": new, "old": old})
-            conn.execute(sql_text("INSERT OR IGNORE INTO services(name) VALUES(:n);"), {"n": new})
-            if old.lower() != new.lower():
-                conn.execute(sql_text("DELETE FROM services WHERE lower(trim(name))=lower(trim(:old));"),
-                             {"old": old})
-        return True, f"Service '{old}' renamed to '{new}'."
-    except Exception as e:
-        return False, f"Error renaming service: {e}"
-
-def delete_service(db: Engine, name: str) -> Tuple[bool, str]:
-    try:
-        with db.begin() as conn:
-            count = conn.execute(sql_text("SELECT COUNT(*) FROM vendors WHERE lower(trim(service))=lower(trim(:n));"),
-                                 {"n": name}).scalar()
-            if count and count > 0:
-                return False, f"Cannot delete '{name}': {count} vendor(s) still use it."
-            conn.execute(sql_text("DELETE FROM services WHERE lower(trim(name))=lower(trim(:n));"), {"n": name})
-        return True, f"Service '{name}' deleted."
-    except Exception as e:
-        return False, f"Error deleting service: {e}"
+# =========================
+# CRUD
+# =========================
 
 def normalize_phone(p: str) -> str:
     if not p:
@@ -308,31 +254,83 @@ def normalize_phone(p: str) -> str:
 
 def insert_vendor(db: Engine, row: Dict[str, str]) -> Tuple[bool, str]:
     try:
+        caps = _vendor_audit_caps(db)
+        # Base column/value sets
+        cols = [
+            "category", "service", "business_name", "contact_name",
+            "phone", "address", "website", "notes", "keywords"
+        ]
+        params = {k: row.get(k) for k in cols}
+
+        # Conditionally append audit fields
+        if caps["created_at"]:
+            cols.append("created_at")
+        if caps["updated_at"]:
+            cols.append("updated_at")
+        if caps["updated_by"]:
+            cols.append("updated_by")
+            params["updated_by"] = _admin_user()
+
+        # Build SQL with server-side timestamps to avoid client clock issues
+        values_sql = []
+        for c in cols:
+            if c in ("created_at", "updated_at"):
+                values_sql.append("CURRENT_TIMESTAMP")
+            else:
+                values_sql.append(f":{c}")
+
+        sql = f"""
+            INSERT INTO vendors ({", ".join(cols)})
+            VALUES ({", ".join(values_sql)})
+        """
+
         with db.begin() as conn:
-            conn.execute(sql_text("""
-                INSERT INTO vendors (category, service, business_name, contact_name, phone, address, website, notes, keywords)
-                VALUES (:category, :service, :business_name, :contact_name, :phone, :address, :website, :notes, :keywords)
-            """), row)
+            conn.execute(sql_text(sql), params)
         return True, "Vendor added."
     except Exception as e:
         return False, f"Error adding vendor: {e}"
 
 def update_vendor(db: Engine, vid: int, row: Dict[str, str]) -> Tuple[bool, str]:
     try:
+        caps = _vendor_audit_caps(db)
+        sets = [
+            "category=:category",
+            "service=:service",
+            "business_name=:business_name",
+            "contact_name=:contact_name",
+            "phone=:phone",
+            "address=:address",
+            "website=:website",
+            "notes=:notes",
+            "keywords=:keywords",
+        ]
+        params = {
+            "category": row.get("category"),
+            "service": row.get("service"),
+            "business_name": row.get("business_name"),
+            "contact_name": row.get("contact_name"),
+            "phone": row.get("phone"),
+            "address": row.get("address"),
+            "website": row.get("website"),
+            "notes": row.get("notes"),
+            "keywords": row.get("keywords"),
+            "id": vid,
+        }
+
+        if caps["updated_at"]:
+            sets.append("updated_at=CURRENT_TIMESTAMP")
+        if caps["updated_by"]:
+            sets.append("updated_by=:updated_by")
+            params["updated_by"] = _admin_user()
+
+        sql = f"""
+            UPDATE vendors
+            SET {", ".join(sets)}
+            WHERE id=:id
+        """
+
         with db.begin() as conn:
-            conn.execute(sql_text("""
-                UPDATE vendors
-                SET category=:category,
-                    service=:service,
-                    business_name=:business_name,
-                    contact_name=:contact_name,
-                    phone=:phone,
-                    address=:address,
-                    website=:website,
-                    notes=:notes,
-                    keywords=:keywords
-                WHERE id=:id
-            """), {**row, "id": vid})
+            conn.execute(sql_text(sql), params)
         return True, "Vendor updated."
     except Exception as e:
         return False, f"Error updating vendor: {e}"
@@ -460,6 +458,27 @@ def trim_and_title_business_names(db: Engine) -> Tuple[int, int]:
                 conn.execute(sql_text("UPDATE vendors SET business_name=:n WHERE id=:id;"), {"n": newn2, "id": vid})
                 updated += 1
     return updated, total
+
+def backfill_vendor_audit(db: Engine) -> Tuple[int, int]:
+    caps = _vendor_audit_caps(db)
+    if not any(caps.values()):
+        return 0, 0
+    updates = 0
+    with db.begin() as conn:
+        total = conn.execute(sql_text("SELECT COUNT(*) FROM vendors;")).scalar() or 0
+        if caps["created_at"]:
+            updates += conn.execute(sql_text("""
+                UPDATE vendors SET created_at = COALESCE(created_at, CURRENT_TIMESTAMP)
+            """)).rowcount or 0
+        if caps["updated_at"]:
+            updates += conn.execute(sql_text("""
+                UPDATE vendors SET updated_at = COALESCE(updated_at, created_at, CURRENT_TIMESTAMP)
+            """)).rowcount or 0
+        if caps["updated_by"]:
+            updates += conn.execute(sql_text("""
+                UPDATE vendors SET updated_by = COALESCE(updated_by, 'system')
+            """)).rowcount or 0
+    return updates, total
 
 # =========================
 # UI Helpers
@@ -781,6 +800,12 @@ def tab_maintenance(db: Engine):
             updated, total = trim_and_title_business_names(db)
             st.success(f"Updated {updated} of {total} business names.")
             rerun()
+
+    st.markdown("---")
+    if st.button("Backfill vendor audit columns (created/updated/by)", key="btn_backfill_audit"):
+        upd, total = backfill_vendor_audit(db)
+        st.success(f"Backfilled {upd} fields across {total} rows.")
+        rerun()
 
 def tab_debug(db: Engine):
     st.subheader("Status & Secrets (debug)")
