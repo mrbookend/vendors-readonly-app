@@ -621,25 +621,49 @@ LIMIT 5;
 """
     sql_text_input = st.text_area("SQL", value=default_sql, height=140)
     run = st.button("Execute SQL")
+
+    def _first_sql_token(s: str) -> str:
+        if not s:
+            return ""
+        s = s.replace("\ufeff", "")  # strip BOM if present
+        s = s.lstrip()
+        # strip leading line and block comments
+        import re as _re
+        while True:
+            if s.startswith("--"):
+                nl = s.find("\n")
+                s = "" if nl == -1 else s[nl+1:].lstrip()
+                continue
+            if s.startswith("/*"):
+                m = _re.search(r"\*/", s)
+                if m:
+                    s = s[m.end():].lstrip()
+                    continue
+            break
+        m = _re.match(r"([A-Za-z_]+)", s)
+        return m.group(1).upper() if m else ""
+
     if run:
         stmt = (sql_text_input or "").strip()
         if not stmt:
             st.warning("Enter a statement.")
-        elif not re.match(r"^(SELECT|PRAGMA)", stmt, flags=re.IGNORECASE):
-            st.error("Only SELECT or PRAGMA statements are allowed here.")
         else:
-            try:
-                with engine.begin() as conn:
-                    res = conn.execute(sql_text(stmt))
-                    cols = res.keys() if hasattr(res, "keys") else None
-                    rows = res.fetchall()
-                if rows:
-                    df_out = pd.DataFrame(rows, columns=list(cols) if cols else None)
-                    st.dataframe(df_out, use_container_width=True, hide_index=True)
-                else:
-                    st.info("No rows returned.")
-            except Exception as e:
-                st.error(f"Query error: {e}")
+            tok = _first_sql_token(stmt)
+            if tok not in {"SELECT", "PRAGMA", "WITH"}:  # allow CTEs that start with WITH
+                st.error("Only SELECT or PRAGMA statements are allowed here.")
+            else:
+                try:
+                    with engine.begin() as conn:
+                        res = conn.execute(sql_text(stmt))
+                        cols = res.keys() if hasattr(res, "keys") else None
+                        rows = res.fetchall()
+                    if rows:
+                        df_out = pd.DataFrame(rows, columns=list(cols) if cols else None)
+                        st.dataframe(df_out, use_container_width=True, hide_index=True)
+                    else:
+                        st.info("No rows returned.")
+                except Exception as e:
+                    st.error(f"Query error: {e}")
 
 
 def main():
