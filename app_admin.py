@@ -581,7 +581,30 @@ def tab_browse(db: Engine):
     if "address" in df_disp:       gob.configure_column("address", header_name=H("address"), width=addr_w)
     if "url" in df_disp:           gob.configure_column("url", header_name=H("url"), width=url_w)
 
-# Clickable WEBSITE link co
+# Clickable WEBSITE link column — return an HTML STRING (not a DOM node)
+from st_aggrid import JsCode
+link_renderer = JsCode("""
+function(params) {
+  const raw = params.value || "";
+  if (!raw) { return ""; }
+  let url = String(raw).trim();
+  // ensure scheme; prefer https
+  if (!/^https?:\\/\\//i.test(url)) { url = "https://" + url; }
+  return `<a href="${url}" target="_blank" rel="noopener noreferrer">Open</a>`;
+}
+""")
+
+if "WEBSITE" in df_disp:
+    gob.configure_column(
+        "WEBSITE",
+        header_name=H("Website"),
+        width=link_w,
+        sortable=False,
+        filter=False,
+        cellRenderer=link_renderer,
+    )
+
+    
     # Notes & Keywords: NO WRAP (fixed row height + ellipsis); uppercase headers
     nowrap_style = {"whiteSpace": "nowrap", "overflow": "hidden", "textOverflow": "ellipsis"}
     if "notes" in df_disp:
