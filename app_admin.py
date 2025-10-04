@@ -20,6 +20,8 @@ from sqlalchemy import create_engine
 from sqlalchemy.sql import text as sql_text
 from urllib.parse import urlparse
 from datetime import datetime, timezone
+import json
+
 
 # ---- AgGrid (optional; app falls back if not installed) ----
 try:
