@@ -516,19 +516,34 @@ def tab_browse(db: Engine):
 
     # --- Sidebar controls for column widths ---
     with st.sidebar.expander("Browse table layout", expanded=False):
-        id_w     = st.number_input("ID width",              value=80,  min_value=50,  max_value=400,  step=10)
-        cat_w    = st.number_input("Category width",        value=140, min_value=80,  max_value=600,  step=10)
-        svc_w    = st.number_input("Service width",         value=160, min_value=80,  max_value=600,  step=10)
-        name_w   = st.number_input("Business name width",   value=220, min_value=120, max_value=800,  step=10)
-        contact_w= st.number_input("Contact name width",    value=160, min_value=100, max_value=600,  step=10)
-        phone_w  = st.number_input("Phone width",           value=120, min_value=100, max_value=300,  step=10)
-        addr_w   = st.number_input("Address width",         value=260, min_value=120, max_value=900,  step=10)
-        site_w   = st.number_input("Website width",         value=200, min_value=120, max_value=700,  step=10)
-        notes_w  = st.number_input("Notes width",           value=520, min_value=200, max_value=1600, step=20)
-        keys_w   = st.number_input("Keywords width",        value=420, min_value=200, max_value=1600, step=20)
+        id_w      = st.number_input("ID width",              value=80,  min_value=50,  max_value=400,  step=10)
+        cat_w     = st.number_input("Category width",        value=140, min_value=80,  max_value=600,  step=10)
+        svc_w     = st.number_input("Service width",         value=160, min_value=80,  max_value=600,  step=10)
+        name_w    = st.number_input("Business name width",   value=220, min_value=120, max_value=800,  step=10)
+        contact_w = st.number_input("Contact name width",    value=160, min_value=100, max_value=600,  step=10)
+        phone_w   = st.number_input("Phone width",           value=120, min_value=100, max_value=300,  step=10)
+        addr_w    = st.number_input("Address width",         value=260, min_value=120, max_value=900,  step=10)
+        site_w    = st.number_input("Website width",         value=200, min_value=120, max_value=700,  step=10)
+        notes_w   = st.number_input("Notes width",           value=520, min_value=200, max_value=1600, step=20)
+        keys_w    = st.number_input("Keywords width",        value=420, min_value=200, max_value=1600, step=20)
 
         wrap_notes = st.checkbox("Wrap Notes", value=True)
         wrap_keys  = st.checkbox("Wrap Keywords", value=True)
+
+    # ---- Reactivity trick: remount AgGrid when layout changes ----
+    layout_sig = (
+        id_w, cat_w, svc_w, name_w, contact_w, phone_w, addr_w, site_w, notes_w, keys_w,
+        wrap_notes, wrap_keys
+    )
+    if "browse_layout_sig" not in st.session_state:
+        st.session_state["browse_layout_sig"] = layout_sig
+    if "browse_layout_rev" not in st.session_state:
+        st.session_state["browse_layout_rev"] = 0
+
+    if layout_sig != st.session_state["browse_layout_sig"]:
+        st.session_state["browse_layout_sig"] = layout_sig
+        st.session_state["browse_layout_rev"] += 1
+    grid_key = f"browse_grid_rev_{st.session_state['browse_layout_rev']}"
 
     # --- Build AgGrid options ---
     gob = GridOptionsBuilder.from_dataframe(df)
@@ -543,7 +558,7 @@ def tab_browse(db: Engine):
     gob.configure_default_column(
         resizable=True,
         sortable=True,
-        filter=False,            # ← filters disabled globally
+        filter=False,            # filters disabled globally
         wrapHeaderText=True,
         autoHeaderHeight=True,
         minWidth=90,
@@ -600,13 +615,15 @@ def tab_browse(db: Engine):
         df,
         gridOptions=grid_options,
         theme="balham",
-        fit_columns_on_grid_load=True,  # initial fit only; manual resizes persist
+        fit_columns_on_grid_load=False,  # we control widths; don't auto-fit
         enable_enterprise_modules=False,
         allow_unsafe_jscode=False,
-        reload_data=False,
+        reload_data=True,                # force grid to re-read data/defs
         update_mode=GridUpdateMode.NO_UPDATE,
+        key=grid_key,                    # ← remount component when layout changes
         height=None,                     # auto via domLayout
     )
+
 
 def tab_vendor_crud(db: Engine):
     st.subheader("Add / Edit / Delete Vendor")
