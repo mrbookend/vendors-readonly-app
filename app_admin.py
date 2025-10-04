@@ -26,8 +26,9 @@ from sqlalchemy.engine import Engine
 from sqlalchemy.exc import NoSuchModuleError, SQLAlchemyError
 from urllib.parse import urlparse, parse_qsl, urlencode, urlunparse
 
-# AgGrid (table with column width control & wrapping)
-from st_aggrid import AgGrid, GridOptionsBuilder, GridUpdateMode
+# (AG Grid not used on Browse anymore)
+# from st_aggrid import AgGrid, GridOptionsBuilder, GridUpdateMode
+
 
 # --- URL sanitizer for display-only ---
 def _sanitize_urls(df: pd.DataFrame, col: str = "website") -> pd.DataFrame:
