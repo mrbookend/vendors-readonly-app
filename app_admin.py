@@ -515,6 +515,62 @@ def _aggrid_view(df_show: pd.DataFrame, website_label: str = "website"):
     grid_options["suppressMenuHide"] = True
     grid_options["domLayout"] = "normal"
 
+        # --- Show column width in header text while resizing, then restore ---
+    grid_options.setdefault("context", {})
+
+    # Capture original header names once
+    grid_options["onGridReady"] = JsCode("""
+        function(params){
+          const api = params.api, colApi = params.columnApi;
+          const go = api.gridOptionsWrapper.gridOptions;
+          if (!go.context) go.context = {};
+          const map = go.context._origHeaderNames = {};
+          const cols = colApi.getAllGridColumns();
+          cols.forEach(c => {
+            const def = c.getColDef();
+            const id  = c.getColId();
+            map[id] = (def.headerName != null ? def.headerName : (def.field || id));
+          });
+        }
+    """)
+
+    grid_options["onColumnResized"] = JsCode("""
+        function(event){
+          if (!event || !event.api || !event.column) return;
+          const api = event.api, colApi = api.columnApi, col = event.column;
+          const go = api.gridOptionsWrapper.gridOptions;
+          if (!go.context) go.context = {};
+          if (!go.context._origHeaderNames) go.context._origHeaderNames = {};
+
+          const id  = col.getColId();
+          const def = col.getColDef();
+          const orig = go.context._origHeaderNames[id] != null
+                         ? go.context._origHeaderNames[id]
+                         : (def.headerName != null ? def.headerName : (def.field || id));
+          const w = Math.round(col.getActualWidth());
+
+          // Mutate the headerName live to include width
+          def.headerName = orig + " \u2022 " + w + "px"; // " • 123px"
+          api.refreshHeader();
+
+          // When finished, restore after a short delay
+          if (event.finished) {
+            setTimeout(function(){
+              try {
+                const colObj = colApi.getColumn(id);
+                const def2 = colObj ? colObj.getColDef() : def;
+                def2.headerName = orig;
+                api.refreshHeader();
+              } catch (e) {}
+            }, 800);
+          }
+        }
+    """)
+
+    # (Optional) give headers a touch more height so the text never feels cramped
+    grid_options["headerHeight"] = 42
+
+
     # --- Column width HUD: pinned top row showing widths during resize ---
     # Start with no HUD row
     grid_options["pinnedTopRowData"] = []
