@@ -613,15 +613,12 @@ def tab_debug():
     # --- Read-only SQL runner (SELECT/PRAGMA only) ---
     st.markdown("### Run SQL (read-only)")
     st.caption("Allowed: statements starting with SELECT or PRAGMA. This is blocked from performing writes.")
-    default_sql = (
-        "SELECT id, business_name, created_at, updated_at, updated_by
-"
-        "FROM vendors
-"
-        "ORDER BY id DESC
-"
-        "LIMIT 5;"
-    )
+    default_sql = """\
+SELECT id, business_name, created_at, updated_at, updated_by
+FROM vendors
+ORDER BY id DESC
+LIMIT 5;
+"""
     sql_text_input = st.text_area("SQL", value=default_sql, height=140)
     run = st.button("Execute SQL")
     if run:
