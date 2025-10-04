@@ -319,30 +319,75 @@ with tab_browse:
     else:
         df_view = df.copy()
 
-    # --- Linkified Website + separate full URL view using data_editor ---
-    def _domain(u: str) -> str:
-        if not isinstance(u, str) or not u.strip():
-            return ""
-        try:
-            p = urlparse(u if u.startswith(("http://", "https://")) else "https://" + u)
-            return p.netloc or u
-        except Exception:
-            return u
+  # --- Linkified Website + separate full URL view using HTML (version-agnostic) ---
+import html
+from urllib.parse import urlparse
 
-    df_show = df_view.copy()
-    if "website" not in df_show.columns:
-        df_show["website"] = ""
-    df_show["website"] = df_show["website"].astype(str).fillna("")
+def _ensure_scheme(u: str) -> str:
+    u = (u or "").strip()
+    if not u:
+        return ""
+    return u if u.startswith(("http://", "https://")) else f"https://{u}"
 
-    # Derived presentation columns:
-    # - Website: clickable link (values are URLs)
-    # - URL (full): raw URL text for copy/paste
-    df_show["Website"] = df_show["website"]           # clickable column
-    df_show["URL (full)"] = df_show["website"]        # non-clickable text (explicit)
+def _escape(s: str) -> str:
+    return html.escape(s or "", quote=True)
 
-    base_cols = ["id","category","service","business_name","contact_name","phone","address","notes"]
-    opt_cols  = [c for c in ["keywords"] if c in df_show.columns]
-    order = base_cols + ["Website","URL (full)"] + opt_cols
+def _domain(u: str) -> str:
+    u2 = _ensure_scheme(u)
+    try:
+        return urlparse(u2).netloc or u
+    except Exception:
+        return u
+
+df_show = df_view.copy()
+if "website" not in df_show.columns:
+    df_show["website"] = ""
+df_show["website"] = df_show["website"].astype(str).fillna("")
+
+# Derived presentation columns:
+# - Website: clickable <a> (label = domain)
+# - URL (full): raw URL string for copy/paste
+df_show["URL (full)"] = df_show["website"]
+df_show["Website"] = df_show.apply(
+    lambda r: (
+        f'<a href="{_escape(_ensure_scheme(r["website"]))}" target="_blank" rel="noopener">'
+        f'{_escape(_domain(r["website"]))}</a>'
+    ) if r["website"] else "",
+    axis=1
+)
+
+base_cols = ["id","category","service","business_name","contact_name","phone","address","notes"]
+opt_cols  = [c for c in ["keywords"] if c in df_show.columns]
+order = base_cols + ["Website","URL (full)"] + opt_cols
+
+# Build an HTML table (escaped cells, except our controlled anchor HTML)
+cols = order
+thead = "<tr>" + "".join(f"<th>{_escape(c)}</th>" for c in cols) + "</tr>"
+rows_html = []
+for _, row in df_show[cols].iterrows():
+    tds = []
+    for c in cols:
+        if c == "Website":
+            tds.append(row[c] or "")
+        else:
+            val = "" if pd.isna(row[c]) else str(row[c])
+            tds.append(_escape(val))
+    rows_html.append("<tr>" + "".join(f"<td>{td}</td>" for td in tds) + "</tr>")
+
+table_html = f"""
+<div style="overflow-x:auto; max-width:100%;">
+  <table style="width:100%; border-collapse:collapse;">
+    <thead style="position:sticky; top:0; background:#f7f7f7;">
+      {thead}
+    </thead>
+    <tbody>
+      {''.join(rows_html)}
+    </tbody>
+  </table>
+</div>
+"""
+
+st.markdown(table_html, unsafe_allow_html=True)
 
     st.data_editor(
         df_show[order],
