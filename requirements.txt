@@ -10,6 +10,6 @@ numpy==1.26.4
 
 streamlit-aggrid==0.3.4.post3
 
-SQLAlchemy==2.0.32
-sqlalchemy-libsql==0.2.0
+sqlalchemy>=2.0
+sqlalchemy-libsql>=0.1.0
 libsql-client==0.3.1
