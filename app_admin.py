@@ -537,28 +537,49 @@ def tab_browse(db: Engine):
     # Uppercase 'Website' column: clickable link labeled 'website' if url present; else blank
     df_disp["Website"] = df_disp["url"].fillna("").astype(str)
 
-    # ---- Fixed column widths from secrets (fallback to defaults) ----
-    _widths = _read_secret_early("browse_column_widths", {}) or {}
-    def _w(name, default, *fallback_names):
-        for key in (name,) + fallback_names:
-            if isinstance(_widths, dict) and key in _widths:
-                try:
-                    return int(_widths.get(key))
-                except Exception:
-                    break
-        return default
+   # ---- Fixed column widths from secrets (fallback to defaults) ----
+def _merge_widths():
+    """Merge widths from both legacy and new secrets sections."""
+    merged = {}
+    # Read both names to support either/both in secrets.toml
+    for sect in ("browse_column_widths", "COLUMN_WIDTHS_PX_READONLY"):
+        obj = _read_secret_early(sect, None)
+        if isinstance(obj, dict):
+            merged.update(obj)
+    return merged
 
-    id_w      = _w("id", 80)
-    cat_w     = _w("category", 140)
-    svc_w     = _w("service", 160)
-    name_w    = _w("business_name", 220)
-    contact_w = _w("contact_name", 160)
-    phone_w   = _w("phone", 140)
-    addr_w    = _w("address", 260)
-    url_w     = _w("url", 220, "website")        # fallback to old 'website'
-    link_w    = _w("Website", 140, "website_link")
-    notes_w   = _w("notes", 520)
-    keys_w    = _w("keywords", 420)
+_widths = _merge_widths()
+
+def _w(name, default, *fallback_names):
+    """
+    Fetch width for 'name' from secrets; if missing, try any fallback names; else use default.
+    Ensures an int is returned even if secrets are strings.
+    """
+    for key in (name,) + fallback_names:
+        if key in _widths:
+            try:
+                return int(_widths[key])
+            except Exception:
+                pass
+    return default
+
+id_w      = _w("id", 80)
+cat_w     = _w("category", 140)
+svc_w     = _w("service", 160)
+name_w    = _w("business_name", 220)
+contact_w = _w("contact_name", 160)
+phone_w   = _w("phone", 140)
+addr_w    = _w("address", 260)
+
+# Raw URL column width: accept either 'url' or legacy 'website' key
+url_w     = _w("url", 220, "website")
+
+# Clickable link column header is 'Website': accept either 'Website' or legacy 'website_link'
+link_w    = _w("Website", 140, "website_link")
+
+notes_w   = _w("notes", 520)
+keys_w    = _w("keywords", 420)
+
 
     # --- Build AgGrid options ---
     gob = GridOptionsBuilder.from_dataframe(df_disp)
