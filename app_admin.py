@@ -209,18 +209,34 @@ def _current_username() -> str:
 
 
 def add_vendor(data: Dict[str, Optional[str]]) -> int:
+    use_meta = _vendors_has(["created_at", "updated_at", "updated_by"])
+    if use_meta:
+        sql = """
+            INSERT INTO vendors (
+                category, service, business_name, contact_name, phone, address, website, notes, keywords,
+                created_at, updated_at, updated_by
+            )
+            VALUES (
+                :category, :service, :business_name, :contact_name, :phone, :address, :website, :notes, :keywords,
+                CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, :updated_by
+            )
+        """
+        params = {**data, "updated_by": _current_username()}
+    else:
+        sql = """
+            INSERT INTO vendors (
+                category, service, business_name, contact_name, phone, address, website, notes, keywords
+            ) VALUES (
+                :category, :service, :business_name, :contact_name, :phone, :address, :website, :notes, :keywords
+            )
+        """
+        params = data
+
     with engine.begin() as conn:
-        res = conn.execute(
-            sql_text(
-                """
-                INSERT INTO vendors (category, service, business_name, contact_name, phone, address, website, notes, keywords)
-                VALUES (:category, :service, :business_name, :contact_name, :phone, :address, :website, :notes, :keywords)
-                """
-            ),
-            data,
-        )
+        res = conn.execute(sql_text(sql), params)
         new_id = res.lastrowid if hasattr(res, "lastrowid") else None
     return int(new_id or 0)
+
 
 
 def update_vendor(vid: int, data: Dict[str, Optional[str]]) -> None:
