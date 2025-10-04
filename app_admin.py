@@ -192,6 +192,22 @@ def load_vendors_df() -> pd.DataFrame:
 # Write helpers
 # -----------------------------
 
+def _vendors_has(cols: list[str]) -> bool:
+    """Return True if all requested columns exist on the vendors table."""
+    with engine.begin() as conn:
+        rows = conn.execute(sql_text("PRAGMA table_info(vendors)")).fetchall()
+        have = {r[1] for r in rows}
+    return all(c in have for c in cols)
+
+def _current_username() -> str:
+    """Pick a default username for updated_by when none is supplied."""
+    try:
+        val = (st.secrets.get("UPDATED_BY_DEFAULT") or os.environ.get("UPDATED_BY_DEFAULT") or "admin").strip()
+        return val or "admin"
+    except Exception:
+        return os.environ.get("UPDATED_BY_DEFAULT", "admin").strip()
+
+
 def add_vendor(data: Dict[str, Optional[str]]) -> int:
     with engine.begin() as conn:
         res = conn.execute(
