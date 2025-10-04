@@ -1,17 +1,18 @@
-# app_admin.py — Vendors Admin (v3.5.1)
+# app_admin.py — Vendors Admin (v3.6.1)
 # View | Add | Edit | Delete | Categories Admin | Services Admin | Maintenance | Changelog
-# - AgGrid: NO per-column filters; long text (notes/address/website url) wraps + auto-expands rows
-# - FIX: use JS-style keys in cellStyle (whiteSpace/wordBreak/overflowWrap) so wrapping actually works
-# - Quick filter under Help; CSV at bottom; Debug expander at very bottom
+# - AgGrid optional: no per-column filters; long text wraps + auto-expands rows
+# - Fixed widths honored (no auto-size fighting)
+# - Quick filter under Help; CSV at bottom; Debug expander placed directly under CSV in View tab
 # - Validators: phone (10 digits), website (http/https), service required unless category="Home Repair"
 # - Audit trail: created_at, updated_at, updated_by + vendor_changes changelog
-# - Auto-migration for audit columns/tables
+# - Auto-migration for audit columns/tables; ensure ref tables (categories/services) exist
+# - Immediate UI refresh after Add/Save/Delete/Maint ops
 
 from __future__ import annotations
 
 import os
 import re
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Optional
 
 import pandas as pd
 import streamlit as st
@@ -126,7 +127,7 @@ eng = _engine()
 
 
 # -----------------------------
-# Schema migration (audit columns + changelog table)
+# Schema migration / guardrails
 # -----------------------------
 def _column_exists(conn, table: str, col: str) -> bool:
     try:
@@ -136,14 +137,39 @@ def _column_exists(conn, table: str, col: str) -> bool:
     except Exception:
         return False
 
+def _table_exists(conn, table: str) -> bool:
+    try:
+        res = conn.execute(sql_text(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name=:t"
+        ), {"t": table}).fetchone()
+        return bool(res)
+    except Exception:
+        return False
+
+def _ensure_ref_tables(conn):
+    conn.execute(sql_text("""
+        CREATE TABLE IF NOT EXISTS categories (
+            id   INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT UNIQUE NOT NULL
+        )
+    """))
+    conn.execute(sql_text("""
+        CREATE TABLE IF NOT EXISTS services (
+            id   INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT UNIQUE NOT NULL
+        )
+    """))
+
 def _ensure_schema():
     with eng.begin() as c:
-        if not _column_exists(c, "vendors", "created_at"):
-            c.execute(sql_text("ALTER TABLE vendors ADD COLUMN created_at TEXT"))
-        if not _column_exists(c, "vendors", "updated_at"):
-            c.execute(sql_text("ALTER TABLE vendors ADD COLUMN updated_at TEXT"))
-        if not _column_exists(c, "vendors", "updated_by"):
-            c.execute(sql_text("ALTER TABLE vendors ADD COLUMN updated_by TEXT"))
+        _ensure_ref_tables(c)
+        if _table_exists(c, "vendors"):
+            if not _column_exists(c, "vendors", "created_at"):
+                c.execute(sql_text("ALTER TABLE vendors ADD COLUMN created_at TEXT"))
+            if not _column_exists(c, "vendors", "updated_at"):
+                c.execute(sql_text("ALTER TABLE vendors ADD COLUMN updated_at TEXT"))
+            if not _column_exists(c, "vendors", "updated_by"):
+                c.execute(sql_text("ALTER TABLE vendors ADD COLUMN updated_by TEXT"))
         c.execute(sql_text("""
             CREATE TABLE IF NOT EXISTS vendor_changes (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -241,7 +267,7 @@ def _validate_vendor_fields(business_name: str, category: str, service: str, pho
     else:
         cleaned["category"] = category.strip()
 
-    if (category or "").strip().lower() != "home repair":
+    if (category or "").strip().casefold() != "home repair":
         if not (service or "").strip():
             errors["service"] = "Service is required unless Category is 'Home Repair'."
         else:
@@ -386,8 +412,8 @@ def _aggrid_view(df_show: pd.DataFrame, website_label: str = "website"):
         st.info("No rows to display.")
         return
 
+    # Determine website column & add normalized URL helper column
     website_key = website_label if website_label in df_show.columns else next((c for c in df_show.columns if c.lower()=="website"), None)
-
     _df = df_show.copy()
     url_col = None
     if website_key:
@@ -416,12 +442,14 @@ def _aggrid_view(df_show: pd.DataFrame, website_label: str = "website"):
         if px:
             gob.configure_column(col, width=px)
 
-    # Long text columns auto-expand (FIX: AgGrid cellStyle uses JS-style keys)
-    long_cols = {"notes","address"}
-    if url_col:
-        long_cols.add(url_col)
+    # Identify long-text columns robustly
+    def _is_long_col(name: str) -> bool:
+        n = name.lower()
+        return ("address" in n) or ("notes" in n) or n.endswith(" url")
+
+    # Long text columns auto-expand (JS-style cellStyle keys)
     for col in list(_df.columns):
-        if col.lower() in long_cols:
+        if _is_long_col(col):
             gob.configure_column(
                 col,
                 wrapText=True,
@@ -429,7 +457,7 @@ def _aggrid_view(df_show: pd.DataFrame, website_label: str = "website"):
                 cellStyle={"whiteSpace": "normal", "wordBreak": "break-word", "overflowWrap": "anywhere"},
             )
 
-    # Clickable "Website"
+    # Clickable "Website" label: underlying URL from helper column
     if website_key and url_col:
         link_renderer = JsCode(f"""
             function(params){{
@@ -443,6 +471,8 @@ def _aggrid_view(df_show: pd.DataFrame, website_label: str = "website"):
     grid_options = gob.build()
     grid_options["floatingFilter"] = False
     grid_options["suppressMenuHide"] = True
+    # Keep fixed widths; don't auto-fit
+    grid_options["domLayout"] = "normal"
 
     AgGrid(
         _df,
@@ -451,14 +481,14 @@ def _aggrid_view(df_show: pd.DataFrame, website_label: str = "website"):
         fit_columns_on_grid_load=False,
         allow_unsafe_jscode=True,
         enable_enterprise_modules=False,
-        columns_auto_size_mode=ColumnsAutoSizeMode.FIT_CONTENTS,
+        columns_auto_size_mode=ColumnsAutoSizeMode.NO_AUTOSIZE,
         height=600,
         theme="streamlit",
     )
 
 
 # -----------------------------
-# VIEW tab (with quick filter; CSV at bottom)
+# VIEW tab (with quick filter; CSV at bottom + DEBUG right after CSV)
 # -----------------------------
 def tab_view(query: str):
     df = _fetch_df()
@@ -469,7 +499,7 @@ def tab_view(query: str):
         _aggrid_view(df_show, website_label=LABEL_OVERRIDES.get("website", "website"))
     else:
         st.warning("`streamlit-aggrid` not installed — showing basic table.")
-        _apply_css(df.columns.tolist())
+        _apply_css(df_show.columns.tolist())
         st.dataframe(df_show, use_container_width=True, hide_index=True)
 
     st.download_button(
@@ -479,21 +509,24 @@ def tab_view(query: str):
         mime="text/csv",
     )
 
+    # << DEBUG: placed immediately below the CSV button in View tab >>
+    render_status_debug(expanded=False)
+
 
 # -----------------------------
 # ADD / EDIT / DELETE / Admin tabs
 # -----------------------------
 def tab_add():
-    cats = _cats()["name"].tolist()
-    svcs = _svcs()["name"].tolist()
+    cats = sorted(_cats()["name"].dropna().astype(str).tolist(), key=lambda s: s.casefold())
+    svcs = sorted(_svcs()["name"].dropna().astype(str).tolist(), key=lambda s: s.casefold())
 
     st.info("Fields in **bold** are required. Service is optional only when Category is 'Home Repair'.")
     with st.form("add_vendor_form", clear_on_submit=True):
         col = st.columns(2)
         with col[0]:
             business_name = st.text_input(f"**{LABEL_OVERRIDES.get('business_name','business_name')}** *", placeholder="Acme Plumbing")
-            category = st.selectbox(LABEL_OVERRIDES.get("category", "category"), options=sorted(cats))
-            service = st.selectbox(LABEL_OVERRIDES.get("service", "service"), options=[""] + sorted(svcs))
+            category = st.selectbox(LABEL_OVERRIDES.get("category", "category"), options=cats)
+            service = st.selectbox(LABEL_OVERRIDES.get("service", "service"), options=[""] + svcs)
             contact_name = st.text_input(LABEL_OVERRIDES.get("contact_name", "contact_name"))
             phone = st.text_input(LABEL_OVERRIDES.get("phone", "phone"), placeholder="(210) 555-0123 or 210-555-0123")
         with col[1]:
@@ -505,7 +538,8 @@ def tab_add():
         if submitted:
             ok, cleaned, errors = _validate_vendor_fields(business_name, category, service, phone, website)
             if not ok:
-                for field, msg in errors.items(): st.error(f"{field}: {msg}")
+                for field, msg in errors.items():
+                    st.error(f"{field}: {msg}")
                 return
             row = {
                 "business_name": cleaned["business_name"], "category": cleaned["category"], "service": cleaned["service"],
@@ -514,27 +548,59 @@ def tab_add():
             }
             _insert_vendor(row)
             st.success("Vendor added.")
+            st.rerun()
+
+def _parse_vid_from_label(label: str) -> Optional[int]:
+    if "id#" not in label:
+        return None
+    try:
+        return int(label.split("id#")[-1].strip())
+    except Exception:
+        return None
 
 def tab_edit():
     df = _fetch_df()
     if df.empty:
-        st.info("No vendors available."); return
+        st.info("No vendors available.")
+        return
+
     df_sel = df.copy()
-    df_sel["label"] = df_sel["business_name"].fillna("") + " (" + df_sel["category"].fillna("") + ") — id#" + df_sel["id"].astype(str)
+    df_sel = df_sel.sort_values(
+        by=["business_name","category","id"],
+        key=lambda s: s.astype(str).str.casefold()
+    )
+    df_sel["label"] = (
+        df_sel["business_name"].fillna("").astype(str) + " (" +
+        df_sel["category"].fillna("").astype(str) + ") — id#" +
+        df_sel["id"].astype(str)
+    )
+
     choice = st.selectbox("Select Vendor", options=df_sel["label"].tolist())
-    vid = int(choice.split("id#")[-1])
+    vid = _parse_vid_from_label(choice)
+    if vid is None:
+        st.error("Could not parse selected vendor id.")
+        return
+
     row = df[df["id"] == vid].iloc[0].to_dict()
 
-    cats = _cats()["name"].tolist()
-    svcs = _svcs()["name"].tolist()
+    cats = sorted(_cats()["name"].dropna().astype(str).tolist(), key=lambda s: s.casefold())
+    svcs = sorted(_svcs()["name"].dropna().astype(str).tolist(), key=lambda s: s.casefold())
+
     with st.form("edit_vendor_form"):
         col = st.columns(2)
         with col[0]:
             row["business_name"] = st.text_input(LABEL_OVERRIDES.get("business_name", "business_name"), value=row["business_name"])
-            row["category"] = st.selectbox(LABEL_OVERRIDES.get("category", "category"), options=sorted(cats),
-                                           index=max(0, sorted(cats).index(row["category"]) if row["category"] in cats else 0))
-            row["service"] = st.selectbox(LABEL_OVERRIDES.get("service", "service"), options=[""] + sorted(svcs),
-                                          index=0 if not row.get("service") else ([""] + sorted(svcs)).index(row["service"]) if row["service"] in svcs else 0)
+            cat_idx = 0
+            if row.get("category") in cats:
+                cat_idx = cats.index(row["category"])
+            row["category"] = st.selectbox(LABEL_OVERRIDES.get("category", "category"), options=cats, index=cat_idx)
+
+            svc_options = [""] + svcs
+            svc_idx = 0
+            if row.get("service") in svcs:
+                svc_idx = 1 + svcs.index(row["service"])
+            row["service"] = st.selectbox(LABEL_OVERRIDES.get("service", "service"), options=svc_options, index=svc_idx)
+
             row["contact_name"] = st.text_input(LABEL_OVERRIDES.get("contact_name", "contact_name"), value=row.get("contact_name", ""))
             row["phone"] = st.text_input(LABEL_OVERRIDES.get("phone", "phone"), value=row.get("phone", ""))
         with col[1]:
@@ -547,10 +613,12 @@ def tab_edit():
         with col2[0]:
             if st.form_submit_button("Save Changes"):
                 ok, cleaned, errors = _validate_vendor_fields(
-                    row.get("business_name",""), row.get("category",""), row.get("service",""), row.get("phone",""), row.get("website","")
+                    row.get("business_name",""), row.get("category",""), row.get("service",""),
+                    row.get("phone",""), row.get("website","")
                 )
                 if not ok:
-                    for field, msg in errors.items(): st.error(f"{field}: {msg}")
+                    for field, msg in errors.items():
+                        st.error(f"{field}: {msg}")
                     return
                 upd = {
                     "business_name": cleaned["business_name"], "category": cleaned["category"], "service": cleaned["service"],
@@ -559,32 +627,55 @@ def tab_edit():
                 }
                 _update_vendor(vid, upd)
                 st.success("Saved.")
+                st.rerun()
         with col2[1]:
             if st.form_submit_button("Cancel"):
                 st.stop()
 
 def tab_delete():
     df = _fetch_df()
-    if df.empty: st.info("No vendors to delete."); return
-    df_sel = df.copy()
-    df_sel["label"] = df_sel["business_name"].fillna("") + " (" + df_sel["category"].fillna("") + ") — id#" + df_sel["id"].astype(str)
+    if df.empty:
+        st.info("No vendors to delete.")
+        return
+
+    df_sel = df.copy().sort_values(
+        by=["business_name","category","id"],
+        key=lambda s: s.astype(str).str.casefold()
+    )
+    df_sel["label"] = (
+        df_sel["business_name"].fillna("").astype(str) + " (" +
+        df_sel["category"].fillna("").astype(str) + ") — id#" +
+        df_sel["id"].astype(str)
+    )
     choice = st.selectbox("Select Vendor to Delete", options=df_sel["label"].tolist())
-    vid = int(choice.split("id#")[-1])
+    vid = _parse_vid_from_label(choice)
+    if vid is None:
+        st.error("Could not parse selected vendor id.")
+        return
+
     if st.button("Delete", type="primary"):
-        _delete_vendor(vid); st.success("Deleted.")
+        _delete_vendor(vid)
+        st.success("Deleted.")
+        st.rerun()
 
 def tab_categories():
     st.subheader("Categories Admin")
     cats = _cats()
     st.dataframe(cats, use_container_width=True, hide_index=True)
+
     with st.form("add_cat"):
         new = st.text_input("Add Category")
         if st.form_submit_button("Add") and (new or "").strip():
-            _upsert_category(new); st.success("Category added (or already existed). Reload to see it.")
+            _upsert_category(new)
+            st.success("Category added (or already existed). Reload to see it.")
+            st.rerun()
+
     with st.form("del_cat"):
         delname = st.text_input("Delete Category (exact name)")
         if st.form_submit_button("Delete") and (delname or "").strip():
-            _delete_category(delname); st.success("Category deleted if it existed. Reassign vendors first if needed.")
+            _delete_category(delname)
+            st.success("Category deleted if it existed. Reassign vendors first if needed.")
+            st.rerun()
 
 def _upsert_category(name: str):
     with eng.begin() as c:
@@ -598,14 +689,20 @@ def tab_services():
     st.subheader("Services Admin")
     svcs = _svcs()
     st.dataframe(svcs, use_container_width=True, hide_index=True)
+
     with st.form("add_svc"):
         new = st.text_input("Add Service")
         if st.form_submit_button("Add") and (new or "").strip():
-            _upsert_service(new); st.success("Service added (or already existed). Reload to see it.")
+            _upsert_service(new)
+            st.success("Service added (or already existed). Reload to see it.")
+            st.rerun()
+
     with st.form("del_svc"):
         delname = st.text_input("Delete Service (exact name)")
         if st.form_submit_button("Delete") and (delname or "").strip():
-            _delete_service(delname); st.success("Service deleted if it existed. Reassign vendors first if needed.")
+            _delete_service(delname)
+            st.success("Service deleted if it existed. Reassign vendors first if needed.")
+            st.rerun()
 
 def _upsert_service(name: str):
     with eng.begin() as c:
@@ -624,8 +721,9 @@ def tab_maintenance():
             with eng.begin() as c:
                 dfp = pd.read_sql_query(sql_text("SELECT id, phone FROM vendors"), c.connection)
                 for _, r in dfp.iterrows():
-                    fmt = _format_phone_10(str(r.get("phone","")))
-                    if fmt and fmt != (r.get("phone") or ""):
+                    oldp = str(r.get("phone",""))
+                    fmt = _format_phone_10(oldp)
+                    if fmt and fmt != oldp:
                         now = _now_iso()
                         c.execute(sql_text(
                             "UPDATE vendors SET phone = :p, updated_at = :ua, updated_by = :ub WHERE id = :id"
@@ -634,8 +732,9 @@ def tab_maintenance():
                             INSERT INTO vendor_changes(vendor_id, changed_at, changed_by, action, field, old_value, new_value)
                             VALUES(:vid, :ts, :by, 'update', 'phone', :oldv, :newv)
                         """), {"vid": int(r["id"]), "ts": now, "by": ADMIN_DISPLAY_NAME,
-                               "oldv": str(r.get("phone") or ""), "newv": fmt})
+                               "oldv": oldp, "newv": fmt})
             st.success("Phone numbers normalized where possible.")
+            st.rerun()
     with col[1]:
         if st.button("Trim whitespace in text fields"):
             with eng.begin() as c:
@@ -644,19 +743,23 @@ def tab_maintenance():
                 c.execute(sql_text("UPDATE vendors SET updated_at = :ua, updated_by = :ub"),
                           {"ua": _now_iso(), "ub": ADMIN_DISPLAY_NAME})
             st.success("Whitespace trimmed.")
+            st.rerun()
 
 def _fmt_when(s: str) -> str:
     try:
         dt = datetime.fromisoformat(s.replace("Z","+00:00"))
-        return dt.astimezone().strftime("%b %-d, %Y, %-I:%M %p")
+        return dt.astimezone().strftime("%b %d, %Y, %I:%M %p")
     except Exception:
         return s
 
 def tab_changelog():
     st.subheader("Changelog")
     f1, f2 = st.columns(2)
-    with f1: vendor_filter = st.text_input("Filter by vendor name contains", "")
-    with f2: user_filter   = st.text_input("Filter by edited-by contains", "")
+    with f1:
+        vendor_filter = st.text_input("Filter by vendor name contains", "")
+    with f2:
+        user_filter = st.text_input("Filter by edited-by contains", "")
+
     with eng.connect() as c:
         q = """
             SELECT vc.id, vc.vendor_id, vc.changed_at, vc.changed_by, vc.action, vc.field, vc.old_value, vc.new_value,
@@ -666,10 +769,12 @@ def tab_changelog():
             ORDER BY vc.changed_at DESC, vc.id DESC
         """
         df = pd.read_sql_query(sql_text(q), c)
+
     if vendor_filter.strip():
         df = df[df["business_name"].fillna("").str.contains(vendor_filter.strip(), case=False, na=False)]
     if user_filter.strip():
         df = df[df["changed_by"].fillna("").str.contains(user_filter.strip(), case=False, na=False)]
+
     lines = []
     for _, r in df.iterrows():
         when = _fmt_when(str(r["changed_at"]))
@@ -695,10 +800,10 @@ def tab_changelog():
 
 
 # -----------------------------
-# Status & Secrets (debug) — END (BOTTOM)
+# Status & Secrets (debug) — helper
 # -----------------------------
-def render_status_debug():
-    with st.expander("Status & Secrets (debug)", expanded=False):
+def render_status_debug(expanded=False):
+    with st.expander("Status & Secrets (debug)", expanded=expanded):
         backend = "libsql" if str(_read_secret("TURSO_DATABASE_URL","")).startswith("sqlite+libsql://") else "sqlite"
         st.write("DB")
         st.code({"backend": backend, "dsn": _read_secret("TURSO_DATABASE_URL",""),
@@ -732,8 +837,7 @@ def main():
     with tabs[6]: tab_maintenance()
     with tabs[7]: tab_changelog()
 
-    # Ensure debug expander is at the very bottom of the page
-    render_status_debug()
+    # No global debug call here — it's already rendered under CSV in View tab.
 
 if __name__ == "__main__":
     main()
