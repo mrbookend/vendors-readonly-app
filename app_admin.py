@@ -78,13 +78,29 @@ def _normalize_turso_sqlalchemy_url(raw: str) -> str:
     """
     if not raw:
         return ""
+
+    raw = raw.strip()
+
+    # If bare host, add Turso scheme
     if "://" not in raw:
         raw = "libsql://" + raw
-    raw = raw.replace("libsql://", "sqlite+libsql://", 1)
+
+    # Only convert scheme if it *starts with* libsql:// (avoid double 'sqlite+')
+    if raw.startswith("libsql://"):
+        raw = raw.replace("libsql://", "sqlite+libsql://", 1)
+    elif raw.startswith("sqlite+libsql://"):
+        pass  # already correct
+    else:
+        # Unknown scheme (e.g., http://) — treat as host and rewrite
+        parsed_tmp = urlparse(raw)
+        host = parsed_tmp.netloc or parsed_tmp.path
+        raw = "sqlite+libsql://" + host
+
     parsed = urlparse(raw)
     q = dict(parse_qsl(parsed.query, keep_blank_values=True))
     q["secure"] = "true"  # normalize once
     new_query = urlencode(q, doseq=True)
+
     return urlunparse((parsed.scheme, parsed.netloc, parsed.path, parsed.params, new_query, parsed.fragment))
 
 def build_engine() -> Tuple[Engine, Dict[str, str]]:
@@ -110,7 +126,8 @@ def build_engine() -> Tuple[Engine, Dict[str, str]]:
                 "driver": "libsql",
             }
         except (NoSuchModuleError, ValueError, SQLAlchemyError) as e:
-            st.warning(f"Turso/libSQL unavailable ({type(e).__name__}); falling back to local vendors.db.")
+            # Expanded warning includes the actual error message for easier diagnosis
+            st.warning(f"Turso/libSQL unavailable ({type(e).__name__}: {e}); falling back to local vendors.db.")
 
     # Local fallback
     sqlite_path = os.path.join(os.path.dirname(__file__), "vendors.db")
