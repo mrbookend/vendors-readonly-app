@@ -514,78 +514,7 @@ def selectbox(label: str, options: List[str], key: str, index: Optional[int] = N
 # Tabs
 # =========================
 
-def tab_browse(db: Engine):
-    # Fetch data
-    df = fetch_vendors_df(db)
-
-    # Global text search
-    q = st.text_input(
-        "Global search across all fields (non-FTS, case-insensitive; matches partial words).",
-        placeholder="e.g., plumb returns any record with 'plumb' anywhere",
-        key="browse_query",
-    ).strip()
-
-    if q:
-        q_lower = q.lower()
-        mask = pd.Series([False] * len(df))
-        for col in df.columns:
-            if df[col].dtype == object:
-                mask = mask | df[col].fillna("").str.lower().str.contains(q_lower, na=False)
-        df = df[mask]
-
-    # ---- Prepare display dataframe: phone fmt; build url; drop raw 'website'; add WEBSITE link source ----
-    def _fmt_phone(val: str) -> str:
-        if val is None:
-            return ""
-        s = re.sub(r"\D+", "", str(val))
-        return f"({s[0:3]}) {s[3:6]}-{s[6:10]}" if len(s) == 10 else (str(val) if val else "")
-
-    df_disp = df.copy()
-
-    if "phone" in df_disp.columns:
-        df_disp["phone"] = df_disp["phone"].apply(_fmt_phone)
-
-    # Create 'url' from DB 'website' (back-compat), then drop 'website'
-    if "website" in df_disp.columns:
-        df_disp["url"] = df_disp["website"].fillna("")
-        df_disp.drop(columns=["website"], inplace=True)
-    elif "url" not in df_disp.columns:
-        df_disp["url"] = ""
-
-    # WEBSITE column used for clickable link (value is the url; renderer will create <a>)
-    df_disp["WEBSITE"] = df_disp["url"].fillna("").astype(str)
-
-    # ---- Column widths from secrets (supports two sections; latter wins on conflicts) ----
-    def _merge_widths():
-        merged = {}
-        for sect in ("browse_column_widths", "COLUMN_WIDTHS_PX_READONLY"):
-            obj = _read_secret_early(sect, None)
-            if isinstance(obj, dict):
-                merged.update(obj)
-        return merged
-
-    _widths = _merge_widths()
-
-    def _w(name, default, *fallback_names):
-        for key in (name,) + fallback_names:
-            if key in _widths:
-                try:
-                    return int(_widths[key])
-                except Exception:
-                    pass
-        return default
-
-    id_w      = _w("id", 80)
-    cat_w     = _w("category", 140)
-    svc_w     = _w("service", 160)
-    name_w    = _w("business_name", 220)
-    contact_w = _w("contact_name", 160)
-    phone_w   = _w("phone", 140)
-    addr_w    = _w("address", 260)
-    url_w     = _w("url", 220, "website")          # 'url' or legacy 'website'
-    link_w    = _w("Website", 140, "website_link") # 'Website' or legacy 'website_link'
-    notes_w   = _w("notes", 520)
-    keys_w    = _w("keywords", 420)
+def tab_browse
 
     # --- Build AgGrid options ---
     gob = GridOptionsBuilder.from_dataframe(df_disp)
