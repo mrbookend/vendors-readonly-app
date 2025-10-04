@@ -298,7 +298,7 @@ def repair_services_table() -> str:
 # -----------------------------
 
 def tab_browse():
-            df = load_vendors_df()
+    df = load_vendors_df()
 
     q = st.text_input("Search", placeholder="e.g., plumb returns any record with 'plumb' anywhere")
     if q:
