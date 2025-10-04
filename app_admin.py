@@ -1,8 +1,10 @@
-# app_admin.py — Vendors Admin (v3.6.8)
+# app_admin.py — Vendors Admin (v3.6.9)
 # View | Add | Edit | Delete | Categories Admin | Services Admin | Maintenance | Changelog
 # - AgGrid optional: wrap/auto-height for ALL columns EXCEPT notes & keywords (fixed height)
-# - Website column: shows hostname, looks like a link, opens on click (no DOM/HTML renderers; avoids React #31)
+# - Website column: shows literal "Website", underlined/pointer; click opens in new tab
+#   (guarded: does not open while editing; ignores non-click events)
 # - Copy UX: keyboard selection + context menu (“Copy”, “Copy with headers”, “Copy row (TSV)”)
+# - Disabled full-row hover highlight and row selection on click (so only cells/ranges highlight)
 # - Fallback uses st.table; CSS: wrap everywhere except notes/keywords; fixed widths
 # - Validators, audit trail, schema guardrails; CSV + Debug under the table in View
 
@@ -476,18 +478,12 @@ def _aggrid_view(df_show: pd.DataFrame, website_label: str = "website"):
                 cellStyle={"whiteSpace": "nowrap", "textOverflow": "ellipsis", "overflow": "hidden"}
             )
 
-    # Website column — show hostname label; make it look like a link; no HTML/DOM renderers
+    # Website column — show literal "Website"; underline+pointer; no HTML/DOM renderers
     if website_key and url_col:
         label_formatter = JsCode(f"""
             function(params){{
                 const url = (params.data && params.data["{url_col}"]) || "";
-                if (!url) return "";
-                try {{
-                    const u = new URL(url);
-                    return u.hostname;   // e.g., example.com
-                }} catch(e) {{
-                    return "Website";
-                }}
+                return url ? "Website" : "";
             }}
         """)
         gob.configure_column(
@@ -502,27 +498,39 @@ def _aggrid_view(df_show: pd.DataFrame, website_label: str = "website"):
     grid_options["suppressMenuHide"] = True
     grid_options["domLayout"] = "normal"
 
-    # Improve copy behavior
+    # Improve copy behavior (but avoid whole-row highlight/selection)
     grid_options["ensureDomOrder"] = True
     grid_options["enableRangeSelection"] = True
     grid_options["enableCellTextSelection"] = True
-    grid_options["rowSelection"] = "multiple"
-    grid_options["rowMultiSelectWithClick"] = True
-    grid_options["suppressRowClickSelection"] = False
+
+    # Disable row selection via click and row hover highlight
+    grid_options["rowSelection"] = "single"          # required key; we'll suppress actual click-selection
+    grid_options["rowMultiSelectWithClick"] = False  # no multi-select on click
+    grid_options["suppressRowClickSelection"] = True # clicking a cell won’t select the row
+    grid_options["suppressRowHoverHighlight"] = True # no full-row highlight on hover
+
+    # Keep clipboard behavior
     grid_options["suppressCopyRowsToClipboard"] = False
     grid_options["clipboardDelimiter"] = "\t"
     grid_options["copyHeadersToClipboard"] = False
 
-    # Open URL on click for the Website column
+    # Open URL on click for the Website column (guard: only on real mouse click, and not while editing)
     if website_key and url_col:
         grid_options["onCellClicked"] = JsCode(f"""
             function(event){{
-                if (event.colDef && event.colDef.field === "{website_key}") {{
-                    const url = (event.data && event.data["{url_col}"]) || "";
-                    if (url) {{
-                        window.open(url, "_blank", "noopener,noreferrer");
-                    }}
-                }}
+                if (!(event && event.colDef && event.colDef.field === "{website_key}")) return;
+                const url = (event.data && event.data["{url_col}"]) || "";
+                if (!url) return;
+
+                // Guard: do not open while any cell is being edited
+                const isEditing = event.api ? event.api.getEditingCells().length > 0 : false;
+                if (isEditing) return;
+
+                // Guard: only react to actual mouse clicks (ignore Enter/keyboard)
+                const ev = event.event;
+                if (ev && ev.type && ev.type !== "click") return;
+
+                window.open(url, "_blank", "noopener,noreferrer");
             }}
         """)
 
@@ -557,6 +565,12 @@ def _aggrid_view(df_show: pd.DataFrame, website_label: str = "website"):
           return res;
         }
     """)
+
+    # Optional: hard override any leftover hover styling if theme ignores suppressRowHoverHighlight
+    st.markdown(
+        "<style>.ag-theme-streamlit .ag-row-hover { background-color: transparent !important; }</style>",
+        unsafe_allow_html=True,
+    )
 
     AgGrid(
         _df,
@@ -877,7 +891,7 @@ def tab_changelog():
             field = r.get("field") or "field"
             oldv = r.get("old_value") or ""
             newv = r.get("new_value") or ""
-            _ = f"`{oldv}` → `{newv}`"  # arrow kept out of bullet
+            _ = f"`{oldv}` → `{newv}`"  # keep arrow out of bullet text to reduce Markdown escaping issues
             lines.append(f"{when} — Updated **{field}** for **{name}** (by {by})")
         else:
             lines.append(f"{when} — Change on **{name}** (by {by})")
