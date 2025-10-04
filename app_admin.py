@@ -557,33 +557,27 @@ def tab_browse
     if "address" in df_disp:       gob.configure_column("address", header_name=H("address"), width=addr_w)
     if "url" in df_disp:           gob.configure_column("url", header_name=H("url"), width=url_w)
 
-    # Clickable WEBSITE link column — return a real DOM <a> element (reliable clickability)
-    from st_aggrid import JsCode
-    link_renderer = JsCode("""
-        function(params) {
-            var raw = params.value;
-            if (!raw) { return ''; }
-            var url = ('' + raw).trim();
-            if (!/^https?:\\/\\//i.test(url)) {
-                url = 'http://' + url;
-            }
-            var a = document.createElement('a');
-            a.href = url;
-            a.target = '_blank';
-            a.rel = 'noopener';
-            a.innerText = 'website';
-            return a;
-        }
-    """)
-    if "WEBSITE" in df_disp:
-        gob.configure_column(
-            "WEBSITE",
-            header_name=H("Website"),
-            width=link_w,
-            sortable=False,
-            filter=False,
-            cellRenderer=link_renderer,
-        )
+   # Clickable WEBSITE link column — return an HTML string (NOT a DOM node)
+from st_aggrid import JsCode
+link_renderer = JsCode(`
+    function(params) {
+        const raw = params.value || "";
+        if (!raw) { return ""; }
+        let url = String(raw).trim();
+        if (!/^https?:\\/\\//i.test(url)) { url = "https://" + url; }  // prefer https
+        return `<a href="${url}" target="_blank" rel="noopener noreferrer">Open</a>`;
+    }
+`)
+if "WEBSITE" in df_disp:
+    gob.configure_column(
+        "WEBSITE",
+        header_name=H("Website"),
+        width=link_w,
+        sortable=False,
+        filter=False,
+        cellRenderer=link_renderer,
+    )
+
 
     # Notes & Keywords: NO WRAP (fixed row height + ellipsis); uppercase headers
     nowrap_style = {"whiteSpace": "nowrap", "overflow": "hidden", "textOverflow": "ellipsis"}
