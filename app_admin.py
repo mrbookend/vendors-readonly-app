@@ -327,12 +327,14 @@ with tab_browse:
 
     df = vendors_df()
     text_cols = [c for c in df.columns if c != "id"]
+
+    # --- SINGLE search widget (unique key) ---
     st.caption("Global search across all fields (non-FTS, case-insensitive; matches partial words).")
     q = st.text_input(
         "Search",
         value="",
         placeholder="e.g., plumb returns any record with 'plumb' anywhere",
-        key="browse_search",  # prevent DuplicateWidgetID
+        key="browse_search",
     )
 
     if q.strip():
@@ -343,9 +345,8 @@ with tab_browse:
         df_view = df[mask].copy()
     else:
         df_view = df.copy()
-    
 
-    # --- Linkified Website + separate full URL view using HTML (version-agnostic) ---
+    # --- HTML table: linkified Website + no-wrap for Keywords/Phone/ID ---
     import html
     from urllib.parse import urlparse
 
@@ -370,9 +371,7 @@ with tab_browse:
         df_show["website"] = ""
     df_show["website"] = df_show["website"].astype(str).fillna("")
 
-    # Derived presentation columns:
-    # - Website: clickable <a> (label = domain)
-    # - URL (full): raw URL string for copy/paste
+    # Derived columns
     df_show["URL (full)"] = df_show["website"]
     df_show["Website"] = df_show.apply(
         lambda r: (
@@ -382,37 +381,77 @@ with tab_browse:
         axis=1
     )
 
+    # Column order; include keywords last if present
     base_cols = ["id","category","service","business_name","contact_name","phone","address","notes"]
     opt_cols  = [c for c in ["keywords"] if c in df_show.columns]
     order = base_cols + ["Website","URL (full)"] + opt_cols
-
-    # Build HTML table (escaped cells, except our controlled anchor HTML)
     cols = order
-    thead = "<tr>" + "".join(f"<th>{_escape(c)}</th>" for c in cols) + "</tr>"
+
+    # Pre-compute per-column CSS classes so we can control wrapping
+    # No wrap for id/phone/keywords; keep reasonable widths to avoid tall rows
+    col_classes = {c: "" for c in cols}
+    if "id" in col_classes:
+        col_classes["id"] = "no-wrap narrow"
+    if "phone" in col_classes:
+        col_classes["phone"] = "no-wrap narrow"
+    if "keywords" in col_classes:
+        col_classes["keywords"] = "no-wrap medium"
+
+    # Build header
+    thead = "<tr>" + "".join(
+        f'<th class="{col_classes.get(c, "")}">{_escape(c)}</th>' for c in cols
+    ) + "</tr>"
+
+    # Build body (escape everything except the Website anchor we control)
     rows_html = []
     for _, row in df_show[cols].iterrows():
         tds = []
         for c in cols:
+            cls = col_classes.get(c, "")
             if c == "Website":
-                tds.append(row[c] or "")
+                cell_html = row[c] or ""
             else:
                 val = "" if pd.isna(row[c]) else str(row[c])
-                tds.append(_escape(val))
-        rows_html.append("<tr>" + "".join(f"<td>{td}</td>" for td in tds) + "</tr>")
+                # Truncate visually but keep full in title tooltip
+                cell_html = f'<span title="{_escape(val)}">{_escape(val)}</span>'
+            tds.append(f'<td class="{cls}">{cell_html}</td>')
+        rows_html.append("<tr>" + "".join(tds) + "</tr>")
+
+    # CSS: fixed layout, ellipsis, no wrap for certain cols, sane widths
+    table_css = """
+    <style>
+      .tbl-wrap { overflow-x: auto; max-width: 100%; }
+      .tbl { width: 100%; border-collapse: collapse; table-layout: fixed; }
+      .tbl th, .tbl td { padding: 6px 8px; border-bottom: 1px solid #eee; vertical-align: top; }
+      .tbl thead th { position: sticky; top: 0; background: #f7f7f7; z-index: 1; }
+
+      /* Default cells: single-line ellipsis to avoid tall rows */
+      .tbl td > span {
+        display: block;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+      }
+
+      /* No-wrap + narrow widths for ID/Phone; medium for Keywords */
+      .tbl th.narrow, .tbl td.narrow { width: 110px; }
+      .tbl th.medium, .tbl td.medium { width: 220px; }
+      .tbl th.no-wrap, .tbl td.no-wrap { white-space: nowrap; }
+    </style>
+    """
+
     table_html = f"""
-    <div style="overflow-x:auto; max-width:100%;">
-      <table style="width:100%; border-collapse:collapse;">
-        <thead style="position:sticky; top:0; background:#f7f7f7;">
-          {thead}
-        </thead>
-        <tbody>
-          {''.join(rows_html)}
-        </tbody>
+    {table_css}
+    <div class="tbl-wrap">
+      <table class="tbl">
+        <thead>{thead}</thead>
+        <tbody>{''.join(rows_html)}</tbody>
       </table>
     </div>
     """
 
     st.markdown(table_html, unsafe_allow_html=True)
+
 
 
 # -----------------------------
