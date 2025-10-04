@@ -497,9 +497,10 @@ def selectbox(label: str, options: List[str], key: str, index: Optional[int] = N
 # =========================
 
 def tab_browse(db: Engine):
-    st.subheader("Browse Vendors")
+    # No subheader per request
     df = fetch_vendors_df(db)
 
+    # Global text search
     q = st.text_input(
         "Global search across all fields (non-FTS, case-insensitive; matches partial words).",
         placeholder="e.g., plumb returns any record with 'plumb' anywhere",
@@ -514,6 +515,23 @@ def tab_browse(db: Engine):
                 mask = mask | df[col].fillna("").str.lower().str.contains(q_lower, na=False)
         df = df[mask]
 
+    # ---- derive display dataframe: format phone; add clickable Website column source ----
+    def _fmt_phone(val: str) -> str:
+        if val is None:
+            return ""
+        s = re.sub(r"\D+", "", str(val))
+        return f"({s[0:3]}) {s[3:6]}-{s[6:10]}" if len(s) == 10 else (str(val) if val else "")
+
+    df_disp = df.copy()
+    if "phone" in df_disp.columns:
+        df_disp["phone"] = df_disp["phone"].apply(_fmt_phone)
+
+    # website_link column will render as a clickable anchor (label: 'Website')
+    if "website" in df_disp.columns:
+        df_disp["website_link"] = df_disp["website"]
+    else:
+        df_disp["website_link"] = ""
+
     # --- Sidebar controls for column widths ---
     with st.sidebar.expander("Browse table layout", expanded=False):
         id_w      = st.number_input("ID width",              value=80,  min_value=50,  max_value=400,  step=10)
@@ -521,9 +539,10 @@ def tab_browse(db: Engine):
         svc_w     = st.number_input("Service width",         value=160, min_value=80,  max_value=600,  step=10)
         name_w    = st.number_input("Business name width",   value=220, min_value=120, max_value=800,  step=10)
         contact_w = st.number_input("Contact name width",    value=160, min_value=100, max_value=600,  step=10)
-        phone_w   = st.number_input("Phone width",           value=120, min_value=100, max_value=300,  step=10)
+        phone_w   = st.number_input("Phone width",           value=140, min_value=100, max_value=300,  step=10)
         addr_w    = st.number_input("Address width",         value=260, min_value=120, max_value=900,  step=10)
-        site_w    = st.number_input("Website width",         value=200, min_value=120, max_value=700,  step=10)
+        site_w    = st.number_input("Raw URL width",         value=220, min_value=120, max_value=700,  step=10)
+        link_w    = st.number_input("'Website' link width",  value=140, min_value=120, max_value=400,  step=10)
         notes_w   = st.number_input("Notes width",           value=520, min_value=200, max_value=1600, step=20)
         keys_w    = st.number_input("Keywords width",        value=420, min_value=200, max_value=1600, step=20)
 
@@ -532,25 +551,24 @@ def tab_browse(db: Engine):
 
     # ---- Reactivity trick: remount AgGrid when layout changes ----
     layout_sig = (
-        id_w, cat_w, svc_w, name_w, contact_w, phone_w, addr_w, site_w, notes_w, keys_w,
+        id_w, cat_w, svc_w, name_w, contact_w, phone_w, addr_w, site_w, link_w, notes_w, keys_w,
         wrap_notes, wrap_keys
     )
     if "browse_layout_sig" not in st.session_state:
         st.session_state["browse_layout_sig"] = layout_sig
     if "browse_layout_rev" not in st.session_state:
         st.session_state["browse_layout_rev"] = 0
-
     if layout_sig != st.session_state["browse_layout_sig"]:
         st.session_state["browse_layout_sig"] = layout_sig
         st.session_state["browse_layout_rev"] += 1
     grid_key = f"browse_grid_rev_{st.session_state['browse_layout_rev']}"
 
     # --- Build AgGrid options ---
-    gob = GridOptionsBuilder.from_dataframe(df)
+    gob = GridOptionsBuilder.from_dataframe(df_disp)
 
     # General defaults
     gob.configure_grid_options(
-        domLayout="autoHeight",                 # grid grows with rows
+        domLayout="autoHeight",
         ensureDomOrder=True,
         suppressFieldDotNotation=True,
         suppressMovableColumns=False,
@@ -558,45 +576,63 @@ def tab_browse(db: Engine):
     gob.configure_default_column(
         resizable=True,
         sortable=True,
-        filter=False,            # filters disabled globally
+        filter=True,             # enable filters by default
         wrapHeaderText=True,
         autoHeaderHeight=True,
         minWidth=90,
     )
 
-    # Column-specific configs (stable ordering)
+    # Stable ordering (include new 'website_link' after 'website')
     col_order = [
         "id","category","service","business_name","contact_name","phone",
-        "address","website","notes","keywords"
+        "address","website","website_link","notes","keywords"
     ]
-    existing = [c for c in col_order if c in df.columns] + [c for c in df.columns if c not in col_order]
+    existing = [c for c in col_order if c in df_disp.columns] + [c for c in df_disp.columns if c not in col_order]
 
-    if "id" in df:
-        gob.configure_column("id", header_name="ID", width=id_w, pinned=None)
-    if "category" in df:
-        gob.configure_column("category", width=cat_w)
-    if "service" in df:
-        gob.configure_column("service", width=svc_w)
-    if "business_name" in df:
-        gob.configure_column("business_name", width=name_w)
-    if "contact_name" in df:
-        gob.configure_column("contact_name", width=contact_w)
-    if "phone" in df:
-        gob.configure_column("phone", width=phone_w)
-    if "address" in df:
-        gob.configure_column("address", width=addr_w)
-    if "website" in df:
-        gob.configure_column("website", width=site_w)
+    # ID: disable filter explicitly
+    if "id" in df_disp:
+        gob.configure_column("id", header_name="ID", width=id_w, filter=False)
+
+    if "category" in df_disp:      gob.configure_column("category", width=cat_w)
+    if "service" in df_disp:       gob.configure_column("service", width=svc_w)
+    if "business_name" in df_disp: gob.configure_column("business_name", width=name_w)
+    if "contact_name" in df_disp:  gob.configure_column("contact_name", width=contact_w)
+    if "phone" in df_disp:         gob.configure_column("phone", width=phone_w)
+    if "address" in df_disp:       gob.configure_column("address", width=addr_w)
+    if "website" in df_disp:       gob.configure_column("website", width=site_w)
+
+    # Clickable Website link column
+    from st_aggrid import JsCode
+    link_renderer = JsCode("""
+        function(params) {
+            const raw = params.value;
+            if (!raw) { return ''; }
+            let url = ('' + raw).trim();
+            if (!/^https?:\\/\\//i.test(url)) {
+                url = 'http://' + url;
+            }
+            return `<a href="${url}" target="_blank" rel="noopener">Website</a>`;
+        }
+    """)
+    if "website_link" in df_disp:
+        gob.configure_column(
+            "website_link",
+            header_name="Website",
+            width=link_w,
+            sortable=False,
+            filter=False,
+            cellRenderer=link_renderer,
+        )
 
     # Notes & Keywords: wide + wrapping
-    if "notes" in df:
+    if "notes" in df_disp:
         gob.configure_column(
             "notes",
             width=notes_w,
             cellStyle={"whiteSpace": "normal"} if wrap_notes else {"whiteSpace": "nowrap"},
-            autoHeight=wrap_notes,  # grows row height if wrapping
+            autoHeight=wrap_notes,
         )
-    if "keywords" in df:
+    if "keywords" in df_disp:
         gob.configure_column(
             "keywords",
             width=keys_w,
@@ -612,17 +648,18 @@ def tab_browse(db: Engine):
     )
 
     AgGrid(
-        df,
+        df_disp,
         gridOptions=grid_options,
         theme="balham",
-        fit_columns_on_grid_load=False,  # we control widths; don't auto-fit
+        fit_columns_on_grid_load=False,
         enable_enterprise_modules=False,
-        allow_unsafe_jscode=False,
-        reload_data=True,                # force grid to re-read data/defs
+        allow_unsafe_jscode=True,   # required for clickable link renderer
+        reload_data=True,
         update_mode=GridUpdateMode.NO_UPDATE,
-        key=grid_key,                    # ← remount component when layout changes
-        height=None,                     # auto via domLayout
+        key=grid_key,
+        height=None,
     )
+
 
 
 def tab_vendor_crud(db: Engine):
