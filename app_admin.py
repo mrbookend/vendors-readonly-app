@@ -590,10 +590,60 @@ def tab_debug():
         }
     )
 
+    # --- Recent changes panel ---
+    st.markdown("### Recent changes (last 10)")
+    with engine.begin() as conn:
+        rows = conn.execute(sql_text(
+            """
+            SELECT id, business_name, COALESCE(updated_at, created_at) AS timestamp, updated_by
+            FROM vendors
+            ORDER BY datetime(COALESCE(updated_at, created_at)) DESC, id DESC
+            LIMIT 10
+            """
+        )).fetchall()
+    if rows:
+        st.dataframe(
+            pd.DataFrame(rows, columns=["id", "business_name", "timestamp", "updated_by"]),
+            use_container_width=True,
+            hide_index=True,
+        )
+    else:
+        st.caption("No recent rows.")
 
-# -----------------------------
-# Main
-# -----------------------------
+    # --- Read-only SQL runner (SELECT/PRAGMA only) ---
+    st.markdown("### Run SQL (read-only)")
+    st.caption("Allowed: statements starting with SELECT or PRAGMA. This is blocked from performing writes.")
+    default_sql = (
+        "SELECT id, business_name, created_at, updated_at, updated_by
+"
+        "FROM vendors
+"
+        "ORDER BY id DESC
+"
+        "LIMIT 5;"
+    )
+    sql_text_input = st.text_area("SQL", value=default_sql, height=140)
+    run = st.button("Execute SQL")
+    if run:
+        stmt = (sql_text_input or "").strip()
+        if not stmt:
+            st.warning("Enter a statement.")
+        elif not re.match(r"^(SELECT|PRAGMA)", stmt, flags=re.IGNORECASE):
+            st.error("Only SELECT or PRAGMA statements are allowed here.")
+        else:
+            try:
+                with engine.begin() as conn:
+                    res = conn.execute(sql_text(stmt))
+                    cols = res.keys() if hasattr(res, "keys") else None
+                    rows = res.fetchall()
+                if rows:
+                    df_out = pd.DataFrame(rows, columns=list(cols) if cols else None)
+                    st.dataframe(df_out, use_container_width=True, hide_index=True)
+                else:
+                    st.info("No rows returned.")
+            except Exception as e:
+                st.error(f"Query error: {e}")
+
 
 def main():
     # Title intentionally removed per user request
@@ -622,5 +672,7 @@ def main():
     with tabs[6]:
         tab_debug()
 
+
 if __name__ == "__main__":
     main()
+
