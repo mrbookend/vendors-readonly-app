@@ -502,6 +502,29 @@ def backfill_vendor_audit(db: Engine) -> Tuple[int, int]:
 # UI Helpers
 # =========================
 
+# --- AG Grid helper: add Website link column (returns HTML STRING, not DOM node) ---
+def _add_website_link_column(gob, df_disp, link_w):
+    from st_aggrid import JsCode
+    link_renderer = JsCode("""
+function(params) {
+  const raw = params.value || "";
+  if (!raw) { return ""; }
+  let url = String(raw).trim();
+  if (!/^https?:\\/\\//i.test(url)) { url = "https://" + url; }  // prefer https
+  return `<a href="${url}" target="_blank" rel="noopener noreferrer">Open</a>`;
+}
+""")
+    if "WEBSITE" in df_disp:
+        gob.configure_column(
+            "WEBSITE",
+            header_name="Website",
+            width=link_w,
+            sortable=False,
+            filter=False,
+            cellRenderer=link_renderer,
+        )
+
+
 def rerun():
     st.rerun()
 
