@@ -196,11 +196,13 @@ def _apply_css_for_table(field_order: List[str]):
     base = f"""
     {tbl_sel}, {df_sel} {{ table-layout: fixed !important; }}
     {tbl_sel} td, {tbl_sel} th, {df_sel} td, {df_sel} th {{
-        white-space: normal !important;       /* wrap by default */
-        overflow-wrap: anywhere !important;
-        word-break: break-word !important;
+        white-space: normal !important;        /* allow wrapping */
+        overflow-wrap: normal !important;      /* wrap at word boundaries */
+        word-break: normal !important;         /* no mid-word breaks */
+        hyphens: auto !important;              /* optional hyphenation for long words */
     }}
     """
+
     rules = [base]
 
     # Fixed per-column widths (1-based nth-child)
