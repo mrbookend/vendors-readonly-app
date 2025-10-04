@@ -500,7 +500,7 @@ def tab_browse(db: Engine):
     # Fetch data
     df = fetch_vendors_df(db)
 
-    # Global text search (kept)
+    # Global text search
     q = st.text_input(
         "Global search across all fields (non-FTS, case-insensitive; matches partial words).",
         placeholder="e.g., plumb returns any record with 'plumb' anywhere",
@@ -515,7 +515,7 @@ def tab_browse(db: Engine):
                 mask = mask | df[col].fillna("").str.lower().str.contains(q_lower, na=False)
         df = df[mask]
 
-    # ---- derive display dataframe: format phone; create url + WEBSITE link; DROP raw 'website' column ----
+    # ---- Prepare display dataframe: phone fmt; build url; drop raw 'website'; add WEBSITE link source ----
     def _fmt_phone(val: str) -> str:
         if val is None:
             return ""
@@ -524,22 +524,20 @@ def tab_browse(db: Engine):
 
     df_disp = df.copy()
 
-    # Phone formatting
     if "phone" in df_disp.columns:
         df_disp["phone"] = df_disp["phone"].apply(_fmt_phone)
 
-    # url column from DB 'website' (back-compat)
+    # Create 'url' from DB 'website' (back-compat), then drop 'website'
     if "website" in df_disp.columns:
         df_disp["url"] = df_disp["website"].fillna("")
-        # Remove the lowercase 'website' column entirely so it doesn't appear at the end
         df_disp.drop(columns=["website"], inplace=True)
     elif "url" not in df_disp.columns:
         df_disp["url"] = ""
 
-    # Uppercase 'WEBSITE' column used for clickable link cell
+    # WEBSITE column used for clickable link (value is the url; renderer will create <a>)
     df_disp["WEBSITE"] = df_disp["url"].fillna("").astype(str)
 
-    # ---- Fixed column widths from secrets (fallback to defaults) ----
+    # ---- Column widths from secrets (supports two sections; latter wins on conflicts) ----
     def _merge_widths():
         merged = {}
         for sect in ("browse_column_widths", "COLUMN_WIDTHS_PX_READONLY"):
@@ -566,15 +564,15 @@ def tab_browse(db: Engine):
     contact_w = _w("contact_name", 160)
     phone_w   = _w("phone", 140)
     addr_w    = _w("address", 260)
-    url_w     = _w("url", 220, "website")          # supports either 'url' or legacy 'website'
-    link_w    = _w("Website", 140, "website_link") # supports either 'Website' or 'website_link'
+    url_w     = _w("url", 220, "website")          # 'url' or legacy 'website'
+    link_w    = _w("Website", 140, "website_link") # 'Website' or legacy 'website_link'
     notes_w   = _w("notes", 520)
     keys_w    = _w("keywords", 420)
 
     # --- Build AgGrid options ---
     gob = GridOptionsBuilder.from_dataframe(df_disp)
 
-    # General defaults: NO FILTERS on any column; allow narrow widths
+    # Global defaults: NO FILTERS anywhere; allow narrow widths
     gob.configure_grid_options(
         domLayout="autoHeight",
         ensureDomOrder=True,
@@ -594,14 +592,14 @@ def tab_browse(db: Engine):
     def H(s: str) -> str:
         return s.upper()
 
-    # Desired column order (note: 'website' is dropped; only 'url' + 'WEBSITE' remain)
+    # Desired column order (website dropped; only url + WEBSITE)
     col_order = [
         "id","category","service","business_name","contact_name","phone",
         "address","url","WEBSITE","notes","keywords"
     ]
     existing = [c for c in col_order if c in df_disp.columns] + [c for c in df_disp.columns if c not in col_order]
 
-    # Per-column configs (uppercase headers, no filters anywhere)
+    # Per-column configs (uppercase headers, no filters)
     if "id" in df_disp:            gob.configure_column("id", header_name=H("id"), width=id_w)
     if "category" in df_disp:      gob.configure_column("category", header_name=H("category"), width=cat_w)
     if "service" in df_disp:       gob.configure_column("service", header_name=H("service"), width=svc_w)
@@ -611,7 +609,7 @@ def tab_browse(db: Engine):
     if "address" in df_disp:       gob.configure_column("address", header_name=H("address"), width=addr_w)
     if "url" in df_disp:           gob.configure_column("url", header_name=H("url"), width=url_w)
 
-    # Clickable WEBSITE link column (cell label 'website' if url present)
+    # Clickable WEBSITE link column — return a real DOM <a> element (reliable clickability)
     from st_aggrid import JsCode
     link_renderer = JsCode("""
         function(params) {
@@ -621,7 +619,12 @@ def tab_browse(db: Engine):
             if (!/^https?:\\/\\//i.test(url)) {
                 url = 'http://' + url;
             }
-            return '<a href="' + url + '" target="_blank" rel="noopener">website</a>';
+            var a = document.createElement('a');
+            a.href = url;
+            a.target = '_blank';
+            a.rel = 'noopener';
+            a.innerText = 'website';
+            return a;
         }
     """)
     if "WEBSITE" in df_disp:
@@ -666,10 +669,10 @@ def tab_browse(db: Engine):
         theme="balham",
         fit_columns_on_grid_load=False,   # use our fixed widths
         enable_enterprise_modules=False,
-        allow_unsafe_jscode=True,         # needed for clickable link renderer
+        allow_unsafe_jscode=True,         # required for the JS cellRenderer above
         reload_data=True,
         update_mode=GridUpdateMode.NO_UPDATE,
-        key="browse_grid_fixed_layout_v5",
+        key="browse_grid_fixed_layout_v6",
         height=None,
     )
 
