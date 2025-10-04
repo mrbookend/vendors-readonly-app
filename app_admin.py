@@ -240,19 +240,29 @@ def add_vendor(data: Dict[str, Optional[str]]) -> int:
 
 
 def update_vendor(vid: int, data: Dict[str, Optional[str]]) -> None:
+    use_meta = _vendors_has(["updated_at", "updated_by"])
+    if use_meta:
+        sql = """
+            UPDATE vendors
+               SET category=:category, service=:service, business_name=:business_name,
+                   contact_name=:contact_name, phone=:phone, address=:address,
+                   website=:website, notes=:notes, keywords=:keywords,
+                   updated_at=CURRENT_TIMESTAMP, updated_by=:updated_by
+             WHERE id=:id
+        """
+        params = {"id": vid, **data, "updated_by": _current_username()}
+    else:
+        sql = """
+            UPDATE vendors
+               SET category=:category, service=:service, business_name=:business_name,
+                   contact_name=:contact_name, phone=:phone, address=:address,
+                   website=:website, notes=:notes, keywords=:keywords
+             WHERE id=:id
+        """
+        params = {"id": vid, **data}
+
     with engine.begin() as conn:
-        conn.execute(
-            sql_text(
-                """
-                UPDATE vendors
-                   SET category=:category, service=:service, business_name=:business_name,
-                       contact_name=:contact_name, phone=:phone, address=:address,
-                       website=:website, notes=:notes, keywords=:keywords
-                 WHERE id=:id
-                """
-            ),
-            {"id": vid, **data},
-        )
+        conn.execute(sql_text(sql), params)
 
 
 def delete_vendor(vid: int) -> None:
