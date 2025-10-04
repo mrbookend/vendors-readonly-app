@@ -1,7 +1,7 @@
 # app_admin.py
 # Vendors Admin — streamlined:
-# - Wide layout via secrets (page_title, page_max_width_px, sidebar_state)
-# - DB: Turso/libSQL via sqlite+libsql://… with auth token; fallback to local SQLite vendors.db
+# - Wide layout via secrets (page_title, page_max_width_px=2300 default, sidebar_state)
+# - DB: Turso/libSQL via sqlite+libsql://… with auth token; guarded fallback to local SQLite vendors.db
 # - Browse Vendors: single global, case-insensitive, partial-word filter across all fields (non-FTS)
 # - Add / Edit / Delete Vendor:
 #       * Business Name REQUIRED
@@ -28,6 +28,7 @@ import pandas as pd
 import streamlit as st
 from sqlalchemy import create_engine, text as sql_text
 from sqlalchemy.engine import Engine
+from sqlalchemy.exc import NoSuchModuleError, SQLAlchemyError
 from urllib.parse import urlparse, parse_qsl, urlencode, urlunparse
 
 # =========================
@@ -43,7 +44,8 @@ def _read_secret_early(name: str, default=None):
     return os.environ.get(name, default)
 
 PAGE_TITLE = _read_secret_early("page_title", "Vendors Admin")
-PAGE_MAX_WIDTH_PX = int(_read_secret_early("page_max_width_px", 1200))
+# Default width 2300 (overrides previous 1200 default unless secret provided)
+PAGE_MAX_WIDTH_PX = int(_read_secret_early("page_max_width_px", 2300))
 SIDEBAR_STATE = _read_secret_early("sidebar_state", "expanded")
 
 st.set_page_config(page_title=PAGE_TITLE, layout="wide", initial_sidebar_state=SIDEBAR_STATE)
@@ -63,7 +65,7 @@ st.markdown(
 )
 
 # =========================
-# DB Engine: libSQL -> SQLite fallback
+# DB Engine: libSQL -> SQLite guarded fallback
 # =========================
 
 def _normalize_turso_sqlalchemy_url(raw: str) -> str:
@@ -86,28 +88,35 @@ def _normalize_turso_sqlalchemy_url(raw: str) -> str:
     return urlunparse((parsed.scheme, parsed.netloc, parsed.path, parsed.params, new_query, parsed.fragment))
 
 def build_engine() -> Tuple[Engine, Dict[str, str]]:
+    """
+    Try Turso/libSQL first. If the dialect is missing or URL/auth are bad,
+    warn and fall back to local SQLite vendors.db so the app stays up.
+    """
     turso_url = _read_secret_early("TURSO_DATABASE_URL", "") or ""
     turso_token = _read_secret_early("TURSO_AUTH_TOKEN", "") or ""
 
     if turso_url and turso_token:
         sqlalchemy_url = _normalize_turso_sqlalchemy_url(turso_url)
-        engine = create_engine(
-            sqlalchemy_url,
-            connect_args={"auth_token": turso_token},
-            pool_pre_ping=True,
-        )
-        return engine, {
-            "using_remote": True,
-            "sqlalchemy_url": sqlalchemy_url,
-            "dialect": "sqlite",
-            "driver": "libsql",
-        }
+        try:
+            eng = create_engine(
+                sqlalchemy_url,
+                connect_args={"auth_token": turso_token},
+                pool_pre_ping=True,
+            )
+            return eng, {
+                "using_remote": True,
+                "sqlalchemy_url": sqlalchemy_url,
+                "dialect": "sqlite",
+                "driver": "libsql",
+            }
+        except (NoSuchModuleError, ValueError, SQLAlchemyError) as e:
+            st.warning(f"Turso/libSQL unavailable ({type(e).__name__}); falling back to local vendors.db.")
 
-    # Fallback to local SQLite vendors.db
+    # Local fallback
     sqlite_path = os.path.join(os.path.dirname(__file__), "vendors.db")
     sqlalchemy_url = f"sqlite:///{sqlite_path}"
-    engine = create_engine(sqlalchemy_url)
-    return engine, {
+    eng = create_engine(sqlalchemy_url)
+    return eng, {
         "using_remote": False,
         "sqlalchemy_url": sqlalchemy_url,
         "dialect": "sqlite",
