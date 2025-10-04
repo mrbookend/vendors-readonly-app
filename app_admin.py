@@ -480,22 +480,27 @@ def _aggrid_view(df_show: pd.DataFrame, website_label: str = "website"):
                 cellStyle={"whiteSpace": "nowrap", "textOverflow": "ellipsis", "overflow": "hidden"}
             )
 
-        # Clickable "Website" WITHOUT HTML/DOM renderers: show hostname; style like a link.
+    # Clickable "Website" WITHOUT HTML/DOM renderers: show hostname; style like a link.
     if website_key and url_col:
         label_formatter = JsCode(f"""
-            function(params){{
+            function(params){
                 const url = (params.data && params.data["{url_col}"]) || "";
                 if (!url) return "";
-                try {{
+                try {
                     const u = new URL(url);
                     return u.hostname;   // e.g., example.com
-                }} catch(e) {{
+                } catch(e) {
                     return "Website";
-                }}
-            }}
+                }
+            }
         """)
-             gob.configure_column(
+        gob.configure_column(
             website_key,
+            valueFormatter=label_formatter,
+            tooltipField=url_col,  # hover shows full URL
+            cellStyle={"textDecoration": "underline", "cursor": "pointer"}  # make it look like a link
+        )
+
             valueFormatter=label_formatter,
             tooltipField=url_col,  # hover shows full URL
             cellStyle={"textDecoration": "underline", "cursor": "pointer"}  # make it look like a link
