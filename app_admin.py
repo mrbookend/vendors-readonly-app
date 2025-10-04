@@ -1,14 +1,10 @@
-# app_admin.py — Vendors Admin (v3.6.7)
+# app_admin.py — Vendors Admin (v3.6.8)
 # View | Add | Edit | Delete | Categories Admin | Services Admin | Maintenance | Changelog
 # - AgGrid optional: wrap/auto-height for ALL columns EXCEPT notes & keywords (fixed height)
-# - Website column: renderer now returns an HTML STRING (no raw DOM nodes) → fixes React error #31
-# - Copy UX: range selection + cell text selection; “Copy” button column (TSV)
+# - Website column: shows hostname, looks like a link, opens on click (no DOM/HTML renderers; avoids React #31)
+# - Copy UX: keyboard selection + context menu (“Copy”, “Copy with headers”, “Copy row (TSV)”)
 # - Fallback uses st.table; CSS: wrap everywhere except notes/keywords; fixed widths
 # - Validators, audit trail, schema guardrails; CSV + Debug under the table in View
-# - v3.6.3: fixed pandas read_sql_query usage in Maintenance
-# - v3.6.5: hardened hyperlink + copy in AgGrid
-# - v3.6.6: fixed Python list insert & CSS typo
-# - v3.6.7: Website cellRenderer returns HTML string (no DOM), preventing React invariant #31
 
 from __future__ import annotations
 
@@ -479,8 +475,8 @@ def _aggrid_view(df_show: pd.DataFrame, website_label: str = "website"):
                 autoHeight=False,
                 cellStyle={"whiteSpace": "nowrap", "textOverflow": "ellipsis", "overflow": "hidden"}
             )
-            
-    # Clickable "Website" WITHOUT HTML/DOM renderers: show hostname; style like a link.
+
+    # Website column — show hostname label; make it look like a link; no HTML/DOM renderers
     if website_key and url_col:
         label_formatter = JsCode(f"""
             function(params){{
@@ -498,14 +494,8 @@ def _aggrid_view(df_show: pd.DataFrame, website_label: str = "website"):
             website_key,
             valueFormatter=label_formatter,
             tooltipField=url_col,  # hover shows full URL
-            cellStyle={{"textDecoration": "underline", "cursor": "pointer"}}  # make it look like a link
-        )
-
-            valueFormatter=label_formatter,
-            tooltipField=url_col,  # hover shows full URL
             cellStyle={"textDecoration": "underline", "cursor": "pointer"}  # make it look like a link
         )
-
 
     grid_options = gob.build()
     grid_options["floatingFilter"] = False
@@ -521,37 +511,22 @@ def _aggrid_view(df_show: pd.DataFrame, website_label: str = "website"):
     grid_options["suppressRowClickSelection"] = False
     grid_options["suppressCopyRowsToClipboard"] = False
     grid_options["clipboardDelimiter"] = "\t"
-        # Open URL on click for the Website column
-    grid_options["onCellClicked"] = JsCode(f"""
-        function(event){{
-            if (event.colDef && event.colDef.field === "{website_key}") {{
-                const url = (event.data && event.data["{url_col}"]) || "";
-                if (url) {{
-                    window.open(url, "_blank", "noopener,noreferrer");
-                }}
-            }}
-        }}
-    """)
-
     grid_options["copyHeadersToClipboard"] = False
 
-    
-
-    # Context menu items incl. Copy row (TSV)
-
     # Open URL on click for the Website column
-    grid_options["onCellClicked"] = JsCode(f"""
-        function(event){{
-            if (event.colDef && event.colDef.field === "{website_key}") {{
-                const url = (event.data && event.data["{url_col}"]) || "";
-                if (url) {{
-                    window.open(url, "_blank", "noopener,noreferrer");
+    if website_key and url_col:
+        grid_options["onCellClicked"] = JsCode(f"""
+            function(event){{
+                if (event.colDef && event.colDef.field === "{website_key}") {{
+                    const url = (event.data && event.data["{url_col}"]) || "";
+                    if (url) {{
+                        window.open(url, "_blank", "noopener,noreferrer");
+                    }}
                 }}
             }}
-        }}
-    """)
+        """)
 
-    
+    # Context menu items incl. Copy row (TSV)
     grid_options["getContextMenuItems"] = JsCode("""
         function(params) {
           const res = ['copy', 'copyWithHeaders', 'paste'];
@@ -582,7 +557,6 @@ def _aggrid_view(df_show: pd.DataFrame, website_label: str = "website"):
           return res;
         }
     """)
-
 
     AgGrid(
         _df,
@@ -903,7 +877,7 @@ def tab_changelog():
             field = r.get("field") or "field"
             oldv = r.get("old_value") or ""
             newv = r.get("new_value") or ""
-            arrow = f"`{oldv}` → `{newv}`" if oldv or newv else ""
+            _ = f"`{oldv}` → `{newv}`"  # arrow kept out of bullet
             lines.append(f"{when} — Updated **{field}** for **{name}** (by {by})")
         else:
             lines.append(f"{when} — Change on **{name}** (by {by})")
