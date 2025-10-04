@@ -72,28 +72,70 @@ st.markdown(
 # =========================
 # DB Engine: libSQL -> SQLite fallback
 # =========================
+# --- replace your existing build_engine() with this normalized version ---
+
+from urllib.parse import urlparse, parse_qsl, urlencode, urlunparse
+
+def _normalize_turso_sqlalchemy_url(raw: str) -> str:
+    """
+    Accepts any of:
+      - 'libsql://host' (Turso style)
+      - 'sqlite+libsql://host' (SQLAlchemy style)
+      - with/without '?secure=true'
+    Returns a clean 'sqlite+libsql://host?...' with secure=true exactly once.
+    """
+    if not raw:
+        return ""
+
+    # If someone passed a bare host, add scheme
+    if "://" not in raw:
+        raw = "libsql://" + raw
+
+    # Force SQLAlchemy scheme
+    raw = raw.replace("libsql://", "sqlite+libsql://", 1)
+
+    parsed = urlparse(raw)
+    q = dict(parse_qsl(parsed.query, keep_blank_values=True))
+
+    # Normalize secure flag to 'true' (lowercase string) exactly once
+    q["secure"] = "true"
+
+    # Rebuild URL with normalized query params
+    new_query = urlencode(q, doseq=True)
+    normalized = urlunparse((parsed.scheme, parsed.netloc, parsed.path, parsed.params, new_query, parsed.fragment))
+    return normalized
 
 def build_engine() -> Tuple[Engine, Dict[str, str]]:
-    # Prefer libSQL (Turso) if secrets present; else local SQLite
-    turso_url = _read_secret_early("TURSO_DATABASE_URL", "")
-    turso_token = _read_secret_early("TURSO_AUTH_TOKEN", "")
+    turso_url = _read_secret_early("TURSO_DATABASE_URL", "") or ""
+    turso_token = _read_secret_early("TURSO_AUTH_TOKEN", "") or ""
+
     if turso_url and turso_token:
-        # SQLAlchemy URL for libsql dialect
-        sqlalchemy_url = f"sqlite+libsql://{turso_url.split('://')[-1]}?secure=true"
+        sqlalchemy_url = _normalize_turso_sqlalchemy_url(turso_url)
+
+        # Important: do NOT also pass 'secure' here; it's already in the URL.
+        # Only pass the auth token via connect_args.
         engine = create_engine(
             sqlalchemy_url,
             connect_args={"auth_token": turso_token},
             pool_pre_ping=True,
         )
-        return engine, {"using_remote": True, "sqlalchemy_url": sqlalchemy_url, "dialect": "sqlite", "driver": "libsql"}
+        return engine, {
+            "using_remote": True,
+            "sqlalchemy_url": sqlalchemy_url,
+            "dialect": "sqlite",
+            "driver": "libsql",
+        }
 
     # Fallback to local SQLite vendors.db
     sqlite_path = os.path.join(os.path.dirname(__file__), "vendors.db")
     sqlalchemy_url = f"sqlite:///{sqlite_path}"
     engine = create_engine(sqlalchemy_url)
-    return engine, {"using_remote": False, "sqlalchemy_url": sqlalchemy_url, "dialect": "sqlite", "driver": "sqlite"}
-
-engine, engine_info = build_engine()
+    return engine, {
+        "using_remote": False,
+        "sqlalchemy_url": sqlalchemy_url,
+        "dialect": "sqlite",
+        "driver": "sqlite",
+    }
 
 # =========================
 # Schema helpers
