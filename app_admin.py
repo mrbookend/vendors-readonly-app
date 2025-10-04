@@ -1,11 +1,12 @@
-# app_admin.py — Vendors Admin (v3.6.4)
+# app_admin.py — Vendors Admin (v3.6.5)
 # View | Add | Edit | Delete | Categories Admin | Services Admin | Maintenance | Changelog
-# - AgGrid optional: long text wraps + auto-expands rows for ALL columns EXCEPT notes & keywords (fixed height)
-# - Fallback uses st.table; CSS enforces wrap for all except notes/keywords + fixed widths
-# - AgGrid: clickable Website link; range selection + context menu copy; proper copy via ensureDomOrder
-# - Validators, audit trail, schema guardrails; CSV + Debug placed under the table in View
+# - AgGrid optional: wrap/auto-height for ALL columns EXCEPT notes & keywords (fixed height)
+# - Website column: proper clickable link via DOM element, click propagation suppressed
+# - Copy UX: enable range selection + cell text selection; add "Copy" button column to copy full row (TSV)
+# - Fallback uses st.table; CSS: wrap everywhere except notes/keywords; fixed widths
+# - Validators, audit trail, schema guardrails; CSV + Debug under the table in View
 # - v3.6.3: fixed pandas read_sql_query usage in Maintenance
-# - v3.6.4: wrap policy + link render + copy UX hardened
+# - v3.6.5: hardened hyperlink + copy behavior in AgGrid
 
 from __future__ import annotations
 
@@ -189,7 +190,7 @@ _ensure_schema()
 # CSS for table-based fallback (and some shared rules)
 # -----------------------------
 def _apply_css_for_table(field_order: List[str]):
-    """CSS that affects st.table AND legacy st.dataframe; enforces wrap everywhere EXCEPT notes/keywords."""
+    """CSS that affects st.table AND legacy st.dataframe; wrap everywhere EXCEPT notes/keywords."""
     tbl_sel = "div[data-testid='stTable'] table"
     df_sel  = "div[data-testid='stDataFrame'] table"
     base = f"""
@@ -214,7 +215,7 @@ def _apply_css_for_table(field_order: List[str]):
         }}
         """)
 
-    # Turn OFF wrapping for notes & keywords (they remain one-line; no auto row-height growth)
+    # Turn OFF wrapping for notes & keywords
     def _nth_for(colname: str) -> Optional[int]:
         try:
             return field_order.index(colname) + 1
@@ -222,10 +223,7 @@ def _apply_css_for_table(field_order: List[str]):
             return None
 
     for colname in ["notes", "keywords"]:
-        nth = _nth_for(LABEL_OVERRIDES.get(colname, colname))
-        if nth is None:
-            # Try raw name if labels changed order
-            nth = _nth_for(colname)
+        nth = _nth_for(LABEL_OVERRIDES.get(colname, colname)) or _nth_for(colname)
         if nth:
             rules.append(f"""
             {tbl_sel} thead tr th:nth-child({nth}), {tbl_sel} tbody tr td:nth-child({nth}),
@@ -245,7 +243,7 @@ def _apply_css_for_table(field_order: List[str]):
             background: var(--background-color, white);
             box-shadow: 1px 0 0 rgba(0,0,0,0.06);
         }}
-        {tbl_sel} thead tr th:nth-child(1), {df_sel} thead tr th:nth-child(1) {{ z-index: 3; }}
+        {tbl_sel} thehead tr th:nth-child(1), {df_sel} thead tr th:nth-child(1) {{ z-index: 3; }}
         """
 
     st.markdown("<style>" + "\n".join(rules) + sticky + "</style>", unsafe_allow_html=True)
@@ -435,7 +433,6 @@ def _aggrid_view(df_show: pd.DataFrame, website_label: str = "website"):
         st.info("No rows to display.")
         return
 
-    # Map display labels
     website_key = website_label if website_label in df_show.columns else next((c for c in df_show.columns if c.lower()=="website"), None)
 
     _df = df_show.copy()
@@ -468,11 +465,10 @@ def _aggrid_view(df_show: pd.DataFrame, website_label: str = "website"):
         if px:
             gob.configure_column(col, width=px)
 
-    # Turn OFF wrapping/autoHeight for notes & keywords only
+    # Turn OFF wrap/autoHeight for notes & keywords only
     for col in _df.columns:
         low = col.lower()
         raw_match = low in {"notes","keywords"}
-        # also match if user renamed these columns
         renamed_match = any((k in {"notes","keywords"}) and (LABEL_OVERRIDES.get(k, k) == col) for k in ["notes","keywords"])
         if raw_match or renamed_match:
             gob.configure_column(
@@ -482,38 +478,43 @@ def _aggrid_view(df_show: pd.DataFrame, website_label: str = "website"):
                 cellStyle={"whiteSpace": "nowrap", "textOverflow": "ellipsis", "overflow": "hidden"}
             )
 
-    # Clickable "Website" cell that shows the label 'Website' and opens normalized URL
+    # Clickable "Website" — return a DOM element, stop propagation so grid doesn't swallow it
     if website_key and url_col:
         link_renderer = JsCode(f"""
             function(params) {{
                 const url = params.data && params.data["{url_col}"] ? params.data["{url_col}"] : "";
                 if (!url) return "";
-                // Render clickable text, not raw HTML literal
-                return `<a href="${{url}}" target="_blank" rel="noopener noreferrer">Website</a>`;
+                const a = document.createElement('a');
+                a.href = url;
+                a.target = '_blank';
+                a.rel = 'noopener noreferrer';
+                a.innerText = 'Website';
+                a.addEventListener('click', function(e) {{ e.stopPropagation(); }});
+                return a;
             }}
         """)
         gob.configure_column(website_key, cellRenderer=link_renderer)
 
-    # Improve copy behavior
     grid_options = gob.build()
     grid_options["floatingFilter"] = False
     grid_options["suppressMenuHide"] = True
     grid_options["domLayout"] = "normal"
+
+    # Improve copy behavior
     grid_options["ensureDomOrder"] = True
     grid_options["enableRangeSelection"] = True
+    grid_options["enableCellTextSelection"] = True
+    grid_options["rowSelection"] = "multiple"
+    grid_options["rowMultiSelectWithClick"] = True
+    grid_options["suppressRowClickSelection"] = False
     grid_options["suppressCopyRowsToClipboard"] = False
     grid_options["clipboardDelimiter"] = "\t"
-    grid_options["rowSelection"] = "multiple"
-    grid_options["suppressRowClickSelection"] = False
+    grid_options["copyHeadersToClipboard"] = False
 
-    # Context menu: add "Copy row (TSV)"
+    # Context menu items incl. Copy row (TSV)
     grid_options["getContextMenuItems"] = JsCode("""
         function(params) {
-          const res = [
-            'copy',
-            'copyWithHeaders',
-            'paste'
-          ];
+          const res = ['copy', 'copyWithHeaders', 'paste'];
           const node = params.node;
           if (node && node.data) {
             res.push({
@@ -522,8 +523,9 @@ def _aggrid_view(df_show: pd.DataFrame, website_label: str = "website"):
                 const vals = [];
                 const cols = params.columnApi.getAllDisplayedColumns();
                 cols.forEach(c => {
-                  const k = c.getColId();
-                  const v = node.data[k] != null ? String(node.data[k]) : '';
+                  const id = c.getColId();
+                  if (id === '__copy__') return;
+                  const v = node.data[id] != null ? String(node.data[id]) : '';
                   vals.push(v);
                 });
                 const txt = vals.join('\\t');
@@ -540,6 +542,47 @@ def _aggrid_view(df_show: pd.DataFrame, website_label: str = "website"):
           return res;
         }
     """)
+
+    # Add a small "Copy" button column to copy the full displayed row (works even if keyboard copy is blocked)
+    if "columnDefs" in grid_options and isinstance(grid_options["columnDefs"], list):
+        copy_col = {
+            "headerName": "Copy",
+            "field": "__copy__",
+            "width": 70,
+            "pinned": "left" if STICKY_FIRST else None,
+            "suppressMenu": True,
+            "sortable": False,
+            "filter": False,
+            "cellRenderer": JsCode("""
+                function(params) {
+                    const btn = document.createElement('button');
+                    btn.textContent = 'Copy';
+                    btn.style.cursor = 'pointer';
+                    btn.addEventListener('click', function(e) {
+                        e.stopPropagation();
+                        const data = params.node.data || {};
+                        const cols = params.columnApi.getAllDisplayedColumns();
+                        const vals = [];
+                        cols.forEach(c => {
+                            const id = c.getColId();
+                            if (id === '__copy__') return;
+                            const v = data[id] != null ? String(data[id]) : '';
+                            vals.push(v);
+                        });
+                        const txt = vals.join('\\t');
+                        if (navigator && navigator.clipboard && navigator.clipboard.writeText) {
+                          navigator.clipboard.writeText(txt);
+                        } else {
+                          const ta = document.createElement('textarea');
+                          ta.value = txt; document.body.appendChild(ta);
+                          ta.select(); document.execCommand('copy'); document.body.removeChild(ta);
+                        }
+                    });
+                    return btn;
+                }
+            """)
+        }
+        grid_options["columnDefs"].splice(0, 0, copy_col)
 
     AgGrid(
         _df,
@@ -566,7 +609,6 @@ def tab_view(query: str):
         _aggrid_view(df_show, website_label=LABEL_OVERRIDES.get("website", "website"))
     else:
         st.warning("`streamlit-aggrid` not installed — basic table fallback. Links will not be clickable.")
-        # Apply CSS to wrap all except notes/keywords + widths
         _apply_css_for_table(df_show.columns.tolist())
         df_sorted = df_show.sort_values(
             by=["business_name","category","id"],
@@ -862,7 +904,7 @@ def tab_changelog():
             oldv = r.get("old_value") or ""
             newv = r.get("new_value") or ""
             arrow = f"`{oldv}` → `{newv}`" if oldv or newv else ""
-            lines.append(f"{when} — Updated **{field}** for **{name}** (by {by}) {arrow}")
+            lines.append(f"{when} — Updated **{field}** for **{name}** (by {by})")
         else:
             lines.append(f"{when} — Change on **{name}** (by {by})")
     if not lines:
