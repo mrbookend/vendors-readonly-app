@@ -27,7 +27,7 @@ from sqlalchemy.exc import NoSuchModuleError, SQLAlchemyError
 from urllib.parse import urlparse, parse_qsl, urlencode, urlunparse
 
 # (AG Grid not used on Browse anymore)
-# from st_aggrid import AgGrid, GridOptionsBuilder, GridUpdateMode
+from st_aggrid import AgGrid, GridOptionsBuilder, GridUpdateMode, JsCode
 
 
 # --- URL sanitizer for display-only ---
