@@ -596,7 +596,8 @@ def tab_debug():
 # -----------------------------
 
 def main():
-        tabs = st.tabs([
+    # Title intentionally removed per user request
+    tabs = st.tabs([
         "Browse",
         "Add",
         "Edit",
@@ -620,7 +621,6 @@ def main():
         tab_maintenance()
     with tabs[6]:
         tab_debug()
-
 
 if __name__ == "__main__":
     main()
