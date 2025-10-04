@@ -1,26 +1,27 @@
 # app_admin.py
-# Vendors Admin — stable Streamlit CRUD (no AG Grid), Turso (libSQL) first, SQLite fallback.
+# Vendors Admin — no sidebar; top-of-page navigation for max width.
+# Stable Streamlit CRUD (no AG Grid), Turso (libSQL) first, SQLite fallback.
 # Features:
+# - Top navigation tabs: Browse | Add | Edit | Delete | Admin | Debug
 # - Browse with global (non-FTS) filter across all text fields
-# - Add / Edit / Delete Vendors with validation
-# - Categories & Services Admin (add/delete when unused, reassign vendors on delete)
-# - "Repair services table" button (ensures minimal expected schema)
-# - Immediate refresh after writes (st.rerun())
+# - Add / Edit / Delete Vendors with validation and immediate refresh
+# - Categories & Services Admin (add, reassign, delete-when-unused)
+# - "Repair services table" safety button
 # - Phone normalization: (XXX) XXX-XXXX or blank
 # - URL normalization: ensure https:// scheme
-# - Optional keywords support if vendors.keywords exists
+# - Optional 'keywords' column support if present in vendors
 #
-# Expected DB schema (text-based linking):
+# Expected DB schema (text linking):
 # vendors(id INTEGER PK, category TEXT, service TEXT, business_name TEXT, contact_name TEXT,
-#         phone TEXT, address TEXT, website TEXT, notes TEXT, keywords TEXT [optional])
+#         phone TEXT, address TEXT, website TEXT, notes TEXT, [keywords TEXT optional])
 # categories(id INTEGER PK, name TEXT UNIQUE)
 # services(id INTEGER PK, name TEXT UNIQUE)
 #
 # Secrets (Streamlit):
-#   TURSO_DATABASE_URL: "sqlite+libsql://<your-db-host>?secure=true"
-#   TURSO_AUTH_TOKEN: "<jwt token from Turso>"
+#   TURSO_DATABASE_URL: "sqlite+libsql://<host>?secure=true"
+#   TURSO_AUTH_TOKEN: "<jwt>"
 # Optional layout secrets:
-#   page_title, page_max_width_px, sidebar_state
+#   page_title, page_max_width_px
 
 from __future__ import annotations
 
@@ -34,7 +35,7 @@ from sqlalchemy import create_engine, text as sql_text
 from sqlalchemy.engine import Engine
 
 # -----------------------------
-# Page layout (do this first)
+# Page layout (no sidebar)
 # -----------------------------
 def _read_secret(name: str, default=None):
     try:
@@ -51,8 +52,12 @@ def _apply_page_width_css(max_width_px: Optional[int]):
         f"""
         <style>
           .block-container {{
-              max-width: {int(max_width_px)}px;
+            max-width: {int(max_width_px)}px;
           }}
+          /* Hide the left hamburger/expander space to focus on main content */
+          [data-testid="stSidebar"] {{ display: none; }}
+          /* Reduce top padding slightly for a tighter header */
+          .block-container > div:first-child {{ padding-top: 0.5rem; }}
         </style>
         """,
         unsafe_allow_html=True,
@@ -60,18 +65,20 @@ def _apply_page_width_css(max_width_px: Optional[int]):
 
 PAGE_TITLE = _read_secret("page_title", "Vendors Admin")
 PAGE_MAX_WIDTH = _read_secret("page_max_width_px", 1400)
-SIDEBAR_STATE = _read_secret("sidebar_state", "expanded")
 
-st.set_page_config(page_title=PAGE_TITLE, layout="wide", initial_sidebar_state=SIDEBAR_STATE)
+# No sidebar; set layout wide
+st.set_page_config(page_title=PAGE_TITLE, layout="wide")
 _apply_page_width_css(PAGE_MAX_WIDTH)
 
 st.title(PAGE_TITLE)
+
+# Optional “full width mode” helper for df rendering height
+full_width_mode = st.checkbox("Full-width mode (taller table display)", value=True)
 
 # -----------------------------
 # Engine / DB helpers
 # -----------------------------
 def build_engine() -> Tuple[Engine, Dict[str, str]]:
-    # Try Turso/libSQL first
     turso_url = _read_secret("TURSO_DATABASE_URL")
     turso_token = _read_secret("TURSO_AUTH_TOKEN")
     debug = {}
@@ -93,7 +100,6 @@ def build_engine() -> Tuple[Engine, Dict[str, str]]:
         except Exception as e:
             debug["remote_error"] = str(e)
 
-    # Fallback to local SQLite vendors.db (mounted in container/repo root)
     local_path = os.path.abspath(os.path.join(os.getcwd(), "vendors.db"))
     engine = create_engine(f"sqlite:///{local_path}", future=True)
     debug["engine_url"] = f"sqlite:///{local_path}"
@@ -113,7 +119,7 @@ def table_exists(table: str) -> bool:
     return res is not None
 
 def ensure_min_schema():
-    """Create minimal tables if missing. Do not drop/alter existing user data."""
+    """Create minimal tables if missing. Never drops/alter existing user data."""
     with engine.begin() as conn:
         if not table_exists("categories"):
             conn.execute(sql_text("""
@@ -143,27 +149,23 @@ def ensure_min_schema():
                     notes TEXT
                 )
             """))
-        # If keywords column needed, leave to admin to add; we detect it dynamically.
 
 ensure_min_schema()
 
 def get_columns(table: str) -> List[str]:
     with engine.connect() as conn:
         rows = conn.execute(sql_text(f"PRAGMA table_info({table})")).fetchall()
-    return [r[1] for r in rows]  # name is 2nd column in pragma
+    return [r[1] for r in rows]  # name is 2nd field
 
 def has_column(table: str, col: str) -> bool:
     return col in get_columns(table)
 
 def read_df(table: str) -> pd.DataFrame:
     with engine.connect() as conn:
-        df = pd.read_sql(sql_text(f"SELECT * FROM {table}"), conn)
-    return df
+        return pd.read_sql(sql_text(f"SELECT * FROM {table}"), conn)
 
-def write_df(df: pd.DataFrame, table: str, if_exists: str = "append"):
-    # Not used for row-by-row writes; we use SQL for atomicity
-    with engine.begin() as conn:
-        df.to_sql(table, conn, if_exists=if_exists, index=False)
+def nonempty_trim(s: Optional[str]) -> str:
+    return (s or "").strip()
 
 # -----------------------------
 # Normalization / Validation
@@ -184,11 +186,7 @@ def normalize_url(url: str) -> str:
     u = url.strip()
     if u.startswith("http://") or u.startswith("https://"):
         return u
-    # Accept bare domains
     return f"https://{u}"
-
-def nonempty_trim(s: Optional[str]) -> str:
-    return (s or "").strip()
 
 # -----------------------------
 # Data access helpers (CRUD)
@@ -198,8 +196,7 @@ def list_categories() -> List[str]:
         return []
     df = read_df("categories")
     if "name" in df.columns:
-        vals = sorted({nonempty_trim(x) for x in df["name"].astype(str).tolist() if nonempty_trim(x)})
-        return vals
+        return sorted({nonempty_trim(x) for x in df["name"].astype(str) if nonempty_trim(x)})
     return []
 
 def list_services() -> List[str]:
@@ -207,22 +204,20 @@ def list_services() -> List[str]:
         return []
     df = read_df("services")
     if "name" in df.columns:
-        vals = sorted({nonempty_trim(x) for x in df["name"].astype(str).tolist() if nonempty_trim(x)})
-        return vals
+        return sorted({nonempty_trim(x) for x in df["name"].astype(str) if nonempty_trim(x)})
     return []
 
 def vendors_df() -> pd.DataFrame:
     if not table_exists("vendors"):
         return pd.DataFrame(columns=["id","category","service","business_name","contact_name","phone","address","website","notes"])
     df = read_df("vendors")
-    # Ensure consistent column presence
+
     base_cols = ["id","category","service","business_name","contact_name","phone","address","website","notes"]
     for c in base_cols:
         if c not in df.columns:
             df[c] = ""
-    # Keep optional keywords if present
     cols = df.columns.tolist()
-    order = base_cols + ([c for c in cols if c not in base_cols] if cols else [])
+    order = base_cols + [c for c in cols if c not in base_cols]  # preserve optional columns (e.g., keywords)
     return df[order]
 
 def add_vendor(row: Dict[str, str]) -> int:
@@ -258,7 +253,6 @@ def add_category(name: str) -> None:
         conn.execute(sql_text("INSERT OR IGNORE INTO categories(name) VALUES(:n)"), {"n": name})
 
 def delete_category(name: str) -> None:
-    # Only if unused OR you reassign first (handled in UI)
     with engine.begin() as conn:
         conn.execute(sql_text("DELETE FROM categories WHERE name=:n"), {"n": name})
 
@@ -291,39 +285,31 @@ def usage_counts(col: str, val: str) -> int:
         """), {"v": val}).fetchone()
     return int(res[0]) if res else 0
 
-# -----------------------------
-# Repair button
-# -----------------------------
 def repair_services_table():
     """Ensure 'services' has minimal expected schema; add UNIQUE index if missing."""
     with engine.begin() as conn:
-        # Create if missing
         conn.execute(sql_text("""
             CREATE TABLE IF NOT EXISTS services(
                 id INTEGER PRIMARY KEY,
                 name TEXT UNIQUE
             )
         """))
-        # Try to add unique index (ignore if exists)
         try:
             conn.execute(sql_text("CREATE UNIQUE INDEX IF NOT EXISTS idx_services_name ON services(name)"))
         except Exception:
             pass
 
 # -----------------------------
-# Sidebar Nav
+# Top Navigation (no sidebar)
 # -----------------------------
-st.sidebar.header("Navigation")
-nav = st.sidebar.radio(
-    "Go to",
-    ["Browse", "Add Vendor", "Edit Vendor", "Delete Vendor", "Categories & Services Admin", "Database Status & Schema (debug)"],
-    index=0,
+tab_browse, tab_add, tab_edit, tab_delete, tab_admin, tab_debug = st.tabs(
+    ["Browse", "Add Vendor", "Edit Vendor", "Delete Vendor", "Categories & Services Admin", "Database Status & Schema (debug)"]
 )
 
 # -----------------------------
 # Browse
 # -----------------------------
-if nav == "Browse":
+with tab_browse:
     st.subheader("Browse Vendors")
 
     df = vendors_df()
@@ -340,21 +326,23 @@ if nav == "Browse":
     else:
         df_view = df.copy()
 
-    # Show selected columns in a logical order
     show_cols = [c for c in ["id","category","service","business_name","contact_name","phone","address","website","notes","keywords"] if c in df_view.columns]
-    st.dataframe(df_view[show_cols], use_container_width=True, hide_index=True)
+
+    # Adjust height if full-width mode is on (taller table)
+    height = 700 if full_width_mode else 430
+    st.dataframe(df_view[show_cols], use_container_width=True, height=height, hide_index=True)
 
 # -----------------------------
 # Add Vendor
 # -----------------------------
-elif nav == "Add Vendor":
+with tab_add:
     st.subheader("Add Vendor")
     cats = list_categories()
     svcs = list_services()
 
     with st.form("add_vendor_form", clear_on_submit=False):
         category = st.selectbox("Category (required)", options=cats, index=0 if cats else None, placeholder="Select category")
-        service  = st.selectbox("Service (optional; may be blank if you allow)", options=[""] + svcs, index=0)
+        service  = st.selectbox("Service (optional; may be blank)", options=[""] + svcs, index=0)
         business_name = st.text_input("Business Name (required)")
         contact_name = st.text_input("Contact Name")
         phone = st.text_input("Phone — stored as (XXX) XXX-XXXX or left blank")
@@ -370,16 +358,13 @@ elif nav == "Add Vendor":
     if submitted:
         try:
             if not business_name.strip():
-                st.error("Business Name is required.")
-                st.stop()
+                st.error("Business Name is required."); st.stop()
             if not category:
-                st.error("Category is required.")
-                st.stop()
+                st.error("Category is required."); st.stop()
 
             phone_norm = normalize_phone(phone.strip()) if phone.strip() else ""
             url_norm = normalize_url(website.strip()) if website.strip() else ""
 
-            # Accept keywords with comma or space separation; store as comma-separated
             if has_column("vendors", "keywords"):
                 raw = kw_val.strip()
                 if raw:
@@ -412,14 +397,13 @@ elif nav == "Add Vendor":
 # -----------------------------
 # Edit Vendor
 # -----------------------------
-elif nav == "Edit Vendor":
+with tab_edit:
     st.subheader("Edit Vendor")
 
     df = vendors_df()
     if df.empty:
         st.info("No vendors yet.")
     else:
-        # Sort selection by Business Name ascending
         df_sel = df.copy()
         df_sel["bn_norm"] = df_sel["business_name"].astype(str).str.lower()
         df_sel = df_sel.sort_values(["bn_norm","id"])
@@ -427,7 +411,6 @@ elif nav == "Edit Vendor":
 
         sel = st.selectbox("Select vendor (Business Name ascending)", options=choices)
         if sel:
-            # Parse id
             vid = int(sel.split("—")[0].strip().lstrip("#").strip())
             row = df[df["id"] == vid].iloc[0].to_dict()
 
@@ -452,11 +435,9 @@ elif nav == "Edit Vendor":
             if save:
                 try:
                     if not business_name.strip():
-                        st.error("Business Name is required.")
-                        st.stop()
+                        st.error("Business Name is required."); st.stop()
                     if not category:
-                        st.error("Category is required.")
-                        st.stop()
+                        st.error("Category is required."); st.stop()
 
                     phone_norm = normalize_phone(phone.strip()) if phone.strip() else ""
                     url_norm = normalize_url(website.strip()) if website.strip() else ""
@@ -488,7 +469,7 @@ elif nav == "Edit Vendor":
 # -----------------------------
 # Delete Vendor
 # -----------------------------
-elif nav == "Delete Vendor":
+with tab_delete:
     st.subheader("Delete Vendor")
 
     df = vendors_df()
@@ -520,11 +501,10 @@ elif nav == "Delete Vendor":
 # -----------------------------
 # Categories & Services Admin
 # -----------------------------
-elif nav == "Categories & Services Admin":
+with tab_admin:
     st.subheader("Categories & Services Admin")
-
-    st.caption("Tips: You can reassign all vendors from one value to another, then delete the now-unused value. "
-               "Category is required on vendors; Service is optional (if you allow blank).")
+    st.caption("Tips: Reassign vendors from one value to another, then delete the unused value. "
+               "Category is required; Service may be blank if you allow it.")
 
     tab_cat, tab_svc, tab_repair = st.tabs(["Categories", "Services", "Repair/Utilities"])
 
@@ -633,12 +613,12 @@ elif nav == "Categories & Services Admin":
                 st.success("Services table repaired/ensured.")
             except Exception as e:
                 st.exception(e)
-        st.caption("No destructive changes. It only creates the minimal schema if missing and ensures a unique index on `services.name`.")
+        st.caption("No destructive changes. It creates minimal schema if missing and ensures a unique index on `services.name`.")
 
 # -----------------------------
 # Debug
 # -----------------------------
-elif nav == "Database Status & Schema (debug)":
+with tab_debug:
     st.subheader("Database Status & Schema (debug)")
     st.json({
         "engine_url": engine_info.get("engine_url"),
@@ -656,6 +636,7 @@ elif nav == "Database Status & Schema (debug)":
     st.markdown("##### Sample rows (first 50)")
     if table_exists("vendors"):
         df = vendors_df().head(50)
-        st.dataframe(df, use_container_width=True, hide_index=True)
+        height = 500 if full_width_mode else 350
+        st.dataframe(df, use_container_width=True, height=height, hide_index=True)
     else:
         st.info("vendors table missing")
