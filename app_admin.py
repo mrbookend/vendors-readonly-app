@@ -515,7 +515,8 @@ def selectbox(label: str, options: List[str], key: str, index: Optional[int] = N
 # Tabs
 # =========================
 
-def tab_browse
+def tab_browse(db: Engine):
+
 
     # --- Build AgGrid options ---
     gob = GridOptionsBuilder.from_dataframe(df_disp)
@@ -557,17 +558,18 @@ def tab_browse
     if "address" in df_disp:       gob.configure_column("address", header_name=H("address"), width=addr_w)
     if "url" in df_disp:           gob.configure_column("url", header_name=H("url"), width=url_w)
 
-   # Clickable WEBSITE link column — return an HTML string (NOT a DOM node)
+# Clickable WEBSITE link column — return an HTML STRING (not a DOM node)
 from st_aggrid import JsCode
-link_renderer = JsCode(`
-    function(params) {
-        const raw = params.value || "";
-        if (!raw) { return ""; }
-        let url = String(raw).trim();
-        if (!/^https?:\\/\\//i.test(url)) { url = "https://" + url; }  // prefer https
-        return `<a href="${url}" target="_blank" rel="noopener noreferrer">Open</a>`;
-    }
-`)
+link_renderer = JsCode("""
+function(params) {
+  const raw = params.value || "";
+  if (!raw) { return ""; }
+  let url = String(raw).trim();
+  // Ensure scheme; prefer https
+  if (!/^https?:\\/\\//i.test(url)) { url = "https://" + url; }
+  return `<a href="${url}" target="_blank" rel="noopener noreferrer">Open</a>`;
+}
+""")
 if "WEBSITE" in df_disp:
     gob.configure_column(
         "WEBSITE",
