@@ -327,12 +327,12 @@ with tab_browse:
 
     df = vendors_df()
     text_cols = [c for c in df.columns if c != "id"]
-      st.caption("Global search across all fields (non-FTS, case-insensitive; matches partial words).")
+    st.caption("Global search across all fields (non-FTS, case-insensitive; matches partial words).")
     q = st.text_input(
         "Search",
         value="",
         placeholder="e.g., plumb returns any record with 'plumb' anywhere",
-        key="browse_search",  # << prevents DuplicateWidgetID
+        key="browse_search",  # prevent DuplicateWidgetID
     )
 
     if q.strip():
@@ -343,6 +343,7 @@ with tab_browse:
         df_view = df[mask].copy()
     else:
         df_view = df.copy()
+    
 
     # --- Linkified Website + separate full URL view using HTML (version-agnostic) ---
     import html
