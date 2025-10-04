@@ -1,19 +1,7 @@
-# app_readonly.py — Read‑Only Vendors (stability‑first v3.2)
-# 
-# Goals
-# - Preserve original look/feel and column order (zero surprise)
-# - Secrets control labels, widths, sticky first column, help text
-# - Fix Help crash (no nested expanders; Markdown rendering)
-# - Turso (libSQL) primary DB, local SQLite fallback
-# - Simple quick filter (client‑side contains across all string cols)
-# - Minimal CSS for wrapping/widths; no other visual drift
-# - Download CSV button; Status & Secrets (debug) pinned at END
-# - Website: clickable link (display text = "Website") only when URL is valid,
-#   and a full URL text column immediately to the right.
-#
-# Expected schema: vendors(id, category, service, business_name, contact_name, phone, address, website, notes, keywords)
-#
-# Version: 3.2 (2025‑10‑03)
+from layout_header import apply_layout
+apply_layout()
+# app_readonly.py — Vendors Directory (Read-only, Live DB via Turso or local fallback)
+return
 
 from __future__ import annotations
 
