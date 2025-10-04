@@ -376,7 +376,7 @@ def tab_add():
         }
         vid = add_vendor(data)
         st.success(f"Added vendor #{vid}: {business_name.strip()}")
-        st.experimental_rerun()
+        st.rerun()
 
 
 def tab_edit():
@@ -443,7 +443,7 @@ def tab_edit():
         }
         update_vendor(vid, data)
         st.success(f"Updated vendor #{vid}: {business_name.strip()}")
-        st.experimental_rerun()
+        st.rerun()
 
 
 def tab_delete():
@@ -462,7 +462,7 @@ def tab_delete():
     if st.button("Confirm Delete", type="primary"):
         delete_vendor(vid)
         st.success(f"Deleted vendor #{vid}")
-        st.experimental_rerun()
+        st.rerun()
 
 
 def tab_lib_admin():
@@ -481,7 +481,7 @@ def tab_lib_admin():
         if ok and new_c.strip():
             add_category(new_c)
             st.success(f"Added category '{new_c.strip()}'")
-            st.experimental_rerun()
+            st.rerun()
 
         if cats:
             with st.form("cat_rename"):
@@ -491,7 +491,7 @@ def tab_lib_admin():
             if ok2 and new.strip():
                 rename_category(old, new)
                 st.success(f"Renamed category '{old}' → '{new.strip()}' (vendors updated)")
-                st.experimental_rerun()
+                st.rerun()
 
         if cats:
             with st.form("cat_delete"):
@@ -506,7 +506,7 @@ def tab_lib_admin():
                 else:
                     delete_category(delc)
                     st.success(f"Deleted category '{delc}'")
-                    st.experimental_rerun()
+                    st.rerun()
 
     with colB:
         st.markdown("### Services")
@@ -519,7 +519,7 @@ def tab_lib_admin():
         if ok and new_s.strip():
             add_service(new_s)
             st.success(f"Added service '{new_s.strip()}'")
-            st.experimental_rerun()
+            st.rerun()
 
         if svcs:
             with st.form("svc_rename"):
@@ -529,7 +529,7 @@ def tab_lib_admin():
             if ok2 and new.strip():
                 rename_service(old, new)
                 st.success(f"Renamed service '{old}' → '{new.strip()}' (vendors updated)")
-                st.experimental_rerun()
+                st.rerun()
 
         if svcs:
             with st.form("svc_delete"):
@@ -539,7 +539,7 @@ def tab_lib_admin():
                 # Allow delete even if vendors reference it — vendors keep old text (optional policy).
                 delete_service(dels)
                 st.success(f"Deleted service '{dels}'")
-                st.experimental_rerun()
+                st.rerun()
 
 
 def tab_maintenance():
@@ -548,7 +548,7 @@ def tab_maintenance():
     if st.button("Repair services table (ensure schema id,name)"):
         msg = repair_services_table()
         st.success(msg)
-        st.experimental_rerun()
+        st.rerun()
 
     st.caption("If you recently migrated from an older build, run the repair once to lock the services schema.")
 
