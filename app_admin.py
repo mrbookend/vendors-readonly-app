@@ -500,7 +500,7 @@ def tab_browse(db: Engine):
     # Fetch data
     df = fetch_vendors_df(db)
 
-    # Global text search
+    # Global text search (kept)
     q = st.text_input(
         "Global search across all fields (non-FTS, case-insensitive; matches partial words).",
         placeholder="e.g., plumb returns any record with 'plumb' anywhere",
@@ -515,7 +515,7 @@ def tab_browse(db: Engine):
                 mask = mask | df[col].fillna("").str.lower().str.contains(q_lower, na=False)
         df = df[mask]
 
-    # ---- derive display dataframe: format phone; map DB 'website' -> display 'url'; add 'WEBSITE' link column ----
+    # ---- derive display dataframe: format phone; create url + WEBSITE link; DROP raw 'website' column ----
     def _fmt_phone(val: str) -> str:
         if val is None:
             return ""
@@ -528,18 +528,19 @@ def tab_browse(db: Engine):
     if "phone" in df_disp.columns:
         df_disp["phone"] = df_disp["phone"].apply(_fmt_phone)
 
-    # Raw URL column (lowercase 'url') comes from DB 'website' (back-compat)
+    # url column from DB 'website' (back-compat)
     if "website" in df_disp.columns:
         df_disp["url"] = df_disp["website"].fillna("")
+        # Remove the lowercase 'website' column entirely so it doesn't appear at the end
+        df_disp.drop(columns=["website"], inplace=True)
     elif "url" not in df_disp.columns:
         df_disp["url"] = ""
 
-    # Uppercase 'WEBSITE' column: clickable link labeled 'website' if url present; else blank
+    # Uppercase 'WEBSITE' column used for clickable link cell
     df_disp["WEBSITE"] = df_disp["url"].fillna("").astype(str)
 
     # ---- Fixed column widths from secrets (fallback to defaults) ----
     def _merge_widths():
-        """Merge widths from both legacy and new secrets sections."""
         merged = {}
         for sect in ("browse_column_widths", "COLUMN_WIDTHS_PX_READONLY"):
             obj = _read_secret_early(sect, None)
@@ -550,7 +551,6 @@ def tab_browse(db: Engine):
     _widths = _merge_widths()
 
     def _w(name, default, *fallback_names):
-        """Fetch width for 'name' from secrets; if missing, try fallback names; else use default."""
         for key in (name,) + fallback_names:
             if key in _widths:
                 try:
@@ -574,7 +574,7 @@ def tab_browse(db: Engine):
     # --- Build AgGrid options ---
     gob = GridOptionsBuilder.from_dataframe(df_disp)
 
-    # General defaults: filters ON globally, small minWidth so secrets are respected
+    # General defaults: NO FILTERS on any column; allow narrow widths
     gob.configure_grid_options(
         domLayout="autoHeight",
         ensureDomOrder=True,
@@ -584,25 +584,25 @@ def tab_browse(db: Engine):
     gob.configure_default_column(
         resizable=True,
         sortable=True,
-        filter=True,          # ← filters ON by default
+        filter=False,         # ← disable header filters globally
         wrapHeaderText=True,
         autoHeaderHeight=True,
-        minWidth=40,          # ← allow very narrow columns (e.g., id=45)
+        minWidth=40,          # ← let secrets like id=45 take effect
     )
 
     # Helper to uppercase headers
     def H(s: str) -> str:
         return s.upper()
 
-    # Stable ordering: include 'url' then 'WEBSITE'
+    # Desired column order (note: 'website' is dropped; only 'url' + 'WEBSITE' remain)
     col_order = [
         "id","category","service","business_name","contact_name","phone",
         "address","url","WEBSITE","notes","keywords"
     ]
     existing = [c for c in col_order if c in df_disp.columns] + [c for c in df_disp.columns if c not in col_order]
 
-    # Per-column configs (uppercase headers)
-    if "id" in df_disp:            gob.configure_column("id", header_name=H("id"), width=id_w, filter=False)  # ID filter OFF
+    # Per-column configs (uppercase headers, no filters anywhere)
+    if "id" in df_disp:            gob.configure_column("id", header_name=H("id"), width=id_w)
     if "category" in df_disp:      gob.configure_column("category", header_name=H("category"), width=cat_w)
     if "service" in df_disp:       gob.configure_column("service", header_name=H("service"), width=svc_w)
     if "business_name" in df_disp: gob.configure_column("business_name", header_name=H("business_name"), width=name_w)
@@ -669,7 +669,7 @@ def tab_browse(db: Engine):
         allow_unsafe_jscode=True,         # needed for clickable link renderer
         reload_data=True,
         update_mode=GridUpdateMode.NO_UPDATE,
-        key="browse_grid_fixed_layout_v4",
+        key="browse_grid_fixed_layout_v5",
         height=None,
     )
 
