@@ -1,13 +1,14 @@
-# app_admin.py — Vendors Admin (v3.6.6)
+# app_admin.py — Vendors Admin (v3.6.7)
 # View | Add | Edit | Delete | Categories Admin | Services Admin | Maintenance | Changelog
 # - AgGrid optional: wrap/auto-height for ALL columns EXCEPT notes & keywords (fixed height)
-# - Website column: proper clickable link via DOM element, click propagation suppressed
-# - Copy UX: enable range selection + cell text selection; add "Copy" button column to copy full row (TSV)
+# - Website column: renderer now returns an HTML STRING (no raw DOM nodes) → fixes React error #31
+# - Copy UX: range selection + cell text selection; “Copy” button column (TSV)
 # - Fallback uses st.table; CSS: wrap everywhere except notes/keywords; fixed widths
 # - Validators, audit trail, schema guardrails; CSV + Debug under the table in View
 # - v3.6.3: fixed pandas read_sql_query usage in Maintenance
-# - v3.6.5: hardened hyperlink + copy behavior in AgGrid
-# - v3.6.6: FIX Python list usage (insert instead of splice), CSS typo
+# - v3.6.5: hardened hyperlink + copy in AgGrid
+# - v3.6.6: fixed Python list insert & CSS typo
+# - v3.6.7: Website cellRenderer returns HTML string (no DOM), preventing React invariant #31
 
 from __future__ import annotations
 
@@ -479,19 +480,14 @@ def _aggrid_view(df_show: pd.DataFrame, website_label: str = "website"):
                 cellStyle={"whiteSpace": "nowrap", "textOverflow": "ellipsis", "overflow": "hidden"}
             )
 
-    # Clickable "Website" — return a DOM element, stop propagation so grid doesn't swallow it
+    # Clickable "Website" — RETURN HTML STRING (not a DOM node) to avoid React invariant #31
     if website_key and url_col:
         link_renderer = JsCode(f"""
             function(params) {{
                 const url = params.data && params.data["{url_col}"] ? params.data["{url_col}"] : "";
                 if (!url) return "";
-                const a = document.createElement('a');
-                a.href = url;
-                a.target = '_blank';
-                a.rel = 'noopener noreferrer';
-                a.innerText = 'Website';
-                a.addEventListener('click', function(e) {{ e.stopPropagation(); }});
-                return a;
+                // HTML string; AgGrid sets innerHTML. We also stop propagation inline.
+                return '<a href="' + url + '" target="_blank" rel="noopener noreferrer" onclick="event.stopPropagation();">Website</a>';
             }}
         """)
         gob.configure_column(website_key, cellRenderer=link_renderer)
@@ -583,7 +579,6 @@ def _aggrid_view(df_show: pd.DataFrame, website_label: str = "website"):
                 }
             """)
         }
-        # Python list, not JS: use insert
         grid_options["columnDefs"].insert(0, copy_col)
 
     AgGrid(
@@ -647,7 +642,7 @@ def tab_add():
             phone = st.text_input(LABEL_OVERRIDES.get("phone", "phone"), placeholder="(210) 555-0123 or 210-555-0123")
         with col[1]:
             address = st.text_input(LABEL_OVERRIDES.get("address", "address"))
-            website = st.text_input(LABEL_OVERRIDES.get("website", "website"), value="", placeholder="https://example.com")
+            website = st.text_input(LABEL_OVERRIDES.get("website", "website"), placeholder="https://example.com")
             notes = st.text_area(LABEL_OVERRIDES.get("notes", "notes"))
             keywords = st.text_input(LABEL_OVERRIDES.get("keywords", "keywords"))
         submitted = st.form_submit_button("Add")
