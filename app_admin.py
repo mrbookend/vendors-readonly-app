@@ -480,17 +480,26 @@ def _aggrid_view(df_show: pd.DataFrame, website_label: str = "website"):
                 cellStyle={"whiteSpace": "nowrap", "textOverflow": "ellipsis", "overflow": "hidden"}
             )
 
-    # Clickable "Website" — RETURN HTML STRING (not a DOM node) to avoid React invariant #31
+        # Clickable "Website" WITHOUT HTML/DOM renderers: show hostname; style like a link.
     if website_key and url_col:
-        link_renderer = JsCode(f"""
-            function(params) {{
-                const url = params.data && params.data["{url_col}"] ? params.data["{url_col}"] : "";
+        label_formatter = JsCode(f"""
+            function(params){{
+                const url = (params.data && params.data["{url_col}"]) || "";
                 if (!url) return "";
-                // HTML string; AgGrid sets innerHTML. We also stop propagation inline.
-                return '<a href="' + url + '" target="_blank" rel="noopener noreferrer" onclick="event.stopPropagation();">Website</a>';
+                try {{
+                    const u = new URL(url);
+                    return u.hostname;   // e.g., example.com
+                }} catch(e) {{
+                    return "Website";
+                }}
             }}
         """)
-        gob.configure_column(website_key, cellRenderer=link_renderer)
+        gob.configure_column(
+            website_key,
+            valueFormatter=label_formatter,
+            tooltipField=url_col,  # hover shows full URL
+            cellStyle={{"textDecoration":"underline","cursor":"pointer"}}  # make it look like a link
+        )
 
     grid_options = gob.build()
     grid_options["floatingFilter"] = False
@@ -506,6 +515,18 @@ def _aggrid_view(df_show: pd.DataFrame, website_label: str = "website"):
     grid_options["suppressRowClickSelection"] = False
     grid_options["suppressCopyRowsToClipboard"] = False
     grid_options["clipboardDelimiter"] = "\t"
+        # Open URL on click for the Website column
+    grid_options["onCellClicked"] = JsCode(f"""
+        function(event){{
+            if (event.colDef && event.colDef.field === "{website_key}") {{
+                const url = (event.data && event.data["{url_col}"]) || "";
+                if (url) {{
+                    window.open(url, "_blank", "noopener,noreferrer");
+                }}
+            }}
+        }}
+    """)
+
     grid_options["copyHeadersToClipboard"] = False
 
     # Context menu items incl. Copy row (TSV)
