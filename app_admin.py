@@ -494,12 +494,13 @@ def _aggrid_view(df_show: pd.DataFrame, website_label: str = "website"):
                 }}
             }}
         """)
-        gob.configure_column(
+             gob.configure_column(
             website_key,
             valueFormatter=label_formatter,
             tooltipField=url_col,  # hover shows full URL
-            cellStyle={{"textDecoration":"underline","cursor":"pointer"}}  # make it look like a link
+            cellStyle={"textDecoration": "underline", "cursor": "pointer"}  # make it look like a link
         )
+
 
     grid_options = gob.build()
     grid_options["floatingFilter"] = False
