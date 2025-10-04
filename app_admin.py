@@ -530,17 +530,16 @@ def tab_browse(db: Engine):
 
     # Raw URL column (lowercase 'url') comes from DB 'website'
     if "website" in df_disp.columns:
-        df_disp["url"] = df_disp["website"]
+        df_disp["url"] = df_disp["website"].fillna("")
     elif "url" not in df_disp.columns:
         df_disp["url"] = ""
 
     # Uppercase 'Website' column: clickable link labeled 'website' if url present; else blank
-    df_disp["Website"] = df_disp["url"]
+    df_disp["Website"] = df_disp["url"].fillna("").astype(str)
 
     # ---- Fixed column widths from secrets (fallback to defaults) ----
     _widths = _read_secret_early("browse_column_widths", {}) or {}
     def _w(name, default, *fallback_names):
-        # allow fallback keys (for backwards compat with prior 'website'/'website_link')
         for key in (name,) + fallback_names:
             if isinstance(_widths, dict) and key in _widths:
                 try:
@@ -564,7 +563,7 @@ def tab_browse(db: Engine):
     # --- Build AgGrid options ---
     gob = GridOptionsBuilder.from_dataframe(df_disp)
 
-    # General defaults (ALL FILTERS OFF)
+    # General defaults
     gob.configure_grid_options(
         domLayout="autoHeight",
         ensureDomOrder=True,
@@ -574,11 +573,15 @@ def tab_browse(db: Engine):
     gob.configure_default_column(
         resizable=True,
         sortable=True,
-        filter=False,            # no header filters anywhere
+        filter=True,             # keep filters ON by default
         wrapHeaderText=True,
         autoHeaderHeight=True,
         minWidth=90,
     )
+
+    # Helper to uppercase headers
+    def H(s: str) -> str:
+        return s.upper()
 
     # Stable ordering: include 'url' then 'Website'
     col_order = [
@@ -587,44 +590,46 @@ def tab_browse(db: Engine):
     ]
     existing = [c for c in col_order if c in df_disp.columns] + [c for c in df_disp.columns if c not in col_order]
 
-    # Per-column widths (no filters)
-    if "id" in df_disp:            gob.configure_column("id", header_name="ID", width=id_w)
-    if "category" in df_disp:      gob.configure_column("category", width=cat_w)
-    if "service" in df_disp:       gob.configure_column("service", width=svc_w)
-    if "business_name" in df_disp: gob.configure_column("business_name", width=name_w)
-    if "contact_name" in df_disp:  gob.configure_column("contact_name", width=contact_w)
-    if "phone" in df_disp:         gob.configure_column("phone", width=phone_w)
-    if "address" in df_disp:       gob.configure_column("address", width=addr_w)
-    if "url" in df_disp:           gob.configure_column("url", width=url_w)
+    # Per-column configs (remove filter from ID only; uppercase headers everywhere)
+    if "id" in df_disp:            gob.configure_column("id", header_name=H("ID"), width=id_w, filter=False)
+    if "category" in df_disp:      gob.configure_column("category", header_name=H("category"), width=cat_w)
+    if "service" in df_disp:       gob.configure_column("service", header_name=H("service"), width=svc_w)
+    if "business_name" in df_disp: gob.configure_column("business_name", header_name=H("business_name"), width=name_w)
+    if "contact_name" in df_disp:  gob.configure_column("contact_name", header_name=H("contact_name"), width=contact_w)
+    if "phone" in df_disp:         gob.configure_column("phone", header_name=H("phone"), width=phone_w)
+    if "address" in df_disp:       gob.configure_column("address", header_name=H("address"), width=addr_w)
+    if "url" in df_disp:           gob.configure_column("url", header_name=H("url"), width=url_w)
 
     # Clickable Website link column (cell label 'website' if url present)
     from st_aggrid import JsCode
     link_renderer = JsCode("""
         function(params) {
-            const raw = params.value;
+            var raw = params.value;
             if (!raw) { return ''; }
-            let url = ('' + raw).trim();
+            var url = ('' + raw).trim();
             if (!/^https?:\\/\\//i.test(url)) {
                 url = 'http://' + url;
             }
-            return `<a href="${url}" target="_blank" rel="noopener">website</a>`;
+            // Ensure it's clickable HTML; AG Grid uses innerHTML for JS cellRenderer return strings
+            return '<a href="' + url + '" target="_blank" rel="noopener">website</a>';
         }
     """)
     if "Website" in df_disp:
         gob.configure_column(
             "Website",
-            header_name="Website",
+            header_name=H("Website"),
             width=link_w,
             sortable=False,
             filter=False,
             cellRenderer=link_renderer,
         )
 
-    # Notes & Keywords: NO WRAP (fixed row height + ellipsis)
+    # Notes & Keywords: NO WRAP (fixed row height + ellipsis); uppercase headers
     nowrap_style = {"whiteSpace": "nowrap", "overflow": "hidden", "textOverflow": "ellipsis"}
     if "notes" in df_disp:
         gob.configure_column(
             "notes",
+            header_name=H("notes"),
             width=notes_w,
             cellStyle=nowrap_style,
             autoHeight=False,
@@ -632,6 +637,7 @@ def tab_browse(db: Engine):
     if "keywords" in df_disp:
         gob.configure_column(
             "keywords",
+            header_name=H("keywords"),
             width=keys_w,
             cellStyle=nowrap_style,
             autoHeight=False,
@@ -653,7 +659,7 @@ def tab_browse(db: Engine):
         allow_unsafe_jscode=True,         # needed for clickable link renderer
         reload_data=True,
         update_mode=GridUpdateMode.NO_UPDATE,
-        key="browse_grid_fixed_layout",
+        key="browse_grid_fixed_layout_v2",
         height=None,
     )
 
