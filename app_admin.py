@@ -515,6 +515,98 @@ def _aggrid_view(df_show: pd.DataFrame, website_label: str = "website"):
     grid_options["suppressMenuHide"] = True
     grid_options["domLayout"] = "normal"
 
+    # --- Column width HUD: pinned top row showing widths during resize ---
+    # Start with no HUD row
+    grid_options["pinnedTopRowData"] = []
+
+    # Visual style for the HUD row (small, subtle)
+    st.markdown("""
+    <style>
+      .ag-theme-streamlit .ag-pinned-top .ag-row {
+        background: rgba(0,0,0,0.04) !important;
+        font-size: 11px !important;
+        line-height: 18px !important;
+      }
+      .ag-theme-streamlit .ag-pinned-top .ag-cell {
+        padding-top: 0 !important;
+        padding-bottom: 0 !important;
+        text-align: center;
+        color: rgba(0,0,0,0.7);
+        user-select: none;
+      }
+    </style>
+    """, unsafe_allow_html=True)
+
+    # Helper: build an object whose keys are the displayed colIds and values are "123px"
+    grid_options["getPinnedWidthRow"] = JsCode("""
+        function(api){
+          const row = {};
+          const cols = api.getColumnDefs ? api.getColumnDefs() : [];
+          // Fallback when getColumnDefs() is unavailable: use displayed columns
+          const displayed = api.getColumnDefs ? cols : (api.columnApi ? api.columnApi.getAllDisplayedColumns() : []);
+          if (Array.isArray(displayed)) {
+            displayed.forEach(c => {
+              const colId = c.colId || (c.getColId && c.getColId()) || c.field || '';
+              if (!colId) return;
+              const col = api.columnApi ? api.columnApi.getColumn(colId) : null;
+              const w = col ? Math.round(col.getActualWidth()) : null;
+              row[colId] = w ? (w + 'px') : '';
+            });
+          }
+          return row;
+        }
+    """)
+
+    # Track which column is resizing; show/hide HUD row accordingly
+    grid_options.setdefault("context", {})
+    grid_options["onColumnResized"] = JsCode("""
+        function(event){
+          if (!event || !event.api) return;
+          const api = event.api;
+          const go = api.gridOptionsWrapper.gridOptions;
+          if (!go.context) go.context = {};
+
+          // Mark that we're in resize mode
+          go.context._resizingActive = true;
+
+          // Show/update the HUD top row with current widths
+          try {
+            const builder = go.getPinnedWidthRow || (go.getPinnedWidthRow = function(apiRef){ return {}; });
+            const row = builder(api);
+            api.setPinnedTopRowData([row]);
+          } catch(e) {}
+
+          // After finishing, hide after a short delay
+          if (event.finished) {
+            setTimeout(function(){
+              try {
+                go.context._resizingActive = false;
+                api.setPinnedTopRowData([]);  // hide HUD
+              } catch(e) {}
+            }, 800);
+          }
+        }
+    """)
+
+    # Also refresh the HUD once at grid ready (helpful after first render)
+    grid_options["onGridReady"] = JsCode("""
+        function(params){
+          const api = params.api;
+          const go = api.gridOptionsWrapper.gridOptions;
+          // Keep a callable on gridOptions so our onColumnResized can reach it
+          go.getPinnedWidthRow = function(apiRef){
+            const row = {};
+            const displayed = apiRef.columnApi.getAllDisplayedColumns();
+            displayed.forEach(c => {
+              const id = c.getColId();
+              row[id] = Math.round(c.getActualWidth()) + 'px';
+            });
+            return row;
+          };
+        }
+    """)
+
+
         # --- Temporary width badge above header while resizing (registered component) ---
     header_with_width = JsCode("""
         class WidthHeader {
