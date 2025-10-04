@@ -36,7 +36,7 @@ from sqlalchemy.exc import SQLAlchemyError
 # Page setup (do before any Streamlit UI)
 # -----------------------------
 PAGE_TITLE = st.secrets.get("page_title", "Vendors Admin") if hasattr(st, "secrets") else "Vendors Admin"
-PAGE_MAX_WIDTH_PX = int(st.secrets.get("page_max_width_px", 1200)) if hasattr(st, "secrets") else 1200
+PAGE_MAX_WIDTH_PX = int(st.secrets.get("page_max_width_px", 2300)) if hasattr(st, "secrets") else 1200
 SIDEBAR_STATE = st.secrets.get("sidebar_state", "expanded") if hasattr(st, "secrets") else "expanded"
 
 st.set_page_config(page_title=PAGE_TITLE, layout="wide", initial_sidebar_state=SIDEBAR_STATE)
