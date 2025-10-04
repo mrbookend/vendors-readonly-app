@@ -1,8 +1,9 @@
-# app_admin.py — Vendors Admin (v3.6.1)
+# app_admin.py — Vendors Admin (v3.6.2)
 # View | Add | Edit | Delete | Categories Admin | Services Admin | Maintenance | Changelog
 # - AgGrid optional: no per-column filters; long text wraps + auto-expands rows
-# - Fixed widths honored (no auto-size fighting)
-# - Quick filter under Help; CSV at bottom; Debug expander placed directly under CSV in View tab
+# - Fallback now uses st.table (not st.dataframe) so wrapping & auto-row-height work
+# - Fixed widths honored (no auto-size fighting). CSS targets both st.table & AgGrid fallback.
+# - Quick filter under Help; CSV at bottom; DEBUG expander directly under CSV in View tab
 # - Validators: phone (10 digits), website (http/https), service required unless category="Home Repair"
 # - Audit trail: created_at, updated_at, updated_by + vendor_changes changelog
 # - Auto-migration for audit columns/tables; ensure ref tables (categories/services) exist
@@ -187,43 +188,50 @@ _ensure_schema()
 
 
 # -----------------------------
-# CSS (fallback table only)
+# CSS for table-based fallback (and some shared rules)
 # -----------------------------
 def _apply_css(field_order: List[str]):
-    rules = []
+    # We target BOTH st.dataframe (legacy just in case) AND st.table (our fallback of choice)
+    tbl_sel = "div[data-testid='stTable'] table"
+    df_sel  = "div[data-testid='stDataFrame'] table"
+    base = f"""
+    {tbl_sel} {{ table-layout: fixed !important; }}
+    {df_sel}  {{ table-layout: fixed !important; }}
+    {tbl_sel} td, {tbl_sel} th,
+    {df_sel}  td, {df_sel}  th {{
+        white-space: normal !important;
+        overflow-wrap: anywhere !important;
+        word-break: break-word !important;
+    }}
+    """
+    rules = [base]
+
+    # Fixed per-column widths (1-based nth-child)
     for idx, col in enumerate(field_order, start=1):
         px = COLUMN_WIDTHS.get(col)
         if not px:
             continue
-        rules.append(
-            f"""
-            div[data-testid='stDataFrame'] table thead tr th:nth-child({idx}),
-            div[data-testid='stDataFrame'] table tbody tr td:nth-child({idx}) {{
-                min-width:{px}px !important; max-width:{px}px !important; width:{px}px !important;
-                white-space: normal !important; overflow-wrap:anywhere !important; word-break:break-word !important;
-            }}
-            """
-        )
+        rules.append(f"""
+        {tbl_sel} thead tr th:nth-child({idx}), {tbl_sel} tbody tr td:nth-child({idx}),
+        {df_sel}  thead tr th:nth-child({idx}), {df_sel}  tbody tr td:nth-child({idx}) {{
+            min-width:{px}px !important; max-width:{px}px !important; width:{px}px !important;
+        }}
+        """)
+
     sticky = ""
     if STICKY_FIRST and field_order:
-        sticky = """
-        div[data-testid='stDataFrame'] table thead tr th:nth-child(1),
-        div[data-testid='stDataFrame'] table tbody tr td:nth-child(1){
-            position:sticky;left:0;z-index:2;background:var(--background-color,white);box-shadow:1px 0 0 rgba(0,0,0,0.06);
-        }
-        div[data-testid='stDataFrame'] table thead tr th:nth-child(1){z-index:3;}
-        """
-    st.markdown(
-        f"""
-        <style>
-        div[data-testid='stDataFrame'] table {{ table-layout: fixed !important; }}
-        div[data-testid='stDataFrame'] table td, div[data-testid='stDataFrame'] table th {{
-            white-space: normal !important; overflow-wrap:anywhere !important; word-break:break-word !important;
+        sticky = f"""
+        {tbl_sel} thead tr th:nth-child(1), {tbl_sel} tbody tr td:nth-child(1),
+        {df_sel}  thead tr th:nth-child(1), {df_sel}  tbody tr td:nth-child(1) {{
+            position: sticky; left: 0; z-index: 2;
+            background: var(--background-color, white);
+            box-shadow: 1px 0 0 rgba(0,0,0,0.06);
         }}
-        {''.join(rules)}
-        {sticky}
-        </style>
-        """,
+        {tbl_sel} thead tr th:nth-child(1), {df_sel} thead tr th:nth-child(1) {{ z-index: 3; }}
+        """
+
+    st.markdown(
+        "<style>" + "\n".join(rules) + sticky + "</style>",
         unsafe_allow_html=True,
     )
 
@@ -412,8 +420,8 @@ def _aggrid_view(df_show: pd.DataFrame, website_label: str = "website"):
         st.info("No rows to display.")
         return
 
-    # Determine website column & add normalized URL helper column
     website_key = website_label if website_label in df_show.columns else next((c for c in df_show.columns if c.lower()=="website"), None)
+
     _df = df_show.copy()
     url_col = None
     if website_key:
@@ -442,12 +450,11 @@ def _aggrid_view(df_show: pd.DataFrame, website_label: str = "website"):
         if px:
             gob.configure_column(col, width=px)
 
-    # Identify long-text columns robustly
+    # Long text columns auto-expand (JS-style keys)
     def _is_long_col(name: str) -> bool:
         n = name.lower()
         return ("address" in n) or ("notes" in n) or n.endswith(" url")
 
-    # Long text columns auto-expand (JS-style cellStyle keys)
     for col in list(_df.columns):
         if _is_long_col(col):
             gob.configure_column(
@@ -457,7 +464,7 @@ def _aggrid_view(df_show: pd.DataFrame, website_label: str = "website"):
                 cellStyle={"whiteSpace": "normal", "wordBreak": "break-word", "overflowWrap": "anywhere"},
             )
 
-    # Clickable "Website" label: underlying URL from helper column
+    # Clickable "Website" label using helper URL col
     if website_key and url_col:
         link_renderer = JsCode(f"""
             function(params){{
@@ -471,7 +478,6 @@ def _aggrid_view(df_show: pd.DataFrame, website_label: str = "website"):
     grid_options = gob.build()
     grid_options["floatingFilter"] = False
     grid_options["suppressMenuHide"] = True
-    # Keep fixed widths; don't auto-fit
     grid_options["domLayout"] = "normal"
 
     AgGrid(
@@ -488,7 +494,7 @@ def _aggrid_view(df_show: pd.DataFrame, website_label: str = "website"):
 
 
 # -----------------------------
-# VIEW tab (with quick filter; CSV at bottom + DEBUG right after CSV)
+# VIEW tab (quick filter; CSV; DEBUG right under CSV)
 # -----------------------------
 def tab_view(query: str):
     df = _fetch_df()
@@ -498,9 +504,15 @@ def tab_view(query: str):
     if _AGGRID_AVAILABLE:
         _aggrid_view(df_show, website_label=LABEL_OVERRIDES.get("website", "website"))
     else:
-        st.warning("`streamlit-aggrid` not installed — showing basic table.")
+        st.warning("`streamlit-aggrid` not installed — showing basic table with wrapping.")
         _apply_css(df_show.columns.tolist())
-        st.dataframe(df_show, use_container_width=True, hide_index=True)
+        # st.table gives true HTML table: wraps & auto-row-height; pre-sort for usability
+        df_sorted = df_show.sort_values(
+            by=["business_name","category","id"],
+            key=lambda s: s.astype(str).str.casefold(),
+            ignore_index=True
+        )
+        st.table(df_sorted)
 
     st.download_button(
         label="Download Providers (CSV)",
@@ -509,7 +521,7 @@ def tab_view(query: str):
         mime="text/csv",
     )
 
-    # << DEBUG: placed immediately below the CSV button in View tab >>
+    # Debug expander immediately below CSV
     render_status_debug(expanded=False)
 
 
@@ -836,8 +848,6 @@ def main():
     with tabs[5]: tab_services()
     with tabs[6]: tab_maintenance()
     with tabs[7]: tab_changelog()
-
-    # No global debug call here — it's already rendered under CSV in View tab.
 
 if __name__ == "__main__":
     main()
