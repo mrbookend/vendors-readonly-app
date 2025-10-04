@@ -12,19 +12,12 @@
 # - Category Admin & Service Admin:
 #       * Add, Rename, Delete (with guardrails)
 #       * Orphan surfacing (values used by vendors but missing from libs)
-#       * Category/service usage counts
+#       * Usage counts
 # - Maintenance tab:
 #       * "Repair services table" one-click safety (ensures schema=id,name; migrates from old shapes)
-#       * Normalize phones, trim spaces, title-case business names (optional)
+#       * Normalize phones, trim/title business names
 # - Debug tab at bottom with engine status and schema snapshot
-#
-# Columns (vendors):
-#   id (INT PK), category (TEXT), service (TEXT, nullable), business_name (TEXT),
-#   contact_name (TEXT), phone (TEXT), address (TEXT), website (TEXT), notes (TEXT), keywords (TEXT)
-#
-# Columns (categories): id (INT PK), name (TEXT UNIQUE)
-# Columns (services):   id (INT PK), name (TEXT UNIQUE)
-#
+
 from __future__ import annotations
 
 import os
@@ -35,6 +28,7 @@ import pandas as pd
 import streamlit as st
 from sqlalchemy import create_engine, text as sql_text
 from sqlalchemy.engine import Engine
+from urllib.parse import urlparse, parse_qsl, urlencode, urlunparse
 
 # =========================
 # Page Layout / Secrets
@@ -49,7 +43,7 @@ def _read_secret_early(name: str, default=None):
     return os.environ.get(name, default)
 
 PAGE_TITLE = _read_secret_early("page_title", "Vendors Admin")
-PAGE_MAX_WIDTH_PX = int(_read_secret_early("page_max_width_px", 2300))
+PAGE_MAX_WIDTH_PX = int(_read_secret_early("page_max_width_px", 1200))
 SIDEBAR_STATE = _read_secret_early("sidebar_state", "expanded")
 
 st.set_page_config(page_title=PAGE_TITLE, layout="wide", initial_sidebar_state=SIDEBAR_STATE)
@@ -60,7 +54,6 @@ st.markdown(
       .block-container {{
         max-width: {PAGE_MAX_WIDTH_PX}px;
       }}
-      /* tighter inputs in forms */
       .stTextInput > div > div > input {{
         line-height: 1.15;
       }}
@@ -72,9 +65,6 @@ st.markdown(
 # =========================
 # DB Engine: libSQL -> SQLite fallback
 # =========================
-# --- replace your existing build_engine() with this normalized version ---
-
-from urllib.parse import urlparse, parse_qsl, urlencode, urlunparse
 
 def _normalize_turso_sqlalchemy_url(raw: str) -> str:
     """
@@ -86,24 +76,14 @@ def _normalize_turso_sqlalchemy_url(raw: str) -> str:
     """
     if not raw:
         return ""
-
-    # If someone passed a bare host, add scheme
     if "://" not in raw:
         raw = "libsql://" + raw
-
-    # Force SQLAlchemy scheme
     raw = raw.replace("libsql://", "sqlite+libsql://", 1)
-
     parsed = urlparse(raw)
     q = dict(parse_qsl(parsed.query, keep_blank_values=True))
-
-    # Normalize secure flag to 'true' (lowercase string) exactly once
-    q["secure"] = "true"
-
-    # Rebuild URL with normalized query params
+    q["secure"] = "true"  # normalize once
     new_query = urlencode(q, doseq=True)
-    normalized = urlunparse((parsed.scheme, parsed.netloc, parsed.path, parsed.params, new_query, parsed.fragment))
-    return normalized
+    return urlunparse((parsed.scheme, parsed.netloc, parsed.path, parsed.params, new_query, parsed.fragment))
 
 def build_engine() -> Tuple[Engine, Dict[str, str]]:
     turso_url = _read_secret_early("TURSO_DATABASE_URL", "") or ""
@@ -111,9 +91,6 @@ def build_engine() -> Tuple[Engine, Dict[str, str]]:
 
     if turso_url and turso_token:
         sqlalchemy_url = _normalize_turso_sqlalchemy_url(turso_url)
-
-        # Important: do NOT also pass 'secure' here; it's already in the URL.
-        # Only pass the auth token via connect_args.
         engine = create_engine(
             sqlalchemy_url,
             connect_args={"auth_token": turso_token},
@@ -137,12 +114,15 @@ def build_engine() -> Tuple[Engine, Dict[str, str]]:
         "driver": "sqlite",
     }
 
+# Instantiate the engine BEFORE any DB calls.
+engine, engine_info = build_engine()
+
 # =========================
 # Schema helpers
 # =========================
 
-def ensure_tables():
-    with engine.begin() as conn:
+def ensure_tables(db: Engine):
+    with db.begin() as conn:
         conn.execute(sql_text("""
         CREATE TABLE IF NOT EXISTS vendors (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -167,19 +147,15 @@ def ensure_tables():
             name TEXT UNIQUE NOT NULL
         );"""))
 
-def snapshot_schema() -> Dict:
+def snapshot_schema(db: Engine) -> Dict:
     out: Dict = {}
-    with engine.begin() as conn:
-        # vendors columns
+    with db.begin() as conn:
         cols = conn.execute(sql_text("PRAGMA table_info(vendors);")).mappings().all()
         out["vendors_columns"] = [c["name"] for c in cols] if cols else []
-        # categories
         cols = conn.execute(sql_text("PRAGMA table_info(categories);")).mappings().all()
         out["categories_columns"] = [c["name"] for c in cols] if cols else []
-        # services
         cols = conn.execute(sql_text("PRAGMA table_info(services);")).mappings().all()
         out["services_columns"] = [c["name"] for c in cols] if cols else []
-        # counts
         def count_of(tbl):
             try:
                 return conn.execute(sql_text(f"SELECT COUNT(*) AS c FROM {tbl};")).scalar() or 0
@@ -192,14 +168,15 @@ def snapshot_schema() -> Dict:
         }
     return out
 
-ensure_tables()
+# Create tables now that engine exists
+ensure_tables(engine)
 
 # =========================
 # Data access
 # =========================
 
-def fetch_vendors_df() -> pd.DataFrame:
-    with engine.begin() as conn:
+def fetch_vendors_df(db: Engine) -> pd.DataFrame:
+    with db.begin() as conn:
         df = pd.read_sql(sql_text("""
             SELECT id, category, service, business_name, contact_name, phone, address, website, notes, keywords
             FROM vendors
@@ -207,37 +184,35 @@ def fetch_vendors_df() -> pd.DataFrame:
         """), conn)
     return df
 
-def fetch_categories() -> List[str]:
-    with engine.begin() as conn:
+def fetch_categories(db: Engine) -> List[str]:
+    with db.begin() as conn:
         rows = conn.execute(sql_text("SELECT name FROM categories ORDER BY name COLLATE NOCASE ASC;")).fetchall()
     return [r[0] for r in rows]
 
-def fetch_services() -> List[str]:
-    with engine.begin() as conn:
+def fetch_services(db: Engine) -> List[str]:
+    with db.begin() as conn:
         rows = conn.execute(sql_text("SELECT name FROM services ORDER BY name COLLATE NOCASE ASC;")).fetchall()
     return [r[0] for r in rows]
 
-def add_category(name: str) -> Tuple[bool, str]:
+def add_category(db: Engine, name: str) -> Tuple[bool, str]:
     name = name.strip()
     if not name:
         return False, "Category name cannot be blank."
     try:
-        with engine.begin() as conn:
+        with db.begin() as conn:
             conn.execute(sql_text("INSERT OR IGNORE INTO categories(name) VALUES(:n);"), {"n": name})
         return True, f"Category '{name}' added (or already existed)."
     except Exception as e:
         return False, f"Error adding category: {e}"
 
-def rename_category(old: str, new: str) -> Tuple[bool, str]:
+def rename_category(db: Engine, old: str, new: str) -> Tuple[bool, str]:
     old, new = old.strip(), new.strip()
     if not new:
         return False, "New category name cannot be blank."
     try:
-        with engine.begin() as conn:
-            # Update references in vendors
+        with db.begin() as conn:
             conn.execute(sql_text("UPDATE vendors SET category=:new WHERE lower(trim(category))=lower(trim(:old));"),
                          {"new": new, "old": old})
-            # Upsert new into categories, then delete old if different
             conn.execute(sql_text("INSERT OR IGNORE INTO categories(name) VALUES(:n);"), {"n": new})
             if old.lower() != new.lower():
                 conn.execute(sql_text("DELETE FROM categories WHERE lower(trim(name))=lower(trim(:old));"),
@@ -246,9 +221,9 @@ def rename_category(old: str, new: str) -> Tuple[bool, str]:
     except Exception as e:
         return False, f"Error renaming category: {e}"
 
-def delete_category(name: str) -> Tuple[bool, str]:
+def delete_category(db: Engine, name: str) -> Tuple[bool, str]:
     try:
-        with engine.begin() as conn:
+        with db.begin() as conn:
             count = conn.execute(sql_text("SELECT COUNT(*) FROM vendors WHERE lower(trim(category))=lower(trim(:n));"),
                                  {"n": name}).scalar()
             if count and count > 0:
@@ -258,23 +233,23 @@ def delete_category(name: str) -> Tuple[bool, str]:
     except Exception as e:
         return False, f"Error deleting category: {e}"
 
-def add_service(name: str) -> Tuple[bool, str]:
+def add_service(db: Engine, name: str) -> Tuple[bool, str]:
     name = name.strip()
     if not name:
         return False, "Service name cannot be blank."
     try:
-        with engine.begin() as conn:
+        with db.begin() as conn:
             conn.execute(sql_text("INSERT OR IGNORE INTO services(name) VALUES(:n);"), {"n": name})
         return True, f"Service '{name}' added (or already existed)."
     except Exception as e:
         return False, f"Error adding service: {e}"
 
-def rename_service(old: str, new: str) -> Tuple[bool, str]:
+def rename_service(db: Engine, old: str, new: str) -> Tuple[bool, str]:
     old, new = old.strip(), new.strip()
     if not new:
         return False, "New service name cannot be blank."
     try:
-        with engine.begin() as conn:
+        with db.begin() as conn:
             conn.execute(sql_text("UPDATE vendors SET service=:new WHERE lower(trim(service))=lower(trim(:old));"),
                          {"new": new, "old": old})
             conn.execute(sql_text("INSERT OR IGNORE INTO services(name) VALUES(:n);"), {"n": new})
@@ -285,9 +260,9 @@ def rename_service(old: str, new: str) -> Tuple[bool, str]:
     except Exception as e:
         return False, f"Error renaming service: {e}"
 
-def delete_service(name: str) -> Tuple[bool, str]:
+def delete_service(db: Engine, name: str) -> Tuple[bool, str]:
     try:
-        with engine.begin() as conn:
+        with db.begin() as conn:
             count = conn.execute(sql_text("SELECT COUNT(*) FROM vendors WHERE lower(trim(service))=lower(trim(:n));"),
                                  {"n": name}).scalar()
             if count and count > 0:
@@ -303,11 +278,11 @@ def normalize_phone(p: str) -> str:
     digits = re.sub(r"\D+", "", p)
     if len(digits) == 10:
         return digits
-    return ""  # treat invalid as blank
+    return ""  # invalid => blank
 
-def insert_vendor(row: Dict[str, str]) -> Tuple[bool, str]:
+def insert_vendor(db: Engine, row: Dict[str, str]) -> Tuple[bool, str]:
     try:
-        with engine.begin() as conn:
+        with db.begin() as conn:
             conn.execute(sql_text("""
                 INSERT INTO vendors (category, service, business_name, contact_name, phone, address, website, notes, keywords)
                 VALUES (:category, :service, :business_name, :contact_name, :phone, :address, :website, :notes, :keywords)
@@ -316,9 +291,9 @@ def insert_vendor(row: Dict[str, str]) -> Tuple[bool, str]:
     except Exception as e:
         return False, f"Error adding vendor: {e}"
 
-def update_vendor(vid: int, row: Dict[str, str]) -> Tuple[bool, str]:
+def update_vendor(db: Engine, vid: int, row: Dict[str, str]) -> Tuple[bool, str]:
     try:
-        with engine.begin() as conn:
+        with db.begin() as conn:
             conn.execute(sql_text("""
                 UPDATE vendors
                 SET category=:category,
@@ -336,9 +311,9 @@ def update_vendor(vid: int, row: Dict[str, str]) -> Tuple[bool, str]:
     except Exception as e:
         return False, f"Error updating vendor: {e}"
 
-def delete_vendor(vid: int) -> Tuple[bool, str]:
+def delete_vendor(db: Engine, vid: int) -> Tuple[bool, str]:
     try:
-        with engine.begin() as conn:
+        with db.begin() as conn:
             conn.execute(sql_text("DELETE FROM vendors WHERE id=:id;"), {"id": vid})
         return True, "Vendor deleted."
     except Exception as e:
@@ -348,8 +323,8 @@ def delete_vendor(vid: int) -> Tuple[bool, str]:
 # Orphans / Usage
 # =========================
 
-def category_usage_counts() -> List[Tuple[str, int]]:
-    with engine.begin() as conn:
+def category_usage_counts(db: Engine) -> List[Tuple[str, int]]:
+    with db.begin() as conn:
         rows = conn.execute(sql_text("""
             SELECT v.category AS cat, COUNT(*) AS c
             FROM vendors v
@@ -358,8 +333,8 @@ def category_usage_counts() -> List[Tuple[str, int]]:
         """)).fetchall()
     return [(r[0], r[1]) for r in rows]
 
-def service_usage_counts() -> List[Tuple[str, int]]:
-    with engine.begin() as conn:
+def service_usage_counts(db: Engine) -> List[Tuple[str, int]]:
+    with db.begin() as conn:
         rows = conn.execute(sql_text("""
             SELECT v.service AS svc, COUNT(*) AS c
             FROM vendors v
@@ -369,35 +344,32 @@ def service_usage_counts() -> List[Tuple[str, int]]:
         """)).fetchall()
     return [(r[0], r[1]) for r in rows]
 
-def find_orphan_categories() -> List[str]:
-    # Values used by vendors but missing from categories.name
-    all_cats = set([c.lower().strip() for c in fetch_categories()])
-    used = set([c.lower().strip() for c, _ in category_usage_counts() if c])
+def find_orphan_categories(db: Engine) -> List[str]:
+    all_cats = set([c.lower().strip() for c in fetch_categories(db)])
+    used = set([c.lower().strip() for c, _ in category_usage_counts(db) if c])
     return sorted([u for u in used if u not in all_cats])
 
-def find_orphan_services() -> List[str]:
-    all_svcs = set([s.lower().strip() for s in fetch_services()])
-    used = set([s.lower().strip() for s, _ in service_usage_counts() if s])
+def find_orphan_services(db: Engine) -> List[str]:
+    all_svcs = set([s.lower().strip() for s in fetch_services(db)])
+    used = set([s.lower().strip() for s, _ in service_usage_counts(db) if s])
     return sorted([u for u in used if u not in all_svcs])
 
 # =========================
 # Maintenance ops
 # =========================
 
-def repair_services_table() -> Tuple[bool, str]:
+def repair_services_table(db: Engine) -> Tuple[bool, str]:
     """
     Ensure services has schema (id INTEGER PK AUTOINCREMENT, name TEXT UNIQUE NOT NULL).
     If older/incorrect schema exists, migrate distinct names.
     """
     try:
-        with engine.begin() as conn:
-            # Snapshot existing
+        with db.begin() as conn:
             cols = conn.execute(sql_text("PRAGMA table_info(services);")).mappings().all()
             existing_cols = [c["name"] for c in cols]
             if existing_cols == ["id", "name"]:
                 return True, "Services table already correct."
 
-            # Create temp table with correct schema
             conn.execute(sql_text("""
                 CREATE TABLE IF NOT EXISTS services_tmp (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -405,20 +377,17 @@ def repair_services_table() -> Tuple[bool, str]:
                 );
             """))
 
-            # Try to extract plausible names from existing services table
-            # Heuristics: if column 'name' exists, take it; else union of any text columns
             names = []
             if "name" in existing_cols:
                 rows = conn.execute(sql_text("SELECT name FROM services;")).fetchall()
                 names = [r[0] for r in rows if r and r[0]]
             else:
-                # take any text-looking columns
                 rows = conn.execute(sql_text("SELECT * FROM services;")).fetchall()
                 for row in rows:
                     for val in row:
                         if isinstance(val, str) and val.strip():
                             names.append(val.strip())
-            # Deduplicate/normalize
+
             uniq = sorted(set([n.strip() for n in names if n and n.strip()]))
             for n in uniq:
                 try:
@@ -426,7 +395,6 @@ def repair_services_table() -> Tuple[bool, str]:
                 except Exception:
                     pass
 
-            # Drop old and rename
             conn.execute(sql_text("DROP TABLE services;"))
             conn.execute(sql_text("ALTER TABLE services_tmp RENAME TO services;"))
 
@@ -434,12 +402,8 @@ def repair_services_table() -> Tuple[bool, str]:
     except Exception as e:
         return False, f"Repair failed: {e}"
 
-def normalize_phones_all() -> Tuple[int, int]:
-    """
-    Convert all vendor phone values to ########## if exactly 10 digits; else blank.
-    Returns (updated_count, total_rows)
-    """
-    with engine.begin() as conn:
+def normalize_phones_all(db: Engine) -> Tuple[int, int]:
+    with db.begin() as conn:
         rows = conn.execute(sql_text("SELECT id, phone FROM vendors;")).fetchall()
         total = len(rows)
         updated = 0
@@ -450,8 +414,8 @@ def normalize_phones_all() -> Tuple[int, int]:
                 updated += 1
     return updated, total
 
-def trim_and_title_business_names() -> Tuple[int, int]:
-    with engine.begin() as conn:
+def trim_and_title_business_names(db: Engine) -> Tuple[int, int]:
+    with db.begin() as conn:
         rows = conn.execute(sql_text("SELECT id, business_name FROM vendors;")).fetchall()
         total = len(rows)
         updated = 0
@@ -459,8 +423,6 @@ def trim_and_title_business_names() -> Tuple[int, int]:
             if not n:
                 continue
             newn = re.sub(r"\s+", " ", n).strip()
-            # Prefer not to over-title-case acronyms; keep simple capitalization
-            # Use title() but preserve all-caps segments >= 3 chars
             parts = []
             for tok in newn.split(" "):
                 if len(tok) >= 3 and tok.isupper():
@@ -490,12 +452,10 @@ def selectbox(label: str, options: List[str], key: str, index: Optional[int] = N
 # Tabs
 # =========================
 
-def tab_browse():
+def tab_browse(db: Engine):
     st.subheader("Browse Vendors")
+    df = fetch_vendors_df(db)
 
-    df = fetch_vendors_df()
-
-    # Global non-FTS filter (case-insensitive, partial match across all string columns)
     q = st.text_input(
         "Global search across all fields (non-FTS, case-insensitive; matches partial words).",
         placeholder="e.g., plumb returns any record with 'plumb' anywhere",
@@ -510,21 +470,15 @@ def tab_browse():
                 mask = mask | df[col].fillna("").str.lower().str.contains(q_lower, na=False)
         df = df[mask]
 
-    st.dataframe(
-        df,
-        use_container_width=True,
-        hide_index=True,
-    )
+    st.dataframe(df, use_container_width=True, hide_index=True)
 
-def tab_vendor_crud():
+def tab_vendor_crud(db: Engine):
     st.subheader("Add / Edit / Delete Vendor")
 
-    # Load libs fresh each draw
-    cats = fetch_categories()
-    svcs = fetch_services()
+    cats = fetch_categories(db)
+    svcs = fetch_services(db)
+    df = fetch_vendors_df(db)
 
-    df = fetch_vendors_df()
-    # -------- Add --------
     with st.expander("➕ Add Vendor", expanded=True):
         colA, colB, colC = st.columns([1, 1, 1.2])
 
@@ -544,7 +498,6 @@ def tab_vendor_crud():
             keywords = st.text_input("Keywords (comma-separated)", key="add_keywords")
 
         if st.button("Save New Vendor", type="primary", key="btn_add_vendor"):
-            # Validate requireds
             if not business_name:
                 st.error("Business Name is required.")
                 return
@@ -552,20 +505,18 @@ def tab_vendor_crud():
                 st.error("Category is required.")
                 return
 
-            # Enforce category existence
             cat_name = category.strip()
             if cat_name not in cats:
-                ok, msg = add_category(cat_name)
+                ok, msg = add_category(db, cat_name)
                 if not ok:
                     st.error(msg)
                     return
                 cats.append(cat_name)
 
-            # Service optional, but if provided, enforce existence
             svc_name = (service or "").strip()
             if svc_name:
                 if svc_name not in svcs:
-                    ok, msg = add_service(svc_name)
+                    ok, msg = add_service(db, svc_name)
                     if not ok:
                         st.error(msg)
                         return
@@ -586,19 +537,17 @@ def tab_vendor_crud():
                 "notes": (notes or "").strip(),
                 "keywords": (keywords or "").strip(),
             }
-            ok, msg = insert_vendor(row)
+            ok, msg = insert_vendor(db, row)
             if ok:
                 st.success(msg)
                 rerun()
             else:
                 st.error(msg)
 
-    # -------- Edit/Delete --------
     with st.expander("✏️ Edit or 🗑️ Delete Vendor", expanded=False):
         if df.empty:
             st.info("No vendors to edit.")
             return
-        # Sorted by business_name (already sorted in query)
         options = df["business_name"].tolist()
         sel_name = st.selectbox("Select Vendor by Business Name", options, key="edit_select_name")
 
@@ -610,7 +559,6 @@ def tab_vendor_crud():
         with colA:
             business_name_e = st.text_input("Business Name *", value=vrow["business_name"], key="edit_business_name").strip()
             category_e = st.selectbox("Category *", cats, index=(cats.index(vrow["category"]) if vrow["category"] in cats else 0), key="edit_category")
-            # Service optional; allow blank choice at index 0
             svc_options = [""] + svcs
             svc_val = vrow["service"] if isinstance(vrow["service"], str) else ""
             idx_svc = svc_options.index(svc_val) if svc_val in svc_options else 0
@@ -636,17 +584,15 @@ def tab_vendor_crud():
                     st.error("Category is required.")
                     return
 
-                # ensure category exists
                 if category_e not in cats:
-                    ok, msg = add_category(category_e)
+                    ok, msg = add_category(db, category_e)
                     if not ok:
                         st.error(msg)
                         return
 
-                # service optional; ensure existence if provided
                 svc_e = (service_e or "").strip()
                 if svc_e and svc_e not in svcs:
-                    ok, msg = add_service(svc_e)
+                    ok, msg = add_service(db, svc_e)
                     if not ok:
                         st.error(msg)
                         return
@@ -667,7 +613,7 @@ def tab_vendor_crud():
                     "notes": (notes_e or "").strip(),
                     "keywords": (keywords_e or "").strip(),
                 }
-                ok, msg = update_vendor(vid, row_e)
+                ok, msg = update_vendor(db, vid, row_e)
                 if ok:
                     st.success(msg)
                     rerun()
@@ -676,18 +622,18 @@ def tab_vendor_crud():
 
         with col2:
             if st.button("Delete Vendor", type="secondary", key="btn_delete_vendor"):
-                ok, msg = delete_vendor(vid)
+                ok, msg = delete_vendor(db, vid)
                 if ok:
                     st.success(msg)
                     rerun()
                 else:
                     st.error(msg)
 
-def tab_categories():
+def tab_categories(db: Engine):
     st.subheader("Categories Admin")
 
-    cats = fetch_categories()
-    usage = category_usage_counts()
+    cats = fetch_categories(db)
+    usage = category_usage_counts(db)
     usage_map = {c: n for c, n in usage}
 
     if cats:
@@ -697,7 +643,7 @@ def tab_categories():
     else:
         st.info("No categories yet. Add one below.")
 
-    orphans = find_orphan_categories()
+    orphans = find_orphan_categories(db)
     if orphans:
         st.warning("**Orphan categories detected (used in vendors but missing from library):** " + ", ".join(orphans))
 
@@ -705,7 +651,7 @@ def tab_categories():
     with col1:
         new_cat = st.text_input("Add Category", key="add_category_name")
         if st.button("Add Category", key="btn_add_category"):
-            ok, msg = add_category(new_cat)
+            ok, msg = add_category(db, new_cat)
             (st.success if ok else st.error)(msg)
             if ok:
                 rerun()
@@ -714,7 +660,7 @@ def tab_categories():
             old = st.selectbox("Rename: pick existing", cats, key="rename_cat_old")
             new = st.text_input("New name", key="rename_cat_new")
             if st.button("Rename Category", key="btn_rename_category"):
-                ok, msg = rename_category(old, new)
+                ok, msg = rename_category(db, old, new)
                 (st.success if ok else st.error)(msg)
                 if ok:
                     rerun()
@@ -722,7 +668,7 @@ def tab_categories():
         if cats:
             delc = st.selectbox("Delete: pick category (must have zero usage)", cats, key="delete_cat_pick")
             if st.button("Delete Category", key="btn_delete_category"):
-                ok, msg = delete_category(delc)
+                ok, msg = delete_category(db, delc)
                 (st.success if ok else st.error)(msg)
                 if ok:
                     rerun()
@@ -734,11 +680,11 @@ def tab_categories():
         "- You can’t delete a category that’s still used by any vendor; reassign or rename first."
     )
 
-def tab_services():
+def tab_services(db: Engine):
     st.subheader("Services Admin")
 
-    svcs = fetch_services()
-    usage = service_usage_counts()
+    svcs = fetch_services(db)
+    usage = service_usage_counts(db)
     usage_map = {s: n for s, n in usage}
 
     if svcs:
@@ -748,7 +694,7 @@ def tab_services():
     else:
         st.info("No services yet. Add one below.")
 
-    orphans = find_orphan_services()
+    orphans = find_orphan_services(db)
     if orphans:
         st.warning("**Orphan services detected (used in vendors but missing from library):** " + ", ".join(orphans))
 
@@ -756,7 +702,7 @@ def tab_services():
     with col1:
         new_svc = st.text_input("Add Service", key="add_service_name")
         if st.button("Add Service", key="btn_add_service"):
-            ok, msg = add_service(new_svc)
+            ok, msg = add_service(db, new_svc)
             (st.success if ok else st.error)(msg)
             if ok:
                 rerun()
@@ -765,7 +711,7 @@ def tab_services():
             old = st.selectbox("Rename: pick existing", svcs, key="rename_svc_old")
             new = st.text_input("New name", key="rename_svc_new")
             if st.button("Rename Service", key="btn_rename_service"):
-                ok, msg = rename_service(old, new)
+                ok, msg = rename_service(db, old, new)
                 (st.success if ok else st.error)(msg)
                 if ok:
                     rerun()
@@ -773,7 +719,7 @@ def tab_services():
         if svcs:
             dels = st.selectbox("Delete: pick service (must have zero usage)", svcs, key="delete_svc_pick")
             if st.button("Delete Service", key="btn_delete_service"):
-                ok, msg = delete_service(dels)
+                ok, msg = delete_service(db, dels)
                 (st.success if ok else st.error)(msg)
                 if ok:
                     rerun()
@@ -785,42 +731,37 @@ def tab_services():
         "- You can’t delete a service that’s still used by any vendor; reassign or rename first."
     )
 
-def tab_maintenance():
+def tab_maintenance(db: Engine):
     st.subheader("Maintenance & Safety")
-
     st.caption("Quick operations for schema integrity and light data hygiene.")
 
     col1, col2, col3 = st.columns([0.6, 0.6, 0.6])
 
     with col1:
         if st.button("Repair services table (one-click)", key="btn_repair_services"):
-            ok, msg = repair_services_table()
+            ok, msg = repair_services_table(db)
             (st.success if ok else st.error)(msg)
             if ok:
                 rerun()
 
     with col2:
         if st.button("Normalize all phone numbers", key="btn_norm_phones"):
-            updated, total = normalize_phones_all()
+            updated, total = normalize_phones_all(db)
             st.success(f"Normalized {updated} of {total} phone entries.")
             rerun()
 
     with col3:
         if st.button("Trim + title-case all business names", key="btn_title_names"):
-            updated, total = trim_and_title_business_names()
+            updated, total = trim_and_title_business_names(db)
             st.success(f"Updated {updated} of {total} business names.")
             rerun()
 
-def tab_debug():
+def tab_debug(db: Engine):
     st.subheader("Status & Secrets (debug)")
-
-    dbg = {
-        "DB (resolved)": engine_info,
-    }
+    dbg = {"DB (resolved)": engine_info}
     st.json(dbg)
-
     st.markdown("**DB Probe**")
-    st.json(snapshot_schema())
+    st.json(snapshot_schema(db))
 
 # =========================
 # Main
@@ -829,17 +770,17 @@ def tab_debug():
 def main():
     tabs = st.tabs(["Browse", "Vendors", "Categories", "Services", "Maintenance", "Debug"])
     with tabs[0]:
-        tab_browse()
+        tab_browse(engine)
     with tabs[1]:
-        tab_vendor_crud()
+        tab_vendor_crud(engine)
     with tabs[2]:
-        tab_categories()
+        tab_categories(engine)
     with tabs[3]:
-        tab_services()
+        tab_services(engine)
     with tabs[4]:
-        tab_maintenance()
+        tab_maintenance(engine)
     with tabs[5]:
-        tab_debug()
+        tab_debug(engine)
 
 if __name__ == "__main__":
     main()
