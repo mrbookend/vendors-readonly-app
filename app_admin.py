@@ -501,6 +501,21 @@ def _aggrid_view(df_show: pd.DataFrame, website_label: str = "website"):
         )
 
     grid_options = gob.build()
+
+    # Whole-word wrapping by default (Ag-Grid): no mid-word breaks
+    grid_options.setdefault("defaultColDef", {})
+    grid_options["defaultColDef"]["cellStyle"] = {
+        "whiteSpace": "normal",     # allow wrapping
+        "overflowWrap": "normal",   # wrap at word boundaries
+        "wordBreak": "normal",      # no mid-word breaks
+        "hyphens": "auto"           # optional hyphenation for super-long words
+    }
+
+    grid_options["floatingFilter"] = False
+    grid_options["suppressMenuHide"] = True
+    grid_options["domLayout"] = "normal"
+
+    
     grid_options["floatingFilter"] = False
     grid_options["suppressMenuHide"] = True
     grid_options["domLayout"] = "normal"
