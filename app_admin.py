@@ -1,13 +1,14 @@
-# app_admin.py — Vendors Admin (v3.6.2)
+# app_admin.py — Vendors Admin (v3.6.3)
 # View | Add | Edit | Delete | Categories Admin | Services Admin | Maintenance | Changelog
 # - AgGrid optional: no per-column filters; long text wraps + auto-expands rows
-# - Fallback now uses st.table (not st.dataframe) so wrapping & auto-row-height work
-# - Fixed widths honored (no auto-size fighting). CSS targets both st.table & AgGrid fallback.
+# - Fallback uses st.table so wrapping & auto-row-height work
+# - Fixed widths honored (no auto-size fighting)
 # - Quick filter under Help; CSV at bottom; DEBUG expander directly under CSV in View tab
 # - Validators: phone (10 digits), website (http/https), service required unless category="Home Repair"
 # - Audit trail: created_at, updated_at, updated_by + vendor_changes changelog
 # - Auto-migration for audit columns/tables; ensure ref tables (categories/services) exist
 # - Immediate UI refresh after Add/Save/Delete/Maint ops
+# - v3.6.3: FIX pandas read_sql_query misuse (pass SQL string + SQLAlchemy Connection, not DBAPI .connection)
 
 from __future__ import annotations
 
@@ -191,7 +192,6 @@ _ensure_schema()
 # CSS for table-based fallback (and some shared rules)
 # -----------------------------
 def _apply_css(field_order: List[str]):
-    # We target BOTH st.dataframe (legacy just in case) AND st.table (our fallback of choice)
     tbl_sel = "div[data-testid='stTable'] table"
     df_sel  = "div[data-testid='stDataFrame'] table"
     base = f"""
@@ -206,7 +206,6 @@ def _apply_css(field_order: List[str]):
     """
     rules = [base]
 
-    # Fixed per-column widths (1-based nth-child)
     for idx, col in enumerate(field_order, start=1):
         px = COLUMN_WIDTHS.get(col)
         if not px:
@@ -433,7 +432,6 @@ def _aggrid_view(df_show: pd.DataFrame, website_label: str = "website"):
 
     gob = GridOptionsBuilder.from_dataframe(_df)
 
-    # Disable per-column filters; keep sort/resize
     gob.configure_default_column(
         resizable=True,
         sortable=True,
@@ -442,7 +440,6 @@ def _aggrid_view(df_show: pd.DataFrame, website_label: str = "website"):
         autoHeight=False,
     )
 
-    # Apply widths from secrets (map displayed -> raw if renamed)
     display_to_raw = {disp: raw for raw, disp in LABEL_OVERRIDES.items() if isinstance(disp, str) and disp}
     for col in _df.columns:
         raw_key = display_to_raw.get(col, col)
@@ -450,7 +447,6 @@ def _aggrid_view(df_show: pd.DataFrame, website_label: str = "website"):
         if px:
             gob.configure_column(col, width=px)
 
-    # Long text columns auto-expand (JS-style keys)
     def _is_long_col(name: str) -> bool:
         n = name.lower()
         return ("address" in n) or ("notes" in n) or n.endswith(" url")
@@ -464,7 +460,6 @@ def _aggrid_view(df_show: pd.DataFrame, website_label: str = "website"):
                 cellStyle={"whiteSpace": "normal", "wordBreak": "break-word", "overflowWrap": "anywhere"},
             )
 
-    # Clickable "Website" label using helper URL col
     if website_key and url_col:
         link_renderer = JsCode(f"""
             function(params){{
@@ -506,7 +501,6 @@ def tab_view(query: str):
     else:
         st.warning("`streamlit-aggrid` not installed — showing basic table with wrapping.")
         _apply_css(df_show.columns.tolist())
-        # st.table gives true HTML table: wraps & auto-row-height; pre-sort for usability
         df_sorted = df_show.sort_values(
             by=["business_name","category","id"],
             key=lambda s: s.astype(str).str.casefold(),
@@ -521,7 +515,6 @@ def tab_view(query: str):
         mime="text/csv",
     )
 
-    # Debug expander immediately below CSV
     render_status_debug(expanded=False)
 
 
@@ -731,7 +724,8 @@ def tab_maintenance():
     with col[0]:
         if st.button("Normalize phone format to (xxx) xxx-xxxx"):
             with eng.begin() as c:
-                dfp = pd.read_sql_query(sql_text("SELECT id, phone FROM vendors"), c.connection)
+                # FIX: pass a plain SQL string and the SQLAlchemy Connection (c), not c.connection
+                dfp = pd.read_sql_query("SELECT id, phone FROM vendors", c)
                 for _, r in dfp.iterrows():
                     oldp = str(r.get("phone",""))
                     fmt = _format_phone_10(oldp)
