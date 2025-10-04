@@ -1,4 +1,4 @@
-# app_admin.py — Vendors Admin (v3.6.5)
+# app_admin.py — Vendors Admin (v3.6.6)
 # View | Add | Edit | Delete | Categories Admin | Services Admin | Maintenance | Changelog
 # - AgGrid optional: wrap/auto-height for ALL columns EXCEPT notes & keywords (fixed height)
 # - Website column: proper clickable link via DOM element, click propagation suppressed
@@ -7,6 +7,7 @@
 # - Validators, audit trail, schema guardrails; CSV + Debug under the table in View
 # - v3.6.3: fixed pandas read_sql_query usage in Maintenance
 # - v3.6.5: hardened hyperlink + copy behavior in AgGrid
+# - v3.6.6: FIX Python list usage (insert instead of splice), CSS typo
 
 from __future__ import annotations
 
@@ -243,7 +244,7 @@ def _apply_css_for_table(field_order: List[str]):
             background: var(--background-color, white);
             box-shadow: 1px 0 0 rgba(0,0,0,0.06);
         }}
-        {tbl_sel} thehead tr th:nth-child(1), {df_sel} thead tr th:nth-child(1) {{ z-index: 3; }}
+        {tbl_sel} thead tr th:nth-child(1), {df_sel} thead tr th:nth-child(1) {{ z-index: 3; }}
         """
 
     st.markdown("<style>" + "\n".join(rules) + sticky + "</style>", unsafe_allow_html=True)
@@ -582,7 +583,8 @@ def _aggrid_view(df_show: pd.DataFrame, website_label: str = "website"):
                 }
             """)
         }
-        grid_options["columnDefs"].splice(0, 0, copy_col)
+        # Python list, not JS: use insert
+        grid_options["columnDefs"].insert(0, copy_col)
 
     AgGrid(
         _df,
@@ -645,7 +647,7 @@ def tab_add():
             phone = st.text_input(LABEL_OVERRIDES.get("phone", "phone"), placeholder="(210) 555-0123 or 210-555-0123")
         with col[1]:
             address = st.text_input(LABEL_OVERRIDES.get("address", "address"))
-            website = st.text_input(LABEL_OVERRIDES.get("website", "website"), placeholder="https://example.com")
+            website = st.text_input(LABEL_OVERRIDES.get("website", "website"), value="", placeholder="https://example.com")
             notes = st.text_area(LABEL_OVERRIDES.get("notes", "notes"))
             keywords = st.text_input(LABEL_OVERRIDES.get("keywords", "keywords"))
         submitted = st.form_submit_button("Add")
