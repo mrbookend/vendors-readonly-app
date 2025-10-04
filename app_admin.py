@@ -543,7 +543,7 @@ def tab_browse(db: Engine):
     gob.configure_default_column(
         resizable=True,
         sortable=True,
-        filter=True,
+        filter=False,            # ← filters disabled globally
         wrapHeaderText=True,
         autoHeaderHeight=True,
         minWidth=90,
