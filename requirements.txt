@@ -1,15 +1,20 @@
+# build tooling
 pip==24.2
 setuptools==72.1.0
 wheel==0.44.0
 
+# app framework
 streamlit==1.37.1
 protobuf<5
 
+# data stack
 pandas==2.2.2
 numpy==1.26.4
 
+# UI grid
 streamlit-aggrid==0.3.4.post3
 
-sqlalchemy>=2.0
-sqlalchemy-libsql>=0.1.0
+# database stack (Turso / libSQL via SQLAlchemy)
+sqlalchemy~=2.0
+sqlalchemy-libsql~=0.1
 libsql-client==0.3.1
