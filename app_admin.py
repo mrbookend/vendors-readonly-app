@@ -29,6 +29,24 @@ from urllib.parse import urlparse, parse_qsl, urlencode, urlunparse
 # AgGrid (table with column width control & wrapping)
 from st_aggrid import AgGrid, GridOptionsBuilder, GridUpdateMode
 
+# --- URL sanitizer for display-only ---
+def _sanitize_urls(df: pd.DataFrame, col: str = "website") -> pd.DataFrame:
+    import pandas as pd
+    if col not in df.columns:
+        return df
+    def norm(x):
+        if x is None or (isinstance(x, float) and pd.isna(x)):
+            return ""
+        s = str(x).strip()
+        if not s:
+            return ""
+        if s.startswith(("http://", "https://")):
+            return s
+        return "https://" + s
+    df[col] = df[col].map(norm)
+    return df
+
+
 # =========================
 # Page Layout / Secrets
 # =========================
