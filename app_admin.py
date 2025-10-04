@@ -467,7 +467,7 @@ def _aggrid_view(df_show: pd.DataFrame, website_label: str = "website"):
         if px:
             gob.configure_column(col, width=px)
 
-    # Turn OFF wrap/autoHeight for notes & keywords only
+        # Turn OFF wrap/autoHeight for notes & keywords only
     for col in _df.columns:
         low = col.lower()
         raw_match = low in {"notes","keywords"}
@@ -480,20 +480,19 @@ def _aggrid_view(df_show: pd.DataFrame, website_label: str = "website"):
                 cellStyle={"whiteSpace": "nowrap", "textOverflow": "ellipsis", "overflow": "hidden"}
             )
 
-    # Clickable "Website" — RETURN HTML STRING (not a DOM node) to avoid React invariant #31
+    # Clickable "Website" WITHOUT HTML/DOM renderers: show a label and open on click.
     if website_key and url_col:
-        link_renderer = JsCode(f"""
-            function(params) {{
-                const url = params.data && params.data["{url_col}"] ? params.data["{url_col}"] : "";
-                if (!url) return "";
-                // HTML string; AgGrid sets innerHTML. We also stop propagation inline.
-                return '<a href="' + url + '" target="_blank" rel="noopener noreferrer" onclick="event.stopPropagation();">Website</a>';
+        label_formatter = JsCode(f"""
+            function(params){{
+                const url = (params.data && params.data["{url_col}"]) || "";
+                return url ? "Website" : "";
             }}
         """)
-        gob.configure_column(website_key, cellRenderer=link_renderer)
+        gob.configure_column(website_key, valueFormatter=label_formatter)
 
     grid_options = gob.build()
     grid_options["floatingFilter"] = False
+
     grid_options["suppressMenuHide"] = True
     grid_options["domLayout"] = "normal"
 
