@@ -502,22 +502,32 @@ def _aggrid_view(df_show: pd.DataFrame, website_label: str = "website"):
     grid_options["floatingFilter"] = False
     grid_options["suppressMenuHide"] = True
     grid_options["domLayout"] = "normal"
-
-    # Improve copy behavior (but avoid whole-row highlight/selection)
+    
+    # Improve copy behavior (formatted values; avoid whole-row highlight/selection)
     grid_options["ensureDomOrder"] = True
-    grid_options["enableRangeSelection"] = True
-    grid_options["enableCellTextSelection"] = True
+    grid_options["enableRangeSelection"] = True          # drag to select ranges
+    grid_options["enableCellTextSelection"] = True       # single-cell text selection works
+    grid_options["suppressCopySingleCellRanges"] = False # allow copying a single focused cell
 
-    # Disable row selection via click and row hover highlight
-    grid_options["rowSelection"] = "single"          # required key; we'll suppress actual click-selection
-    grid_options["rowMultiSelectWithClick"] = False  # no multi-select on click
-    grid_options["suppressRowClickSelection"] = True # clicking a cell won’t select the row
-    grid_options["suppressRowHoverHighlight"] = True # no full-row highlight on hover
+    # Disable row selection via click and row hover highlight (keeps cell/range copy clean)
+    grid_options["rowSelection"] = "single"
+    grid_options["rowMultiSelectWithClick"] = False
+    grid_options["suppressRowClickSelection"] = True
+    grid_options["suppressRowHoverHighlight"] = True
 
-    # Keep clipboard behavior
-    grid_options["suppressCopyRowsToClipboard"] = False
-    grid_options["clipboardDelimiter"] = "\t"
-    grid_options["copyHeadersToClipboard"] = False
+    # Clipboard defaults: copy only what’s selected (not whole row)
+    grid_options["suppressCopyRowsToClipboard"] = False  # keep normal copy behavior for selections
+    grid_options["clipboardDelimiter"] = "\t"            # set to "," for CSV if you prefer
+    grid_options["copyHeadersToClipboard"] = False       # set True if you want headers included
+
+    # Copy the displayed (formatted) value when present; fallback to raw value
+    grid_options["processCellForClipboard"] = JsCode("""
+        function(params) {
+          return (params && params.valueFormatted != null) ? String(params.valueFormatted) :
+                 (params && params.value != null) ? String(params.value) : "";
+        }
+    """)
+
 
     # Open URL on click for the Website column (guard: only on real mouse click, and not while editing)
     if website_key and url_col:
