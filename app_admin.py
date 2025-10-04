@@ -509,6 +509,7 @@ def _aggrid_view(df_show: pd.DataFrame, website_label: str = "website"):
     grid_options["copyHeadersToClipboard"] = False
 
     # Context menu items incl. Copy row (TSV)
+        # Context menu items incl. Copy row (TSV)
     grid_options["getContextMenuItems"] = JsCode("""
         function(params) {
           const res = ['copy', 'copyWithHeaders', 'paste'];
@@ -540,50 +541,13 @@ def _aggrid_view(df_show: pd.DataFrame, website_label: str = "website"):
         }
     """)
 
-    # Add a small "Copy" button column to copy the full displayed row (works even if keyboard copy is blocked)
-    if "columnDefs" in grid_options and isinstance(grid_options["columnDefs"], list):
-        copy_col = {
-            "headerName": "Copy",
-            "field": "__copy__",
-            "width": 70,
-            "pinned": "left" if STICKY_FIRST else None,
-            "suppressMenu": True,
-            "sortable": False,
-            "filter": False,
-            "cellRenderer": JsCode("""
-                function(params) {
-                    const btn = document.createElement('button');
-                    btn.textContent = 'Copy';
-                    btn.style.cursor = 'pointer';
-                    btn.addEventListener('click', function(e) {
-                        e.stopPropagation();
-                        const data = params.node.data || {};
-                        const cols = params.columnApi.getAllDisplayedColumns();
-                        const vals = [];
-                        cols.forEach(c => {
-                            const id = c.getColId();
-                            if (id === '__copy__') return;
-                            const v = data[id] != null ? String(data[id]) : '';
-                            vals.push(v);
-                        });
-                        const txt = vals.join('\\t');
-                        if (navigator && navigator.clipboard && navigator.clipboard.writeText) {
-                          navigator.clipboard.writeText(txt);
-                        } else {
-                          const ta = document.createElement('textarea');
-                          ta.value = txt; document.body.appendChild(ta);
-                          ta.select(); document.execCommand('copy'); document.body.removeChild(ta);
-                        }
-                    });
-                    return btn;
-                }
-            """)
-        }
-        grid_options["columnDefs"].insert(0, copy_col)
+    # Removed the per-row "Copy" button column to avoid React invariant #31 (DOM nodes in React tree).
+    # Use keyboard copy (Ctrl/Cmd+C) with selection, or right-click → "Copy row (TSV)".
 
     AgGrid(
         _df,
         gridOptions=grid_options,
+
         update_mode=GridUpdateMode.NO_UPDATE,
         fit_columns_on_grid_load=False,
         allow_unsafe_jscode=True,
