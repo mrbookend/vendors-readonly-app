@@ -1,41 +1,38 @@
-# app_admin.py
-# Vendors Admin — wide layout, no sidebar, top tabs.
-# Stable Streamlit CRUD (no AG Grid), Turso (libSQL) first, SQLite fallback.
-# Features:
-# - Top tabs: Browse | Add | Edit | Delete | Admin | Debug
-# - Browse: global (non-FTS) filter across all fields
-# - Add / Edit / Delete Vendors with validation and immediate refresh
-# - Categories & Services Admin (add, reassign, delete-when-unused)
-# - "Repair services table" safety button
-# - Phone normalization: (XXX) XXX-XXXX or blank
-# - URL normalization: ensure https:// scheme
-# - Optional 'keywords' column support if present in vendors
-#
-# Expected DB schema (text linking):
-# vendors(id INTEGER PK, category TEXT, service TEXT, business_name TEXT, contact_name TEXT,
-#         phone TEXT, address TEXT, website TEXT, notes TEXT, [keywords TEXT optional])
-# categories(id INTEGER PK, name TEXT UNIQUE)
-# services(id INTEGER PK, name TEXT UNIQUE)
-#
-# Secrets (Streamlit), optional:
-#   TURSO_DATABASE_URL: "sqlite+libsql://<host>?secure=true"
-#   TURSO_AUTH_TOKEN: "<jwt>"
-#   page_max_width_px: int (e.g., 1800)
+# app_admin.py — Vendors Admin (v3.6.7)
+# View | Add | Edit | Delete | Categories Admin | Services Admin | Maintenance | Changelog
+# - AgGrid optional: wrap/auto-height for ALL columns EXCEPT notes & keywords (fixed height)
+# - Website column: renderer now returns an HTML STRING (no raw DOM nodes) → fixes React error #31
+# - Copy UX: range selection + cell text selection; “Copy” button column (TSV)
+# - Fallback uses st.table; CSS: wrap everywhere except notes/keywords; fixed widths
+# - Validators, audit trail, schema guardrails; CSV + Debug under the table in View
+# - v3.6.3: fixed pandas read_sql_query usage in Maintenance
+# - v3.6.5: hardened hyperlink + copy in AgGrid
+# - v3.6.6: fixed Python list insert & CSS typo
+# - v3.6.7: Website cellRenderer returns HTML string (no DOM), preventing React invariant #31
 
 from __future__ import annotations
 
 import os
 import re
-from typing import List, Dict, Optional, Tuple
-from urllib.parse import urlparse
+from typing import Dict, List, Tuple, Optional
 
 import pandas as pd
 import streamlit as st
-from sqlalchemy import create_engine, text as sql_text
-from sqlalchemy.engine import Engine
+from sqlalchemy import create_engine
+from sqlalchemy.sql import text as sql_text
+from urllib.parse import urlparse
+from datetime import datetime, timezone
+
+# ---- AgGrid (optional; app falls back if not installed) ----
+try:
+    from st_aggrid import AgGrid, GridOptionsBuilder, JsCode, GridUpdateMode, ColumnsAutoSizeMode
+    _AGGRID_AVAILABLE = True
+except Exception:
+    _AGGRID_AVAILABLE = False
+
 
 # -----------------------------
-# Page layout (no sidebar, wide)
+# Secrets / env helpers
 # -----------------------------
 def _read_secret(name: str, default=None):
     try:
@@ -45,721 +42,911 @@ def _read_secret(name: str, default=None):
         pass
     return os.environ.get(name, default)
 
-def _apply_page_width_css(max_width_px: Optional[int]):
-    if not max_width_px:
-        return
+def _get_bool(val, default=False):
+    if isinstance(val, bool):
+        return val
+    if isinstance(val, str):
+        return val.strip().lower() in ("1", "true", "yes", "on")
+    return bool(default)
+
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+
+
+# -----------------------------
+# Page config / layout
+# -----------------------------
+def _apply_layout():
+    st.set_page_config(
+        page_title=_read_secret("page_title", "HCR Vendors Admin"),
+        layout="wide",
+        initial_sidebar_state=_read_secret("sidebar_state", "expanded"),
+    )
+    maxw = _read_secret("page_max_width_px", 2300)
+    try:
+        maxw = int(maxw)
+    except Exception:
+        maxw = 2300
     st.markdown(
-        f"""
-        <style>
-          .block-container {{
-            max-width: {int(max_width_px)}px;
-          }}
-          /* Hide the left sidebar entirely */
-          [data-testid="stSidebar"] {{ display: none; }}
-          /* Tighten top padding */
-          .block-container > div:first-child {{ padding-top: 0.5rem; }}
-        </style>
-        """,
+        f"<style>.block-container {{ max-width: {maxw}px; }}</style>",
         unsafe_allow_html=True,
     )
 
-PAGE_MAX_WIDTH = _read_secret("page_max_width_px", 1600)
-st.set_page_config(page_title="", layout="wide")  # No visible page title
-_apply_page_width_css(PAGE_MAX_WIDTH)
+_apply_layout()
 
-# (Intentionally no st.title(...) — per request)
 
 # -----------------------------
-# Engine / DB helpers
+# Config from secrets
 # -----------------------------
-def build_engine() -> Tuple[Engine, Dict[str, str]]:
-    turso_url = _read_secret("TURSO_DATABASE_URL")
-    turso_token = _read_secret("TURSO_AUTH_TOKEN")
-    debug = {}
+LABEL_OVERRIDES: Dict[str, str] = _read_secret("READONLY_COLUMN_LABELS", {}) or {}
+COLUMN_WIDTHS: Dict[str, int]   = _read_secret("COLUMN_WIDTHS_PX_READONLY", {}) or {}
+STICKY_FIRST: bool              = _get_bool(_read_secret("READONLY_STICKY_FIRST_COL", False), False)
 
-    if turso_url:
-        try:
-            engine = create_engine(
-                turso_url,
-                connect_args={"auth_token": turso_token} if turso_token else {},
-                pool_pre_ping=True,
-                future=True,
-            )
-            with engine.connect() as conn:
-                conn.execute(sql_text("SELECT 1"))
-            debug["engine_url"] = turso_url
-            debug["using_remote"] = True
-            return engine, debug
-        except Exception as e:
-            debug["remote_error"] = str(e)
-
-    local_path = os.path.abspath(os.path.join(os.getcwd(), "vendors.db"))
-    engine = create_engine(f"sqlite:///{local_path}", future=True)
-    debug["engine_url"] = f"sqlite:///{local_path}"
-    debug["using_remote"] = False
-    return engine, debug
-
-engine, engine_info = build_engine()
-
-def table_exists(table: str) -> bool:
-    with engine.connect() as conn:
-        res = conn.execute(
-            sql_text(
-                "SELECT name FROM sqlite_master WHERE type='table' AND lower(name)=lower(:t)"
-            ),
-            {"t": table},
-        ).fetchone()
-    return res is not None
-
-def ensure_min_schema():
-    """Create minimal tables if missing. No destructive changes."""
-    with engine.begin() as conn:
-        if not table_exists("categories"):
-            conn.execute(sql_text("""
-                CREATE TABLE categories(
-                    id INTEGER PRIMARY KEY,
-                    name TEXT UNIQUE
-                )
-            """))
-        if not table_exists("services"):
-            conn.execute(sql_text("""
-                CREATE TABLE services(
-                    id INTEGER PRIMARY KEY,
-                    name TEXT UNIQUE
-                )
-            """))
-        if not table_exists("vendors"):
-            conn.execute(sql_text("""
-                CREATE TABLE vendors(
-                    id INTEGER PRIMARY KEY,
-                    category TEXT,
-                    service TEXT,
-                    business_name TEXT,
-                    contact_name TEXT,
-                    phone TEXT,
-                    address TEXT,
-                    website TEXT,
-                    notes TEXT
-                )
-            """))
-
-ensure_min_schema()
-
-def get_columns(table: str) -> List[str]:
-    with engine.connect() as conn:
-        rows = conn.execute(sql_text(f"PRAGMA table_info({table})")).fetchall()
-    return [r[1] for r in rows]
-
-def has_column(table: str, col: str) -> bool:
-    return col in get_columns(table)
-
-def read_df(table: str) -> pd.DataFrame:
-    with engine.connect() as conn:
-        return pd.read_sql(sql_text(f"SELECT * FROM {table}"), conn)
-
-def nonempty_trim(s: Optional[str]) -> str:
-    return (s or "").strip()
-
-# -----------------------------
-# Normalization / Validation
-# -----------------------------
-_phone_digits = re.compile(r"\D+")
-
-def normalize_phone(phone: str) -> str:
-    if not phone:
-        return ""
-    digits = _phone_digits.sub("", phone)
-    if len(digits) != 10:
-        raise ValueError("Phone must be 10 digits or left blank")
-    return f"({digits[0:3]}) {digits[3:6]}-{digits[6:10]}"
-
-def normalize_url(url: str) -> str:
-    if not url:
-        return ""
-    u = url.strip()
-    if u.startswith(("http://", "https://")):
-        return u
-    return f"https://{u}"
-
-# -----------------------------
-# Data access helpers (CRUD)
-# -----------------------------
-def list_categories() -> List[str]:
-    if not table_exists("categories"):
-        return []
-    df = read_df("categories")
-    if "name" in df.columns:
-        return sorted({nonempty_trim(x) for x in df["name"].astype(str) if nonempty_trim(x)})
-    return []
-
-def list_services() -> List[str]:
-    if not table_exists("services"):
-        return []
-    df = read_df("services")
-    if "name" in df.columns:
-        return sorted({nonempty_trim(x) for x in df["name"].astype(str) if nonempty_trim(x)})
-    return []
-
-def vendors_df() -> pd.DataFrame:
-    if not table_exists("vendors"):
-        return pd.DataFrame(columns=["id","category","service","business_name","contact_name","phone","address","website","notes"])
-    df = read_df("vendors")
-
-    base_cols = ["id","category","service","business_name","contact_name","phone","address","website","notes"]
-    for c in base_cols:
-        if c not in df.columns:
-            df[c] = ""
-    cols = df.columns.tolist()
-    order = base_cols + [c for c in cols if c not in base_cols]  # preserve optional columns (e.g., keywords)
-    return df[order]
-
-def add_vendor(row: Dict[str, str]) -> int:
-    with engine.begin() as conn:
-        res = conn.execute(sql_text("""
-            INSERT INTO vendors(category, service, business_name, contact_name, phone, address, website, notes {kw_cols})
-            VALUES(:category, :service, :business_name, :contact_name, :phone, :address, :website, :notes {kw_vals})
-        """.format(
-            kw_cols=(", keywords" if has_column("vendors","keywords") else ""),
-            kw_vals=(", :keywords" if has_column("vendors","keywords") else "")
-        )), row)
-        new_id = res.lastrowid if hasattr(res, "lastrowid") else None
-    return int(new_id or 0)
-
-def update_vendor(vendor_id: int, row: Dict[str, str]) -> None:
-    set_parts = ["category=:category","service=:service","business_name=:business_name","contact_name=:contact_name",
-                 "phone=:phone","address=:address","website=:website","notes=:notes"]
-    if has_column("vendors","keywords"):
-        set_parts.append("keywords=:keywords")
-    with engine.begin() as conn:
-        conn.execute(sql_text(f"""
-            UPDATE vendors
-               SET {", ".join(set_parts)}
-             WHERE id=:id
-        """), {**row, "id": vendor_id})
-
-def delete_vendor(vendor_id: int) -> None:
-    with engine.begin() as conn:
-        conn.execute(sql_text("DELETE FROM vendors WHERE id=:id"), {"id": vendor_id})
-
-def add_category(name: str) -> None:
-    with engine.begin() as conn:
-        conn.execute(sql_text("INSERT OR IGNORE INTO categories(name) VALUES(:n)"), {"n": name})
-
-def delete_category(name: str) -> None:
-    with engine.begin() as conn:
-        conn.execute(sql_text("DELETE FROM categories WHERE name=:n"), {"n": name})
-
-def add_service(name: str) -> None:
-    with engine.begin() as conn:
-        conn.execute(sql_text("INSERT OR IGNORE INTO services(name) VALUES(:n)"), {"n": name})
-
-def delete_service(name: str) -> None:
-    with engine.begin() as conn:
-        conn.execute(sql_text("DELETE FROM services WHERE name=:n"), {"n": name})
-
-def reassign_category(old: str, new: str) -> int:
-    with engine.begin() as conn:
-        res = conn.execute(sql_text("""
-            UPDATE vendors SET category=:new WHERE lower(trim(category))=lower(trim(:old))
-        """), {"new": new, "old": old})
-        return res.rowcount or 0
-
-def reassign_service(old: str, new: str) -> int:
-    with engine.begin() as conn:
-        res = conn.execute(sql_text("""
-            UPDATE vendors SET service=:new WHERE lower(trim(service))=lower(trim(:old))
-        """), {"new": new, "old": old})
-        return res.rowcount or 0
-
-def usage_counts(col: str, val: str) -> int:
-    with engine.connect() as conn:
-        res = conn.execute(sql_text(f"""
-            SELECT COUNT(*) FROM vendors WHERE lower(trim({col}))=lower(trim(:v))
-        """), {"v": val}).fetchone()
-    return int(res[0]) if res else 0
-
-def repair_services_table():
-    """Ensure 'services' has minimal expected schema; add UNIQUE index if missing."""
-    with engine.begin() as conn:
-        conn.execute(sql_text("""
-            CREATE TABLE IF NOT EXISTS services(
-                id INTEGER PRIMARY KEY,
-                name TEXT UNIQUE
-            )
-        """))
-        try:
-            conn.execute(sql_text("CREATE UNIQUE INDEX IF NOT EXISTS idx_services_name ON services(name)"))
-        except Exception:
-            pass
-
-# -----------------------------
-# Top Navigation (no sidebar)
-# -----------------------------
-tab_browse, tab_add, tab_edit, tab_delete, tab_admin, tab_debug = st.tabs(
-    ["Browse", "Add Vendor", "Edit Vendor", "Delete Vendor", "Categories & Services Admin", "Database Status & Schema (debug)"]
+HELP_TITLE: str = (
+    _read_secret("READONLY_HELP_TITLE")
+    or LABEL_OVERRIDES.get("readonly_help_title")
+    or "Providers Help / Tips"
+)
+HELP_MD: str = (
+    _read_secret("READONLY_HELP_MD")
+    or LABEL_OVERRIDES.get("readonly_help_md")
+    or ""
+)
+HELP_DEBUG: bool = _get_bool(
+    _read_secret("READONLY_HELP_DEBUG"),
+    _get_bool(LABEL_OVERRIDES.get("readonly_help_debug"), False),
 )
 
+ADMIN_DISPLAY_NAME: str = _read_secret("ADMIN_DISPLAY_NAME", "Admin")
+
+RAW_COLS = [
+    "id","category","service","business_name","contact_name",
+    "phone","address","website","notes","keywords",
+]
+AUDIT_COLS = ["created_at","updated_at","updated_by"]
+
+
 # -----------------------------
-# Browse
+# Engine (Turso/libSQL with fallback)
 # -----------------------------
-with tab_browse:
-    st.subheader("Browse Vendors")
-
-    df = vendors_df()
-    text_cols = [c for c in df.columns if c != "id"]
-    st.caption("Global search across all fields (non-FTS, case-insensitive; matches partial words).")
-    q = st.text_input("Search", value="", placeholder="e.g., plumb returns any record with 'plumb' anywhere")
-
-    if q.strip():
-        needle = q.strip().lower()
-        mask = pd.Series([False] * len(df))
-        for c in text_cols:
-            mask = mask | df[c].astype(str).str.lower().str.contains(needle, na=False)
-        df_view = df[mask].copy()
-    else:
-        df_view = df.copy()
-
- # -----------------------------
-# Browse
-# -----------------------------
-with tab_browse:
-    st.subheader("Browse Vendors")
-
-    df = vendors_df()
-    text_cols = [c for c in df.columns if c != "id"]
-
-    # --- SINGLE search widget (unique key) ---
-    st.caption("Global search across all fields (non-FTS, case-insensitive; matches partial words).")
-    q = st.text_input(
-        "Search",
-        value="",
-        placeholder="e.g., plumb returns any record with 'plumb' anywhere",
-        key="browse_search",
-    )
-
-    if q.strip():
-        needle = q.strip().lower()
-        mask = pd.Series([False] * len(df))
-        for c in text_cols:
-            mask = mask | df[c].astype(str).str.lower().str.contains(needle, na=False)
-        df_view = df[mask].copy()
-    else:
-        df_view = df.copy()
-
-    # --- HTML table: linkified Website + no-wrap for Keywords/Phone/ID ---
-    import html
-    from urllib.parse import urlparse
-
-    def _ensure_scheme(u: str) -> str:
-        u = (u or "").strip()
-        if not u:
-            return ""
-        return u if u.startswith(("http://", "https://")) else f"https://{u}"
-
-    def _escape(s: str) -> str:
-        return html.escape(s or "", quote=True)
-
-    def _domain(u: str) -> str:
-        u2 = _ensure_scheme(u)
+def _engine():
+    url = _read_secret("TURSO_DATABASE_URL", "sqlite+libsql://vendors-prod-mrbookend.aws-us-west-2.turso.io?secure=true")
+    token = _read_secret("TURSO_AUTH_TOKEN", None)
+    if isinstance(url, str) and url.startswith("sqlite+libsql://"):
         try:
-            return urlparse(u2).netloc or u
-        except Exception:
-            return u
-
-    df_show = df_view.copy()
-    if "website" not in df_show.columns:
-        df_show["website"] = ""
-    df_show["website"] = df_show["website"].astype(str).fillna("")
-
-    # Derived columns
-    df_show["URL (full)"] = df_show["website"]
-    df_show["Website"] = df_show.apply(
-        lambda r: (
-            f'<a href="{_escape(_ensure_scheme(r["website"]))}" target="_blank" rel="noopener">'
-            f'{_escape(_domain(r["website"]))}</a>'
-        ) if r["website"] else "",
-        axis=1
-    )
-
-    # Column order; include keywords last if present
-    base_cols = ["id","category","service","business_name","contact_name","phone","address","notes"]
-    opt_cols  = [c for c in ["keywords"] if c in df_show.columns]
-    order = base_cols + ["Website","URL (full)"] + opt_cols
-    cols = order
-
-    # Pre-compute per-column CSS classes so we can control wrapping
-    # No wrap for id/phone/keywords; keep reasonable widths to avoid tall rows
-    col_classes = {c: "" for c in cols}
-    if "id" in col_classes:
-        col_classes["id"] = "no-wrap narrow"
-    if "phone" in col_classes:
-        col_classes["phone"] = "no-wrap narrow"
-    if "keywords" in col_classes:
-        col_classes["keywords"] = "no-wrap medium"
-
-    # Build header
-    thead = "<tr>" + "".join(
-        f'<th class="{col_classes.get(c, "")}">{_escape(c)}</th>' for c in cols
-    ) + "</tr>"
-
-    # Build body (escape everything except the Website anchor we control)
-    rows_html = []
-    for _, row in df_show[cols].iterrows():
-        tds = []
-        for c in cols:
-            cls = col_classes.get(c, "")
-            if c == "Website":
-                cell_html = row[c] or ""
-            else:
-                val = "" if pd.isna(row[c]) else str(row[c])
-                # Truncate visually but keep full in title tooltip
-                cell_html = f'<span title="{_escape(val)}">{_escape(val)}</span>'
-            tds.append(f'<td class="{cls}">{cell_html}</td>')
-        rows_html.append("<tr>" + "".join(tds) + "</tr>")
-
-    # CSS: fixed layout, ellipsis, no wrap for certain cols, sane widths
-    table_css = """
-    <style>
-      .tbl-wrap { overflow-x: auto; max-width: 100%; }
-      .tbl { width: 100%; border-collapse: collapse; table-layout: fixed; }
-      .tbl th, .tbl td { padding: 6px 8px; border-bottom: 1px solid #eee; vertical-align: top; }
-      .tbl thead th { position: sticky; top: 0; background: #f7f7f7; z-index: 1; }
-
-      /* Default cells: single-line ellipsis to avoid tall rows */
-      .tbl td > span {
-        display: block;
-        white-space: nowrap;
-        overflow: hidden;
-        text-overflow: ellipsis;
-      }
-
-      /* No-wrap + narrow widths for ID/Phone; medium for Keywords */
-      .tbl th.narrow, .tbl td.narrow { width: 110px; }
-      .tbl th.medium, .tbl td.medium { width: 220px; }
-      .tbl th.no-wrap, .tbl td.no-wrap { white-space: nowrap; }
-    </style>
-    """
-
-    table_html = f"""
-    {table_css}
-    <div class="tbl-wrap">
-      <table class="tbl">
-        <thead>{thead}</thead>
-        <tbody>{''.join(rows_html)}</tbody>
-      </table>
-    </div>
-    """
-
-    st.markdown(table_html, unsafe_allow_html=True)
-
-
-
-# -----------------------------
-# Add Vendor
-# -----------------------------
-with tab_add:
-    st.subheader("Add Vendor")
-    cats = list_categories()
-    svcs = list_services()
-
-    with st.form("add_vendor_form", clear_on_submit=False):
-        category = st.selectbox("Category (required)", options=cats, index=0 if cats else None, placeholder="Select category")
-        service  = st.selectbox("Service (optional; may be blank)", options=[""] + svcs, index=0)
-        business_name = st.text_input("Business Name (required)")
-        contact_name = st.text_input("Contact Name")
-        phone = st.text_input("Phone — stored as (XXX) XXX-XXXX or left blank")
-        address = st.text_input("Address")
-        website = st.text_input("Website (normalize to https://...)")
-        notes = st.text_area("Notes")
-        kw_val = ""
-        if has_column("vendors", "keywords"):
-            kw_val = st.text_input("Keywords (comma or space separated allowed)")
-
-        submitted = st.form_submit_button("Add Vendor")
-
-    if submitted:
-        try:
-            if not business_name.strip():
-                st.error("Business Name is required."); st.stop()
-            if not category:
-                st.error("Category is required."); st.stop()
-
-            phone_norm = normalize_phone(phone.strip()) if phone.strip() else ""
-            url_norm = normalize_url(website.strip()) if website.strip() else ""
-
-            if has_column("vendors", "keywords"):
-                raw = kw_val.strip()
-                if raw:
-                    parts = [p.strip() for p in re.split(r"[,\s]+", raw) if p.strip()]
-                    kw_final = ", ".join(sorted(set(parts), key=str.lower))
-                else:
-                    kw_final = ""
-            else:
-                kw_final = None
-
-            payload = {
-                "category": nonempty_trim(category),
-                "service": nonempty_trim(service),
-                "business_name": nonempty_trim(business_name),
-                "contact_name": nonempty_trim(contact_name),
-                "phone": phone_norm,
-                "address": nonempty_trim(address),
-                "website": url_norm,
-                "notes": nonempty_trim(notes),
-            }
-            if kw_final is not None:
-                payload["keywords"] = kw_final
-
-            new_id = add_vendor(payload)
-            st.success(f"Added vendor #{new_id}: {payload['business_name']}")
-            st.rerun()
+            eng = create_engine(url, connect_args={"auth_token": token} if token else {}, pool_pre_ping=True)
+            with eng.connect() as c:
+                c.execute(sql_text("SELECT 1"))
+            return eng
         except Exception as e:
-            st.exception(e)
+            st.warning(f"Turso connection failed ({e}). Falling back to local SQLite vendors.db.")
+    local = "/mount/src/vendors-readonly-app/vendors.db"
+    if not os.path.exists(local):
+        local = "vendors.db"
+    return create_engine(f"sqlite:///{local}")
+
+eng = _engine()
+
 
 # -----------------------------
-# Edit Vendor
+# Schema migration / guardrails
 # -----------------------------
-with tab_edit:
-    st.subheader("Edit Vendor")
+def _column_exists(conn, table: str, col: str) -> bool:
+    try:
+        res = conn.execute(sql_text(f"PRAGMA table_info({table})")).fetchall()
+        cols = [r[1] for r in res]
+        return col in cols
+    except Exception:
+        return False
 
-    df = vendors_df()
-    if df.empty:
-        st.info("No vendors yet.")
+def _table_exists(conn, table: str) -> bool:
+    try:
+        res = conn.execute(sql_text(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name=:t"
+        ), {"t": table}).fetchone()
+        return bool(res)
+    except Exception:
+        return False
+
+def _ensure_ref_tables(conn):
+    conn.execute(sql_text("""
+        CREATE TABLE IF NOT EXISTS categories (
+            id   INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT UNIQUE NOT NULL
+        )
+    """))
+    conn.execute(sql_text("""
+        CREATE TABLE IF NOT EXISTS services (
+            id   INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT UNIQUE NOT NULL
+        )
+    """))
+
+def _ensure_schema():
+    with eng.begin() as c:
+        _ensure_ref_tables(c)
+        if _table_exists(c, "vendors"):
+            if not _column_exists(c, "vendors", "created_at"):
+                c.execute(sql_text("ALTER TABLE vendors ADD COLUMN created_at TEXT"))
+            if not _column_exists(c, "vendors", "updated_at"):
+                c.execute(sql_text("ALTER TABLE vendors ADD COLUMN updated_at TEXT"))
+            if not _column_exists(c, "vendors", "updated_by"):
+                c.execute(sql_text("ALTER TABLE vendors ADD COLUMN updated_by TEXT"))
+        c.execute(sql_text("""
+            CREATE TABLE IF NOT EXISTS vendor_changes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                vendor_id INTEGER NOT NULL,
+                changed_at TEXT NOT NULL,
+                changed_by TEXT NOT NULL,
+                action TEXT NOT NULL,   -- 'insert'|'update'|'delete'
+                field TEXT,
+                old_value TEXT,
+                new_value TEXT
+            )
+        """))
+
+_ensure_schema()
+
+
+# -----------------------------
+# CSS for table-based fallback (and some shared rules)
+# -----------------------------
+def _apply_css_for_table(field_order: List[str]):
+    """CSS that affects st.table AND legacy st.dataframe; wrap everywhere EXCEPT notes/keywords."""
+    tbl_sel = "div[data-testid='stTable'] table"
+    df_sel  = "div[data-testid='stDataFrame'] table"
+    base = f"""
+    {tbl_sel}, {df_sel} {{ table-layout: fixed !important; }}
+    {tbl_sel} td, {tbl_sel} th, {df_sel} td, {df_sel} th {{
+        white-space: normal !important;       /* wrap by default */
+        overflow-wrap: anywhere !important;
+        word-break: break-word !important;
+    }}
+    """
+    rules = [base]
+
+    # Fixed per-column widths (1-based nth-child)
+    for idx, col in enumerate(field_order, start=1):
+        px = COLUMN_WIDTHS.get(col)
+        if not px:
+            continue
+        rules.append(f"""
+        {tbl_sel} thead tr th:nth-child({idx}), {tbl_sel} tbody tr td:nth-child({idx}),
+        {df_sel}  thead tr th:nth-child({idx}), {df_sel}  tbody tr td:nth-child({idx}) {{
+            min-width:{px}px !important; max-width:{px}px !important; width:{px}px !important;
+        }}
+        """)
+
+    # Turn OFF wrapping for notes & keywords
+    def _nth_for(colname: str) -> Optional[int]:
+        try:
+            return field_order.index(colname) + 1
+        except ValueError:
+            return None
+
+    for colname in ["notes", "keywords"]:
+        nth = _nth_for(LABEL_OVERRIDES.get(colname, colname)) or _nth_for(colname)
+        if nth:
+            rules.append(f"""
+            {tbl_sel} thead tr th:nth-child({nth}), {tbl_sel} tbody tr td:nth-child({nth}),
+            {df_sel}  thead tr th:nth-child({nth}), {df_sel}  tbody tr td:nth-child({nth}) {{
+                white-space: nowrap !important;     /* no wrap */
+                overflow-wrap: normal !important;
+                word-break: normal !important;
+            }}
+            """)
+
+    sticky = ""
+    if STICKY_FIRST and field_order:
+        sticky = f"""
+        {tbl_sel} thead tr th:nth-child(1), {tbl_sel} tbody tr td:nth-child(1),
+        {df_sel}  thead tr th:nth-child(1), {df_sel}  tbody tr td:nth-child(1) {{
+            position: sticky; left: 0; z-index: 2;
+            background: var(--background-color, white);
+            box-shadow: 1px 0 0 rgba(0,0,0,0.06);
+        }}
+        {tbl_sel} thead tr th:nth-child(1), {df_sel} thead tr th:nth-child(1) {{ z-index: 3; }}
+        """
+
+    st.markdown("<style>" + "\n".join(rules) + sticky + "</style>", unsafe_allow_html=True)
+
+
+# -----------------------------
+# URL / phone validators
+# -----------------------------
+def _normalize_url(u: str) -> str:
+    s = (u or "").strip()
+    if not s:
+        return ""
+    if not s.lower().startswith(("http://","https://")):
+        s = "http://" + s
+    try:
+        p = urlparse(s)
+        if p.scheme not in ("http","https"): return ""
+        if not p.netloc or "." not in p.netloc: return ""
+        return s
+    except Exception:
+        return ""
+
+def _digits_only(s: str) -> str:
+    return re.sub(r"[^0-9]", "", s or "")
+
+def _format_phone_10(digits: str) -> str:
+    d = _digits_only(digits)
+    if len(d) != 10: return ""
+    return f"({d[0:3]}) {d[3:6]}-{d[6:10]}"
+
+def _validate_vendor_fields(business_name: str, category: str, service: str, phone: str, website: str) -> Tuple[bool, Dict[str,str], Dict[str,str]]:
+    errors: Dict[str,str] = {}
+    cleaned: Dict[str,str] = {}
+
+    if not (business_name or "").strip():
+        errors["business_name"] = "Business name is required."
     else:
-        df_sel = df.copy()
-        df_sel["bn_norm"] = df_sel["business_name"].astype(str).str.lower()
-        df_sel = df_sel.sort_values(["bn_norm","id"])
-        choices = [f"#{row.id} — {row.business_name}" for row in df_sel.itertuples(index=False)]
+        cleaned["business_name"] = business_name.strip()
 
-        sel = st.selectbox("Select vendor (Business Name ascending)", options=choices)
-        if sel:
-            vid = int(sel.split("—")[0].strip().lstrip("#").strip())
-            row = df[df["id"] == vid].iloc[0].to_dict()
+    if not (category or "").strip():
+        errors["category"] = "Category is required."
+    else:
+        cleaned["category"] = category.strip()
 
-            cats = list_categories()
-            svcs = list_services()
+    if (category or "").strip().casefold() != "home repair":
+        if not (service or "").strip():
+            errors["service"] = "Service is required unless Category is 'Home Repair'."
+        else:
+            cleaned["service"] = service.strip()
+    else:
+        cleaned["service"] = (service or "").strip()
 
-            with st.form("edit_vendor_form"):
-                category = st.selectbox("Category (required)", options=cats,
-                                        index=(cats.index(row["category"]) if row["category"] in cats else 0 if cats else None))
-                service  = st.selectbox("Service (optional)", options=[""] + svcs,
-                                        index=(([""] + svcs).index(row["service"]) if row["service"] in svcs else 0))
-                business_name = st.text_input("Business Name (required)", value=row.get("business_name",""))
-                contact_name = st.text_input("Contact Name", value=row.get("contact_name","") or "")
-                phone = st.text_input("Phone", value=row.get("phone","") or "")
-                address = st.text_input("Address", value=row.get("address","") or "")
-                website = st.text_input("Website", value=row.get("website","") or "")
-                notes = st.text_area("Notes", value=row.get("notes","") or "")
-                kw_val = None
-                if has_column("vendors","keywords"):
-                    kw_val = st.text_input("Keywords", value=row.get("keywords","") or "")
+    fmt_phone = _format_phone_10(phone)
+    if not fmt_phone:
+        errors["phone"] = "Phone must have exactly 10 digits."
+    else:
+        cleaned["phone"] = fmt_phone
 
-                save = st.form_submit_button("Save Changes")
+    web_norm = _normalize_url(website)
+    if (website or "").strip() and not web_norm:
+        errors["website"] = "Website must start with http/https and include a valid host (e.g., example.com)."
+    else:
+        cleaned["website"] = web_norm  # may be ""
 
-            if save:
-                try:
-                    if not business_name.strip():
-                        st.error("Business Name is required."); st.stop()
-                    if not category:
-                        st.error("Category is required."); st.stop()
+    return (len(errors) == 0), cleaned, errors
 
-                    phone_norm = normalize_phone(phone.strip()) if phone.strip() else ""
-                    url_norm = normalize_url(website.strip()) if website.strip() else ""
-
-                    payload = {
-                        "category": nonempty_trim(category),
-                        "service": nonempty_trim(service),
-                        "business_name": nonempty_trim(business_name),
-                        "contact_name": nonempty_trim(contact_name),
-                        "phone": phone_norm,
-                        "address": nonempty_trim(address),
-                        "website": url_norm,
-                        "notes": nonempty_trim(notes),
-                    }
-                    if kw_val is not None:
-                        raw = kw_val.strip()
-                        if raw:
-                            parts = [p.strip() for p in re.split(r"[,\s]+", raw) if p.strip()]
-                            payload["keywords"] = ", ".join(sorted(set(parts), key=str.lower))
-                        else:
-                            payload["keywords"] = ""
-
-                    update_vendor(vid, payload)
-                    st.success(f"Updated vendor #{vid}.")
-                    st.rerun()
-                except Exception as e:
-                    st.exception(e)
 
 # -----------------------------
-# Delete Vendor
+# Help + Quick filter
 # -----------------------------
-with tab_delete:
-    st.subheader("Delete Vendor")
+def render_help():
+    with st.expander(HELP_TITLE, expanded=False):
+        if HELP_MD:
+            st.markdown(HELP_MD)
+            if HELP_DEBUG:
+                st.caption("Raw help (debug preview)")
+                st.code(HELP_MD, language=None)
+        else:
+            st.info("No help content has been configured yet.")
 
-    df = vendors_df()
+def _quick_filter_ui():
+    return st.text_input("Quick filter (type words or parts of words):", "", placeholder="e.g., plumber roof 78240")
+
+def _apply_quick_filter(df: pd.DataFrame, query: str) -> pd.DataFrame:
+    q = (query or "").strip().lower()
+    if not q:
+        return df
+    terms = [t for t in q.split() if t]
+    if not terms:
+        return df
+    cols = [c for c in df.columns if c.lower() in {
+        "business_name","provider","category","service","contact_name",
+        "phone","address","website","notes","keywords","website url"
+    }]
+    if not cols:
+        return df
+    blob = df[cols].fillna("").astype(str).agg(" ".join, axis=1).str.lower()
+    mask = pd.Series(True, index=df.index)
+    for t in terms:
+        mask &= blob.str.contains(t, na=False)
+    return df[mask]
+
+
+# -----------------------------
+# Data access + audit helpers
+# -----------------------------
+def _fetch_df() -> pd.DataFrame:
+    with eng.connect() as c:
+        df = pd.read_sql_query(sql_text("SELECT * FROM vendors"), c)
+    for col in RAW_COLS + AUDIT_COLS:
+        if col not in df.columns:
+            df[col] = ""
+    return df[RAW_COLS + AUDIT_COLS]
+
+def _cats() -> pd.DataFrame:
+    with eng.connect() as c:
+        try:
+            return pd.read_sql_query(sql_text("SELECT id, name FROM categories ORDER BY name COLLATE NOCASE"), c)
+        except Exception:
+            return pd.DataFrame(columns=["id","name"]).astype({"id":int,"name":str})
+
+def _svcs() -> pd.DataFrame:
+    with eng.connect() as c:
+        try:
+            return pd.read_sql_query(sql_text("SELECT id, name FROM services ORDER BY name COLLATE NOCASE"), c)
+        except Exception:
+            return pd.DataFrame(columns=["id","name"]).astype({"id":int,"name":str})
+
+def _insert_vendor(row: Dict[str,str]):
+    now = _now_iso()
+    row2 = dict(row, created_at=now, updated_at=now, updated_by=ADMIN_DISPLAY_NAME)
+    q = sql_text("""
+        INSERT INTO vendors(category, service, business_name, contact_name, phone, address, website, notes, keywords, created_at, updated_at, updated_by)
+        VALUES(:category,:service,:business_name,:contact_name,:phone,:address,:website,:notes,:keywords,:created_at,:updated_at,:updated_by)
+    """)
+    with eng.begin() as c:
+        c.execute(q, row2)
+        vid = c.execute(sql_text("SELECT last_insert_rowid()")).scalar()
+        c.execute(sql_text("""
+            INSERT INTO vendor_changes(vendor_id, changed_at, changed_by, action, field, old_value, new_value)
+            VALUES(:vid, :ts, :by, 'insert', NULL, NULL, NULL)
+        """), {"vid": vid, "ts": now, "by": ADMIN_DISPLAY_NAME})
+
+def _update_vendor(vid: int, new_row: Dict[str,str]):
+    with eng.begin() as c:
+        cur = c.execute(sql_text("SELECT * FROM vendors WHERE id = :id"), {"id": vid}).mappings().first()
+        if not cur:
+            return
+        now = _now_iso()
+        upd = dict(new_row, updated_at=now, updated_by=ADMIN_DISPLAY_NAME)
+        sets = ", ".join([f"{k} = :{k}" for k in upd.keys()])
+        c.execute(sql_text(f"UPDATE vendors SET {sets} WHERE id = :id"), {**upd, "id": vid})
+        for k, newv in new_row.items():
+            oldv = cur.get(k, "")
+            if (oldv or "") != (newv or ""):
+                c.execute(sql_text("""
+                    INSERT INTO vendor_changes(vendor_id, changed_at, changed_by, action, field, old_value, new_value)
+                    VALUES(:vid, :ts, :by, 'update', :field, :oldv, :newv)
+                """), {"vid": vid, "ts": now, "by": ADMIN_DISPLAY_NAME, "field": k,
+                       "oldv": str(oldv) if oldv is not None else "", "newv": str(newv) if newv is not None else ""})
+
+def _delete_vendor(vid: int):
+    now = _now_iso()
+    with eng.begin() as c:
+        c.execute(sql_text("""
+            INSERT INTO vendor_changes(vendor_id, changed_at, changed_by, action, field, old_value, new_value)
+            VALUES(:vid, :ts, :by, 'delete', NULL, NULL, NULL)
+        """), {"vid": vid, "ts": now, "by": ADMIN_DISPLAY_NAME})
+        c.execute(sql_text("DELETE FROM vendors WHERE id = :id"), {"id": vid})
+
+
+# -----------------------------
+# Label mapping (display only)
+# -----------------------------
+def _apply_labels(df: pd.DataFrame) -> pd.DataFrame:
+    if not LABEL_OVERRIDES:
+        return df
+    mapping = {k:v for k,v in LABEL_OVERRIDES.items() if k in df.columns and isinstance(v,str) and v}
+    return df.rename(columns=mapping)
+
+
+# -----------------------------
+# AgGrid renderer (wrap all but notes/keywords; clickable website; copy)
+# -----------------------------
+def _aggrid_view(df_show: pd.DataFrame, website_label: str = "website"):
+    if df_show.empty:
+        st.info("No rows to display.")
+        return
+
+    website_key = website_label if website_label in df_show.columns else next((c for c in df_show.columns if c.lower()=="website"), None)
+
+    _df = df_show.copy()
+
+    # Add normalized URL helper column next to website column
+    url_col = None
+    if website_key:
+        raw_guess = "website"
+        norm = _df[raw_guess].map(_normalize_url) if raw_guess in _df.columns else _df[website_key].map(_normalize_url)
+        url_col = f"{website_key} URL" if website_key.lower() != "website" else "Website URL"
+        widx = _df.columns.get_loc(website_key)
+        _df.insert(widx + 1, url_col, norm)
+
+    gob = GridOptionsBuilder.from_dataframe(_df)
+
+    # Default: wrap + autoHeight ON (we'll turn OFF for notes/keywords only)
+    gob.configure_default_column(
+        resizable=True,
+        sortable=True,
+        filter=False,
+        wrapText=True,
+        autoHeight=True,
+    )
+
+    # Apply fixed widths from secrets (map displayed -> raw if renamed)
+    display_to_raw = {disp: raw for raw, disp in LABEL_OVERRIDES.items() if isinstance(disp, str) and disp}
+    for col in _df.columns:
+        raw_key = display_to_raw.get(col, col)
+        px = COLUMN_WIDTHS.get(raw_key)
+        if px:
+            gob.configure_column(col, width=px)
+
+    # Turn OFF wrap/autoHeight for notes & keywords only
+    for col in _df.columns:
+        low = col.lower()
+        raw_match = low in {"notes","keywords"}
+        renamed_match = any((k in {"notes","keywords"}) and (LABEL_OVERRIDES.get(k, k) == col) for k in ["notes","keywords"])
+        if raw_match or renamed_match:
+            gob.configure_column(
+                col,
+                wrapText=False,
+                autoHeight=False,
+                cellStyle={"whiteSpace": "nowrap", "textOverflow": "ellipsis", "overflow": "hidden"}
+            )
+
+    # Clickable "Website" — RETURN HTML STRING (not a DOM node) to avoid React invariant #31
+    if website_key and url_col:
+        link_renderer = JsCode(f"""
+            function(params) {{
+                const url = params.data && params.data["{url_col}"] ? params.data["{url_col}"] : "";
+                if (!url) return "";
+                // HTML string; AgGrid sets innerHTML. We also stop propagation inline.
+                return '<a href="' + url + '" target="_blank" rel="noopener noreferrer" onclick="event.stopPropagation();">Website</a>';
+            }}
+        """)
+        gob.configure_column(website_key, cellRenderer=link_renderer)
+
+    grid_options = gob.build()
+    grid_options["floatingFilter"] = False
+    grid_options["suppressMenuHide"] = True
+    grid_options["domLayout"] = "normal"
+
+    # Improve copy behavior
+    grid_options["ensureDomOrder"] = True
+    grid_options["enableRangeSelection"] = True
+    grid_options["enableCellTextSelection"] = True
+    grid_options["rowSelection"] = "multiple"
+    grid_options["rowMultiSelectWithClick"] = True
+    grid_options["suppressRowClickSelection"] = False
+    grid_options["suppressCopyRowsToClipboard"] = False
+    grid_options["clipboardDelimiter"] = "\t"
+    grid_options["copyHeadersToClipboard"] = False
+
+    # Context menu items incl. Copy row (TSV)
+    grid_options["getContextMenuItems"] = JsCode("""
+        function(params) {
+          const res = ['copy', 'copyWithHeaders', 'paste'];
+          const node = params.node;
+          if (node && node.data) {
+            res.push({
+              name: 'Copy row (TSV)',
+              action: () => {
+                const vals = [];
+                const cols = params.columnApi.getAllDisplayedColumns();
+                cols.forEach(c => {
+                  const id = c.getColId();
+                  if (id === '__copy__') return;
+                  const v = node.data[id] != null ? String(node.data[id]) : '';
+                  vals.push(v);
+                });
+                const txt = vals.join('\\t');
+                if (navigator && navigator.clipboard && navigator.clipboard.writeText) {
+                  navigator.clipboard.writeText(txt);
+                } else {
+                  const ta = document.createElement('textarea');
+                  ta.value = txt; document.body.appendChild(ta);
+                  ta.select(); document.execCommand('copy'); document.body.removeChild(ta);
+                }
+              }
+            });
+          }
+          return res;
+        }
+    """)
+
+    # Add a small "Copy" button column to copy the full displayed row (works even if keyboard copy is blocked)
+    if "columnDefs" in grid_options and isinstance(grid_options["columnDefs"], list):
+        copy_col = {
+            "headerName": "Copy",
+            "field": "__copy__",
+            "width": 70,
+            "pinned": "left" if STICKY_FIRST else None,
+            "suppressMenu": True,
+            "sortable": False,
+            "filter": False,
+            "cellRenderer": JsCode("""
+                function(params) {
+                    const btn = document.createElement('button');
+                    btn.textContent = 'Copy';
+                    btn.style.cursor = 'pointer';
+                    btn.addEventListener('click', function(e) {
+                        e.stopPropagation();
+                        const data = params.node.data || {};
+                        const cols = params.columnApi.getAllDisplayedColumns();
+                        const vals = [];
+                        cols.forEach(c => {
+                            const id = c.getColId();
+                            if (id === '__copy__') return;
+                            const v = data[id] != null ? String(data[id]) : '';
+                            vals.push(v);
+                        });
+                        const txt = vals.join('\\t');
+                        if (navigator && navigator.clipboard && navigator.clipboard.writeText) {
+                          navigator.clipboard.writeText(txt);
+                        } else {
+                          const ta = document.createElement('textarea');
+                          ta.value = txt; document.body.appendChild(ta);
+                          ta.select(); document.execCommand('copy'); document.body.removeChild(ta);
+                        }
+                    });
+                    return btn;
+                }
+            """)
+        }
+        grid_options["columnDefs"].insert(0, copy_col)
+
+    AgGrid(
+        _df,
+        gridOptions=grid_options,
+        update_mode=GridUpdateMode.NO_UPDATE,
+        fit_columns_on_grid_load=False,
+        allow_unsafe_jscode=True,
+        enable_enterprise_modules=False,
+        columns_auto_size_mode=ColumnsAutoSizeMode.NO_AUTOSIZE,
+        height=600,
+        theme="streamlit",
+    )
+
+
+# -----------------------------
+# VIEW tab (quick filter; CSV; DEBUG right under CSV)
+# -----------------------------
+def tab_view(query: str):
+    df = _fetch_df()
+    df_show = _apply_labels(df)
+    df_show = _apply_quick_filter(df_show, query)
+
+    if _AGGRID_AVAILABLE:
+        _aggrid_view(df_show, website_label=LABEL_OVERRIDES.get("website", "website"))
+    else:
+        st.warning("`streamlit-aggrid` not installed — basic table fallback. Links will not be clickable.")
+        _apply_css_for_table(df_show.columns.tolist())
+        df_sorted = df_show.sort_values(
+            by=["business_name","category","id"],
+            key=lambda s: s.astype(str).str.casefold(),
+            ignore_index=True
+        )
+        st.table(df_sorted)
+
+    st.download_button(
+        label="Download Providers (CSV)",
+        data=df_show.to_csv(index=False).encode("utf-8"),
+        file_name="providers_admin_view.csv",
+        mime="text/csv",
+    )
+
+    render_status_debug(expanded=False)
+
+
+# -----------------------------
+# ADD / EDIT / DELETE / Admin tabs
+# -----------------------------
+def tab_add():
+    cats = sorted(_cats()["name"].dropna().astype(str).tolist(), key=lambda s: s.casefold())
+    svcs = sorted(_svcs()["name"].dropna().astype(str).tolist(), key=lambda s: s.casefold())
+
+    st.info("Fields in **bold** are required. Service is optional only when Category is 'Home Repair'.")
+    with st.form("add_vendor_form", clear_on_submit=True):
+        col = st.columns(2)
+        with col[0]:
+            business_name = st.text_input(f"**{LABEL_OVERRIDES.get('business_name','business_name')}** *", placeholder="Acme Plumbing")
+            category = st.selectbox(LABEL_OVERRIDES.get("category", "category"), options=cats)
+            service = st.selectbox(LABEL_OVERRIDES.get("service", "service"), options=[""] + svcs)
+            contact_name = st.text_input(LABEL_OVERRIDES.get("contact_name", "contact_name"))
+            phone = st.text_input(LABEL_OVERRIDES.get("phone", "phone"), placeholder="(210) 555-0123 or 210-555-0123")
+        with col[1]:
+            address = st.text_input(LABEL_OVERRIDES.get("address", "address"))
+            website = st.text_input(LABEL_OVERRIDES.get("website", "website"), placeholder="https://example.com")
+            notes = st.text_area(LABEL_OVERRIDES.get("notes", "notes"))
+            keywords = st.text_input(LABEL_OVERRIDES.get("keywords", "keywords"))
+        submitted = st.form_submit_button("Add")
+        if submitted:
+            ok, cleaned, errors = _validate_vendor_fields(business_name, category, service, phone, website)
+            if not ok:
+                for field, msg in errors.items():
+                    st.error(f"{field}: {msg}")
+                return
+            row = {
+                "business_name": cleaned["business_name"], "category": cleaned["category"], "service": cleaned["service"],
+                "contact_name": (contact_name or "").strip(), "phone": cleaned["phone"], "address": (address or "").strip(),
+                "website": cleaned["website"], "notes": (notes or "").strip(), "keywords": (keywords or "").strip(),
+            }
+            _insert_vendor(row)
+            st.success("Vendor added.")
+            st.rerun()
+
+def _parse_vid_from_label(label: str) -> Optional[int]:
+    if "id#" not in label:
+        return None
+    try:
+        return int(label.split("id#")[-1].strip())
+    except Exception:
+        return None
+
+def tab_edit():
+    df = _fetch_df()
+    if df.empty:
+        st.info("No vendors available.")
+        return
+
+    df_sel = df.copy()
+    df_sel = df_sel.sort_values(
+        by=["business_name","category","id"],
+        key=lambda s: s.astype(str).str.casefold()
+    )
+    df_sel["label"] = (
+        df_sel["business_name"].fillna("").astype(str) + " (" +
+        df_sel["category"].fillna("").astype(str) + ") — id#" +
+        df_sel["id"].astype(str)
+    )
+
+    choice = st.selectbox("Select Vendor", options=df_sel["label"].tolist())
+    vid = _parse_vid_from_label(choice)
+    if vid is None:
+        st.error("Could not parse selected vendor id.")
+        return
+
+    row = df[df["id"] == vid].iloc[0].to_dict()
+
+    cats = sorted(_cats()["name"].dropna().astype(str).tolist(), key=lambda s: s.casefold())
+    svcs = sorted(_svcs()["name"].dropna().astype(str).tolist(), key=lambda s: s.casefold())
+
+    with st.form("edit_vendor_form"):
+        col = st.columns(2)
+        with col[0]:
+            row["business_name"] = st.text_input(LABEL_OVERRIDES.get("business_name", "business_name"), value=row["business_name"])
+            cat_idx = 0
+            if row.get("category") in cats:
+                cat_idx = cats.index(row["category"])
+            row["category"] = st.selectbox(LABEL_OVERRIDES.get("category", "category"), options=cats, index=cat_idx)
+
+            svc_options = [""] + svcs
+            svc_idx = 0
+            if row.get("service") in svcs:
+                svc_idx = 1 + svcs.index(row["service"])
+            row["service"] = st.selectbox(LABEL_OVERRIDES.get("service", "service"), options=svc_options, index=svc_idx)
+
+            row["contact_name"] = st.text_input(LABEL_OVERRIDES.get("contact_name", "contact_name"), value=row.get("contact_name", ""))
+            row["phone"] = st.text_input(LABEL_OVERRIDES.get("phone", "phone"), value=row.get("phone", ""))
+        with col[1]:
+            row["address"] = st.text_input(LABEL_OVERRIDES.get("address", "address"), value=row.get("address", ""))
+            row["website"] = st.text_input(LABEL_OVERRIDES.get("website", "website"), value=row.get("website", ""))
+            row["notes"] = st.text_area(LABEL_OVERRIDES.get("notes", "notes"), value=row.get("notes", ""))
+            row["keywords"] = st.text_input(LABEL_OVERRIDES.get("keywords", "keywords"), value=row.get("keywords", ""))
+
+        col2 = st.columns(2)
+        with col2[0]:
+            if st.form_submit_button("Save Changes"):
+                ok, cleaned, errors = _validate_vendor_fields(
+                    row.get("business_name",""), row.get("category",""), row.get("service",""),
+                    row.get("phone",""), row.get("website","")
+                )
+                if not ok:
+                    for field, msg in errors.items():
+                        st.error(f"{field}: {msg}")
+                    return
+                upd = {
+                    "business_name": cleaned["business_name"], "category": cleaned["category"], "service": cleaned["service"],
+                    "contact_name": (row.get("contact_name","")).strip(), "phone": cleaned["phone"], "address": (row.get("address","")).strip(),
+                    "website": cleaned["website"], "notes": (row.get("notes","")).strip(), "keywords": (row.get("keywords","")).strip(),
+                }
+                _update_vendor(vid, upd)
+                st.success("Saved.")
+                st.rerun()
+        with col2[1]:
+            if st.form_submit_button("Cancel"):
+                st.stop()
+
+def tab_delete():
+    df = _fetch_df()
     if df.empty:
         st.info("No vendors to delete.")
+        return
+
+    df_sel = df.copy().sort_values(
+        by=["business_name","category","id"],
+        key=lambda s: s.astype(str).str.casefold()
+    )
+    df_sel["label"] = (
+        df_sel["business_name"].fillna("").astype(str) + " (" +
+        df_sel["category"].fillna("").astype(str) + ") — id#" +
+        df_sel["id"].astype(str)
+    )
+    choice = st.selectbox("Select Vendor to Delete", options=df_sel["label"].tolist())
+    vid = _parse_vid_from_label(choice)
+    if vid is None:
+        st.error("Could not parse selected vendor id.")
+        return
+
+    if st.button("Delete", type="primary"):
+        _delete_vendor(vid)
+        st.success("Deleted.")
+        st.rerun()
+
+def tab_categories():
+    st.subheader("Categories Admin")
+    cats = _cats()
+    st.dataframe(cats, use_container_width=True, hide_index=True)
+
+    with st.form("add_cat"):
+        new = st.text_input("Add Category")
+        if st.form_submit_button("Add") and (new or "").strip():
+            _upsert_category(new)
+            st.success("Category added (or already existed). Reload to see it.")
+            st.rerun()
+
+    with st.form("del_cat"):
+        delname = st.text_input("Delete Category (exact name)")
+        if st.form_submit_button("Delete") and (delname or "").strip():
+            _delete_category(delname)
+            st.success("Category deleted if it existed. Reassign vendors first if needed.")
+            st.rerun()
+
+def _upsert_category(name: str):
+    with eng.begin() as c:
+        c.execute(sql_text("INSERT OR IGNORE INTO categories(name) VALUES(:n)"), {"n": name.strip()})
+
+def _delete_category(name: str):
+    with eng.begin() as c:
+        c.execute(sql_text("DELETE FROM categories WHERE name = :n"), {"n": name.strip()})
+
+def tab_services():
+    st.subheader("Services Admin")
+    svcs = _svcs()
+    st.dataframe(svcs, use_container_width=True, hide_index=True)
+
+    with st.form("add_svc"):
+        new = st.text_input("Add Service")
+        if st.form_submit_button("Add") and (new or "").strip():
+            _upsert_service(new)
+            st.success("Service added (or already existed). Reload to see it.")
+            st.rerun()
+
+    with st.form("del_svc"):
+        delname = st.text_input("Delete Service (exact name)")
+        if st.form_submit_button("Delete") and (delname or "").strip():
+            _delete_service(delname)
+            st.success("Service deleted if it existed. Reassign vendors first if needed.")
+            st.rerun()
+
+def _upsert_service(name: str):
+    with eng.begin() as c:
+        c.execute(sql_text("INSERT OR IGNORE INTO services(name) VALUES(:n)"), {"n": name.strip()})
+
+def _delete_service(name: str):
+    with eng.begin() as c:
+        c.execute(sql_text("DELETE FROM services WHERE name = :n"), {"n": name.strip()})
+
+def tab_maintenance():
+    st.subheader("Maintenance")
+    st.caption("Quick utilities for data hygiene.")
+    col = st.columns(2)
+    with col[0]:
+        if st.button("Normalize phone format to (xxx) xxx-xxxx"):
+            with eng.begin() as c:
+                dfp = pd.read_sql_query("SELECT id, phone FROM vendors", c)
+                for _, r in dfp.iterrows():
+                    oldp = str(r.get("phone",""))
+                    fmt = _format_phone_10(oldp)
+                    if fmt and fmt != oldp:
+                        now = _now_iso()
+                        c.execute(sql_text(
+                            "UPDATE vendors SET phone = :p, updated_at = :ua, updated_by = :ub WHERE id = :id"
+                        ), {"p": fmt, "ua": now, "ub": ADMIN_DISPLAY_NAME, "id": int(r["id"])})
+                        c.execute(sql_text("""
+                            INSERT INTO vendor_changes(vendor_id, changed_at, changed_by, action, field, old_value, new_value)
+                            VALUES(:vid, :ts, :by, 'update', 'phone', :oldv, :newv)
+                        """), {"vid": int(r["id"]), "ts": now, "by": ADMIN_DISPLAY_NAME,
+                               "oldv": oldp, "newv": fmt})
+            st.success("Phone numbers normalized where possible.")
+            st.rerun()
+    with col[1]:
+        if st.button("Trim whitespace in text fields"):
+            with eng.begin() as c:
+                for k in ["category","service","business_name","contact_name","address","website","notes","keywords"]:
+                    c.execute(sql_text(f"UPDATE vendors SET {k} = TRIM({k})"))
+                c.execute(sql_text("UPDATE vendors SET updated_at = :ua, updated_by = :ub"),
+                          {"ua": _now_iso(), "ub": ADMIN_DISPLAY_NAME})
+            st.success("Whitespace trimmed.")
+            st.rerun()
+
+def _fmt_when(s: str) -> str:
+    try:
+        dt = datetime.fromisoformat(s.replace("Z","+00:00"))
+        return dt.astimezone().strftime("%b %d, %Y, %I:%M %p")
+    except Exception:
+        return s
+
+def tab_changelog():
+    st.subheader("Changelog")
+    f1, f2 = st.columns(2)
+    with f1:
+        vendor_filter = st.text_input("Filter by vendor name contains", "")
+    with f2:
+        user_filter = st.text_input("Filter by edited-by contains", "")
+
+    with eng.connect() as c:
+        q = """
+            SELECT vc.id, vc.vendor_id, vc.changed_at, vc.changed_by, vc.action, vc.field, vc.old_value, vc.new_value,
+                   v.business_name
+            FROM vendor_changes vc
+            LEFT JOIN vendors v ON v.id = vc.vendor_id
+            ORDER BY vc.changed_at DESC, vc.id DESC
+        """
+        df = pd.read_sql_query(sql_text(q), c)
+
+    if vendor_filter.strip():
+        df = df[df["business_name"].fillna("").str.contains(vendor_filter.strip(), case=False, na=False)]
+    if user_filter.strip():
+        df = df[df["changed_by"].fillna("").str.contains(user_filter.strip(), case=False, na=False)]
+
+    lines = []
+    for _, r in df.iterrows():
+        when = _fmt_when(str(r["changed_at"]))
+        by = r.get("changed_by") or "unknown"
+        name = r.get("business_name") or f"Vendor #{r.get('vendor_id')}"
+        action = r.get("action")
+        if action == "insert":
+            lines.append(f"{when} — Added **{name}** (by {by})")
+        elif action == "delete":
+            lines.append(f"{when} — Deleted **{name}** (by {by})")
+        elif action == "update":
+            field = r.get("field") or "field"
+            oldv = r.get("old_value") or ""
+            newv = r.get("new_value") or ""
+            arrow = f"`{oldv}` → `{newv}`" if oldv or newv else ""
+            lines.append(f"{when} — Updated **{field}** for **{name}** (by {by})")
+        else:
+            lines.append(f"{when} — Change on **{name}** (by {by})")
+    if not lines:
+        st.info("No changes recorded yet.")
     else:
-        df_sel = df.copy()
-        df_sel["bn_norm"] = df_sel["business_name"].astype(str).str.lower()
-        df_sel = df_sel.sort_values(["bn_norm","id"])
-        choices = [f"#{row.id} — {row.business_name}" for row in df_sel.itertuples(index=False)]
+        st.markdown("\n\n".join(f"- {ln}" for ln in lines))
 
-        sel = st.selectbox("Select vendor to delete", options=choices)
-        if sel:
-            vid = int(sel.split("—")[0].strip().lstrip("#").strip())
-            row = df[df["id"] == vid].iloc[0].to_dict()
-            st.warning(f"Delete vendor #{vid}: {row.get('business_name','(no name)')}?")
-            col1, col2 = st.columns(2)
-            with col1:
-                if st.button("Delete", type="primary"):
-                    try:
-                        delete_vendor(vid)
-                        st.success(f"Deleted vendor #{vid}.")
-                        st.rerun()
-                    except Exception as e:
-                        st.exception(e)
-            with col2:
-                st.info("Action is permanent.")
 
 # -----------------------------
-# Categories & Services Admin
+# Status & Secrets (debug) — helper
 # -----------------------------
-with tab_admin:
-    st.subheader("Categories & Services Admin")
-    st.caption("Tips: Reassign vendors from one value to another, then delete the unused value. "
-               "Category is required; Service may be blank if you allow it.")
+def render_status_debug(expanded=False):
+    with st.expander("Status & Secrets (debug)", expanded=expanded):
+        backend = "libsql" if str(_read_secret("TURSO_DATABASE_URL","")).startswith("sqlite+libsql://") else "sqlite"
+        st.write("DB")
+        st.code({"backend": backend, "dsn": _read_secret("TURSO_DATABASE_URL",""),
+                 "auth": "token_set" if bool(_read_secret("TURSO_AUTH_TOKEN")) else "none"})
+        try:
+            keys = list(st.secrets.keys())
+        except Exception:
+            keys = []
+        st.write("Secrets keys (present)"); st.code(keys)
+        st.write("Help MD:", "present" if bool(HELP_MD) else "(missing or empty)")
+        st.write("Sticky first col enabled:", STICKY_FIRST)
+        st.write("Raw COLUMN_WIDTHS_PX_READONLY (type)", type(COLUMN_WIDTHS).__name__); st.code(COLUMN_WIDTHS)
+        st.write("Column label overrides (if any)"); st.code(LABEL_OVERRIDES)
+        st.write("Admin display name:", ADMIN_DISPLAY_NAME)
 
-    tab_cat, tab_svc, tab_repair = st.tabs(["Categories", "Services", "Repair/Utilities"])
-
-    with tab_cat:
-        st.markdown("#### Categories")
-        cats = list_categories()
-        st.write(f"Existing categories: {', '.join(cats) if cats else '(none)'}")
-
-        st.markdown("**Add Category**")
-        newc = st.text_input("New category name", key="new_cat_name")
-        if st.button("Add Category"):
-            if not newc.strip():
-                st.error("Enter a name.")
-            else:
-                try:
-                    add_category(nonempty_trim(newc))
-                    st.success(f"Added category: {newc}")
-                    st.rerun()
-                except Exception as e:
-                    st.exception(e)
-
-        st.markdown("---")
-        st.markdown("**Reassign Category**")
-        if cats:
-            oldc = st.selectbox("Reassign from", options=cats, key="oldc")
-            newc2 = st.selectbox("Reassign to", options=cats, key="newc")
-            if st.button("Reassign All Vendors to New Category"):
-                if oldc == newc2:
-                    st.warning("Old and new categories are the same.")
-                else:
-                    n = reassign_category(oldc, newc2)
-                    st.success(f"Reassigned {n} vendors from '{oldc}' to '{newc2}'.")
-                    st.rerun()
-
-        st.markdown("---")
-        st.markdown("**Delete Category**")
-        if cats:
-            delc = st.selectbox("Delete which category (must be unused)?", options=cats, key="delc")
-            used = usage_counts("category", delc)
-            st.write(f"Usage count: {used}")
-            if st.button("Delete Category"):
-                if used > 0:
-                    st.error("Cannot delete a category still in use. Reassign vendors first.")
-                else:
-                    try:
-                        delete_category(delc)
-                        st.success(f"Deleted category '{delc}'.")
-                        st.rerun()
-                    except Exception as e:
-                        st.exception(e)
-
-    with tab_svc:
-        st.markdown("#### Services")
-        svcs = list_services()
-        st.write(f"Existing services: {', '.join(svcs) if svcs else '(none)'}")
-
-        st.markdown("**Add Service**")
-        news = st.text_input("New service name", key="new_svc_name")
-        if st.button("Add Service"):
-            if not news.strip():
-                st.error("Enter a name.")
-            else:
-                try:
-                    add_service(nonempty_trim(news))
-                    st.success(f"Added service: {news}")
-                    st.rerun()
-                except Exception as e:
-                    st.exception(e)
-
-        st.markdown("---")
-        st.markdown("**Reassign Service**")
-        if svcs:
-            olds = st.selectbox("Reassign from", options=svcs, key="olds")
-            news2 = st.selectbox("Reassign to", options=svcs, key="news2")
-            if st.button("Reassign All Vendors to New Service"):
-                if olds == news2:
-                    st.warning("Old and new services are the same.")
-                else:
-                    n = reassign_service(olds, news2)
-                    st.success(f"Reassigned {n} vendors from '{olds}' to '{news2}'.")
-                    st.rerun()
-
-        st.markdown("---")
-        st.markdown("**Delete Service**")
-        if svcs:
-            dels = st.selectbox("Delete which service (must be unused)?", options=svcs, key="dels")
-            used = usage_counts("service", dels)
-            st.write(f"Usage count: {used}")
-            if st.button("Delete Service"):
-                if used > 0:
-                    st.error("Cannot delete a service still in use. Reassign vendors first.")
-                else:
-                    try:
-                        delete_service(dels)
-                        st.success(f"Deleted service '{dels}'.")
-                        st.rerun()
-                    except Exception as e:
-                        st.exception(e)
-
-    with tab_repair:
-        st.markdown("#### Repair / Utilities")
-        st.write("If the **services** table gets into a weird state, use this.")
-        if st.button("Repair services table (create/ensure UNIQUE name)"):
-            try:
-                repair_services_table()
-                st.success("Services table repaired/ensured.")
-            except Exception as e:
-                st.exception(e)
-        st.caption("No destructive changes. It creates minimal schema if missing and ensures a unique index on `services.name`.")
 
 # -----------------------------
-# Debug
+# Main
 # -----------------------------
-with tab_debug:
-    st.subheader("Database Status & Schema (debug)")
-    st.json({
-        "engine_url": engine_info.get("engine_url"),
-        "using_remote": engine_info.get("using_remote"),
-        "vendors_columns": get_columns("vendors") if table_exists("vendors") else "(missing)",
-        "has_categories_table": table_exists("categories"),
-        "has_services_table": table_exists("services"),
-        "categories_columns": get_columns("categories") if table_exists("categories") else "(missing)",
-        "services_columns": get_columns("services") if table_exists("services") else "(missing)",
-        "counts": {
-            "vendors": int(len(vendors_df())) if table_exists("vendors") else 0
-        }
-    })
+def main():
+    render_help()
+    q = _quick_filter_ui()
 
-    st.markdown("##### Sample rows (first 50)")
-    if table_exists("vendors"):
-        df = vendors_df().head(50)
-        st.data_editor(df, use_container_width=True, height=500, disabled=True, hide_index=True)
-    else:
-        st.info("vendors table missing")
+    tabs = st.tabs(["View","Add","Edit","Delete","Categories Admin","Services Admin","Maintenance","Changelog"])
+    with tabs[0]: tab_view(q)
+    with tabs[1]: tab_add()
+    with tabs[2]: tab_edit()
+    with tabs[3]: tab_delete()
+    with tabs[4]: tab_categories()
+    with tabs[5]: tab_services()
+    with tabs[6]: tab_maintenance()
+    with tabs[7]: tab_changelog()
+
+if __name__ == "__main__":
+    main()
