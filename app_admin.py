@@ -1,9 +1,9 @@
 # app_admin.py
-# Vendors Admin — no sidebar; top-of-page navigation for max width.
+# Vendors Admin — wide layout, no sidebar, top tabs.
 # Stable Streamlit CRUD (no AG Grid), Turso (libSQL) first, SQLite fallback.
 # Features:
-# - Top navigation tabs: Browse | Add | Edit | Delete | Admin | Debug
-# - Browse with global (non-FTS) filter across all text fields
+# - Top tabs: Browse | Add | Edit | Delete | Admin | Debug
+# - Browse: global (non-FTS) filter across all fields
 # - Add / Edit / Delete Vendors with validation and immediate refresh
 # - Categories & Services Admin (add, reassign, delete-when-unused)
 # - "Repair services table" safety button
@@ -17,17 +17,17 @@
 # categories(id INTEGER PK, name TEXT UNIQUE)
 # services(id INTEGER PK, name TEXT UNIQUE)
 #
-# Secrets (Streamlit):
+# Secrets (Streamlit), optional:
 #   TURSO_DATABASE_URL: "sqlite+libsql://<host>?secure=true"
 #   TURSO_AUTH_TOKEN: "<jwt>"
-# Optional layout secrets:
-#   page_title, page_max_width_px
+#   page_max_width_px: int (e.g., 1800)
 
 from __future__ import annotations
 
 import os
 import re
 from typing import List, Dict, Optional, Tuple
+from urllib.parse import urlparse
 
 import pandas as pd
 import streamlit as st
@@ -35,7 +35,7 @@ from sqlalchemy import create_engine, text as sql_text
 from sqlalchemy.engine import Engine
 
 # -----------------------------
-# Page layout (no sidebar)
+# Page layout (no sidebar, wide)
 # -----------------------------
 def _read_secret(name: str, default=None):
     try:
@@ -54,26 +54,20 @@ def _apply_page_width_css(max_width_px: Optional[int]):
           .block-container {{
             max-width: {int(max_width_px)}px;
           }}
-          /* Hide the left hamburger/expander space to focus on main content */
+          /* Hide the left sidebar entirely */
           [data-testid="stSidebar"] {{ display: none; }}
-          /* Reduce top padding slightly for a tighter header */
+          /* Tighten top padding */
           .block-container > div:first-child {{ padding-top: 0.5rem; }}
         </style>
         """,
         unsafe_allow_html=True,
     )
 
-PAGE_TITLE = _read_secret("page_title", "Vendors Admin")
-PAGE_MAX_WIDTH = _read_secret("page_max_width_px", 1400)
-
-# No sidebar; set layout wide
-st.set_page_config(page_title=PAGE_TITLE, layout="wide")
+PAGE_MAX_WIDTH = _read_secret("page_max_width_px", 1600)
+st.set_page_config(page_title="", layout="wide")  # No visible page title
 _apply_page_width_css(PAGE_MAX_WIDTH)
 
-st.title(PAGE_TITLE)
-
-# Optional “full width mode” helper for df rendering height
-full_width_mode = st.checkbox("Full-width mode (taller table display)", value=True)
+# (Intentionally no st.title(...) — per request)
 
 # -----------------------------
 # Engine / DB helpers
@@ -91,7 +85,6 @@ def build_engine() -> Tuple[Engine, Dict[str, str]]:
                 pool_pre_ping=True,
                 future=True,
             )
-            # Smoke test
             with engine.connect() as conn:
                 conn.execute(sql_text("SELECT 1"))
             debug["engine_url"] = turso_url
@@ -119,7 +112,7 @@ def table_exists(table: str) -> bool:
     return res is not None
 
 def ensure_min_schema():
-    """Create minimal tables if missing. Never drops/alter existing user data."""
+    """Create minimal tables if missing. No destructive changes."""
     with engine.begin() as conn:
         if not table_exists("categories"):
             conn.execute(sql_text("""
@@ -155,7 +148,7 @@ ensure_min_schema()
 def get_columns(table: str) -> List[str]:
     with engine.connect() as conn:
         rows = conn.execute(sql_text(f"PRAGMA table_info({table})")).fetchall()
-    return [r[1] for r in rows]  # name is 2nd field
+    return [r[1] for r in rows]
 
 def has_column(table: str, col: str) -> bool:
     return col in get_columns(table)
@@ -184,7 +177,7 @@ def normalize_url(url: str) -> str:
     if not url:
         return ""
     u = url.strip()
-    if u.startswith("http://") or u.startswith("https://"):
+    if u.startswith(("http://", "https://")):
         return u
     return f"https://{u}"
 
@@ -326,11 +319,50 @@ with tab_browse:
     else:
         df_view = df.copy()
 
-    show_cols = [c for c in ["id","category","service","business_name","contact_name","phone","address","website","notes","keywords"] if c in df_view.columns]
+    # --- Linkified Website + separate full URL view using data_editor ---
+    def _domain(u: str) -> str:
+        if not isinstance(u, str) or not u.strip():
+            return ""
+        try:
+            p = urlparse(u if u.startswith(("http://", "https://")) else "https://" + u)
+            return p.netloc or u
+        except Exception:
+            return u
 
-    # Adjust height if full-width mode is on (taller table)
-    height = 700 if full_width_mode else 430
-    st.dataframe(df_view[show_cols], use_container_width=True, height=height, hide_index=True)
+    df_show = df_view.copy()
+    if "website" not in df_show.columns:
+        df_show["website"] = ""
+    df_show["website"] = df_show["website"].astype(str).fillna("")
+
+    # Derived presentation columns:
+    # - Website: clickable link (values are URLs)
+    # - URL (full): raw URL text for copy/paste
+    df_show["Website"] = df_show["website"]           # clickable column
+    df_show["URL (full)"] = df_show["website"]        # non-clickable text (explicit)
+
+    base_cols = ["id","category","service","business_name","contact_name","phone","address","notes"]
+    opt_cols  = [c for c in ["keywords"] if c in df_show.columns]
+    order = base_cols + ["Website","URL (full)"] + opt_cols
+
+    st.data_editor(
+        df_show[order],
+        use_container_width=True,
+        height=700,         # fixed height; no full-width toggle
+        disabled=True,      # read-only viewer
+        hide_index=True,
+        column_config={
+            "Website": st.column_config.LinkColumn(
+                "Website",
+                help="Click to open website (opens in new tab)",
+                display_text=None,   # show URL as link text
+                target="_blank",
+            ),
+            "URL (full)": st.column_config.TextColumn(
+                "URL (full)",
+                help="Full URL string (copyable text)",
+            ),
+        },
+    )
 
 # -----------------------------
 # Add Vendor
@@ -418,8 +450,10 @@ with tab_edit:
             svcs = list_services()
 
             with st.form("edit_vendor_form"):
-                category = st.selectbox("Category (required)", options=cats, index=(cats.index(row["category"]) if row["category"] in cats else 0 if cats else None))
-                service  = st.selectbox("Service (optional)", options=[""] + svcs, index=( ([""]+svcs).index(row["service"]) if row["service"] in svcs else 0 ))
+                category = st.selectbox("Category (required)", options=cats,
+                                        index=(cats.index(row["category"]) if row["category"] in cats else 0 if cats else None))
+                service  = st.selectbox("Service (optional)", options=[""] + svcs,
+                                        index=(([""] + svcs).index(row["service"]) if row["service"] in svcs else 0))
                 business_name = st.text_input("Business Name (required)", value=row.get("business_name",""))
                 contact_name = st.text_input("Contact Name", value=row.get("contact_name","") or "")
                 phone = st.text_input("Phone", value=row.get("phone","") or "")
@@ -606,7 +640,7 @@ with tab_admin:
 
     with tab_repair:
         st.markdown("#### Repair / Utilities")
-        st.write("Use this if the **services** table gets into a weird state.")
+        st.write("If the **services** table gets into a weird state, use this.")
         if st.button("Repair services table (create/ensure UNIQUE name)"):
             try:
                 repair_services_table()
@@ -636,7 +670,6 @@ with tab_debug:
     st.markdown("##### Sample rows (first 50)")
     if table_exists("vendors"):
         df = vendors_df().head(50)
-        height = 500 if full_width_mode else 350
-        st.dataframe(df, use_container_width=True, height=height, hide_index=True)
+        st.data_editor(df, use_container_width=True, height=500, disabled=True, hide_index=True)
     else:
         st.info("vendors table missing")
