@@ -1,14 +1,11 @@
-# app_admin.py — Vendors Admin (v3.6.3)
+# app_admin.py — Vendors Admin (v3.6.4)
 # View | Add | Edit | Delete | Categories Admin | Services Admin | Maintenance | Changelog
-# - AgGrid optional: no per-column filters; long text wraps + auto-expands rows
-# - Fallback uses st.table so wrapping & auto-row-height work
-# - Fixed widths honored (no auto-size fighting)
-# - Quick filter under Help; CSV at bottom; DEBUG expander directly under CSV in View tab
-# - Validators: phone (10 digits), website (http/https), service required unless category="Home Repair"
-# - Audit trail: created_at, updated_at, updated_by + vendor_changes changelog
-# - Auto-migration for audit columns/tables; ensure ref tables (categories/services) exist
-# - Immediate UI refresh after Add/Save/Delete/Maint ops
-# - v3.6.3: FIX pandas read_sql_query misuse (pass SQL string + SQLAlchemy Connection, not DBAPI .connection)
+# - AgGrid optional: long text wraps + auto-expands rows for ALL columns EXCEPT notes & keywords (fixed height)
+# - Fallback uses st.table; CSS enforces wrap for all except notes/keywords + fixed widths
+# - AgGrid: clickable Website link; range selection + context menu copy; proper copy via ensureDomOrder
+# - Validators, audit trail, schema guardrails; CSV + Debug placed under the table in View
+# - v3.6.3: fixed pandas read_sql_query usage in Maintenance
+# - v3.6.4: wrap policy + link render + copy UX hardened
 
 from __future__ import annotations
 
@@ -191,21 +188,21 @@ _ensure_schema()
 # -----------------------------
 # CSS for table-based fallback (and some shared rules)
 # -----------------------------
-def _apply_css(field_order: List[str]):
+def _apply_css_for_table(field_order: List[str]):
+    """CSS that affects st.table AND legacy st.dataframe; enforces wrap everywhere EXCEPT notes/keywords."""
     tbl_sel = "div[data-testid='stTable'] table"
     df_sel  = "div[data-testid='stDataFrame'] table"
     base = f"""
-    {tbl_sel} {{ table-layout: fixed !important; }}
-    {df_sel}  {{ table-layout: fixed !important; }}
-    {tbl_sel} td, {tbl_sel} th,
-    {df_sel}  td, {df_sel}  th {{
-        white-space: normal !important;
+    {tbl_sel}, {df_sel} {{ table-layout: fixed !important; }}
+    {tbl_sel} td, {tbl_sel} th, {df_sel} td, {df_sel} th {{
+        white-space: normal !important;       /* wrap by default */
         overflow-wrap: anywhere !important;
         word-break: break-word !important;
     }}
     """
     rules = [base]
 
+    # Fixed per-column widths (1-based nth-child)
     for idx, col in enumerate(field_order, start=1):
         px = COLUMN_WIDTHS.get(col)
         if not px:
@@ -216,6 +213,28 @@ def _apply_css(field_order: List[str]):
             min-width:{px}px !important; max-width:{px}px !important; width:{px}px !important;
         }}
         """)
+
+    # Turn OFF wrapping for notes & keywords (they remain one-line; no auto row-height growth)
+    def _nth_for(colname: str) -> Optional[int]:
+        try:
+            return field_order.index(colname) + 1
+        except ValueError:
+            return None
+
+    for colname in ["notes", "keywords"]:
+        nth = _nth_for(LABEL_OVERRIDES.get(colname, colname))
+        if nth is None:
+            # Try raw name if labels changed order
+            nth = _nth_for(colname)
+        if nth:
+            rules.append(f"""
+            {tbl_sel} thead tr th:nth-child({nth}), {tbl_sel} tbody tr td:nth-child({nth}),
+            {df_sel}  thead tr th:nth-child({nth}), {df_sel}  tbody tr td:nth-child({nth}) {{
+                white-space: nowrap !important;     /* no wrap */
+                overflow-wrap: normal !important;
+                word-break: normal !important;
+            }}
+            """)
 
     sticky = ""
     if STICKY_FIRST and field_order:
@@ -229,10 +248,7 @@ def _apply_css(field_order: List[str]):
         {tbl_sel} thead tr th:nth-child(1), {df_sel} thead tr th:nth-child(1) {{ z-index: 3; }}
         """
 
-    st.markdown(
-        "<style>" + "\n".join(rules) + sticky + "</style>",
-        unsafe_allow_html=True,
-    )
+    st.markdown("<style>" + "\n".join(rules) + sticky + "</style>", unsafe_allow_html=True)
 
 
 # -----------------------------
@@ -412,16 +428,19 @@ def _apply_labels(df: pd.DataFrame) -> pd.DataFrame:
 
 
 # -----------------------------
-# AgGrid renderer (no per-column filters; long text autoHeight)
+# AgGrid renderer (wrap all but notes/keywords; clickable website; copy)
 # -----------------------------
 def _aggrid_view(df_show: pd.DataFrame, website_label: str = "website"):
     if df_show.empty:
         st.info("No rows to display.")
         return
 
+    # Map display labels
     website_key = website_label if website_label in df_show.columns else next((c for c in df_show.columns if c.lower()=="website"), None)
 
     _df = df_show.copy()
+
+    # Add normalized URL helper column next to website column
     url_col = None
     if website_key:
         raw_guess = "website"
@@ -432,14 +451,16 @@ def _aggrid_view(df_show: pd.DataFrame, website_label: str = "website"):
 
     gob = GridOptionsBuilder.from_dataframe(_df)
 
+    # Default: wrap + autoHeight ON (we'll turn OFF for notes/keywords only)
     gob.configure_default_column(
         resizable=True,
         sortable=True,
         filter=False,
-        wrapText=False,
-        autoHeight=False,
+        wrapText=True,
+        autoHeight=True,
     )
 
+    # Apply fixed widths from secrets (map displayed -> raw if renamed)
     display_to_raw = {disp: raw for raw, disp in LABEL_OVERRIDES.items() if isinstance(disp, str) and disp}
     for col in _df.columns:
         raw_key = display_to_raw.get(col, col)
@@ -447,33 +468,78 @@ def _aggrid_view(df_show: pd.DataFrame, website_label: str = "website"):
         if px:
             gob.configure_column(col, width=px)
 
-    def _is_long_col(name: str) -> bool:
-        n = name.lower()
-        return ("address" in n) or ("notes" in n) or n.endswith(" url")
-
-    for col in list(_df.columns):
-        if _is_long_col(col):
+    # Turn OFF wrapping/autoHeight for notes & keywords only
+    for col in _df.columns:
+        low = col.lower()
+        raw_match = low in {"notes","keywords"}
+        # also match if user renamed these columns
+        renamed_match = any((k in {"notes","keywords"}) and (LABEL_OVERRIDES.get(k, k) == col) for k in ["notes","keywords"])
+        if raw_match or renamed_match:
             gob.configure_column(
                 col,
-                wrapText=True,
-                autoHeight=True,
-                cellStyle={"whiteSpace": "normal", "wordBreak": "break-word", "overflowWrap": "anywhere"},
+                wrapText=False,
+                autoHeight=False,
+                cellStyle={"whiteSpace": "nowrap", "textOverflow": "ellipsis", "overflow": "hidden"}
             )
 
+    # Clickable "Website" cell that shows the label 'Website' and opens normalized URL
     if website_key and url_col:
         link_renderer = JsCode(f"""
-            function(params){{
+            function(params) {{
                 const url = params.data && params.data["{url_col}"] ? params.data["{url_col}"] : "";
                 if (!url) return "";
+                // Render clickable text, not raw HTML literal
                 return `<a href="${{url}}" target="_blank" rel="noopener noreferrer">Website</a>`;
             }}
         """)
         gob.configure_column(website_key, cellRenderer=link_renderer)
 
+    # Improve copy behavior
     grid_options = gob.build()
     grid_options["floatingFilter"] = False
     grid_options["suppressMenuHide"] = True
     grid_options["domLayout"] = "normal"
+    grid_options["ensureDomOrder"] = True
+    grid_options["enableRangeSelection"] = True
+    grid_options["suppressCopyRowsToClipboard"] = False
+    grid_options["clipboardDelimiter"] = "\t"
+    grid_options["rowSelection"] = "multiple"
+    grid_options["suppressRowClickSelection"] = False
+
+    # Context menu: add "Copy row (TSV)"
+    grid_options["getContextMenuItems"] = JsCode("""
+        function(params) {
+          const res = [
+            'copy',
+            'copyWithHeaders',
+            'paste'
+          ];
+          const node = params.node;
+          if (node && node.data) {
+            res.push({
+              name: 'Copy row (TSV)',
+              action: () => {
+                const vals = [];
+                const cols = params.columnApi.getAllDisplayedColumns();
+                cols.forEach(c => {
+                  const k = c.getColId();
+                  const v = node.data[k] != null ? String(node.data[k]) : '';
+                  vals.push(v);
+                });
+                const txt = vals.join('\\t');
+                if (navigator && navigator.clipboard && navigator.clipboard.writeText) {
+                  navigator.clipboard.writeText(txt);
+                } else {
+                  const ta = document.createElement('textarea');
+                  ta.value = txt; document.body.appendChild(ta);
+                  ta.select(); document.execCommand('copy'); document.body.removeChild(ta);
+                }
+              }
+            });
+          }
+          return res;
+        }
+    """)
 
     AgGrid(
         _df,
@@ -499,8 +565,9 @@ def tab_view(query: str):
     if _AGGRID_AVAILABLE:
         _aggrid_view(df_show, website_label=LABEL_OVERRIDES.get("website", "website"))
     else:
-        st.warning("`streamlit-aggrid` not installed — showing basic table with wrapping.")
-        _apply_css(df_show.columns.tolist())
+        st.warning("`streamlit-aggrid` not installed — basic table fallback. Links will not be clickable.")
+        # Apply CSS to wrap all except notes/keywords + widths
+        _apply_css_for_table(df_show.columns.tolist())
         df_sorted = df_show.sort_values(
             by=["business_name","category","id"],
             key=lambda s: s.astype(str).str.casefold(),
@@ -724,7 +791,6 @@ def tab_maintenance():
     with col[0]:
         if st.button("Normalize phone format to (xxx) xxx-xxxx"):
             with eng.begin() as c:
-                # FIX: pass a plain SQL string and the SQLAlchemy Connection (c), not c.connection
                 dfp = pd.read_sql_query("SELECT id, phone FROM vendors", c)
                 for _, r in dfp.iterrows():
                     oldp = str(r.get("phone",""))
