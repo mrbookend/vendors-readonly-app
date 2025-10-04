@@ -26,7 +26,7 @@ from sqlalchemy.engine import Engine
 from sqlalchemy.exc import NoSuchModuleError, SQLAlchemyError
 from urllib.parse import urlparse, parse_qsl, urlencode, urlunparse
 
-# (AG Grid not used on Browse anymore)
+# AG Grid (used in Browse)
 from st_aggrid import AgGrid, GridOptionsBuilder, GridUpdateMode, JsCode
 
 
@@ -504,7 +504,6 @@ def backfill_vendor_audit(db: Engine) -> Tuple[int, int]:
 
 # --- AG Grid helper: add Website link column (returns HTML STRING, not DOM node) ---
 def _add_website_link_column(gob, df_disp, link_w):
-    from st_aggrid import JsCode
     link_renderer = JsCode("""
 function(params) {
   const raw = params.value || "";
@@ -539,7 +538,73 @@ def selectbox(label: str, options: List[str], key: str, index: Optional[int] = N
 # =========================
 
 def tab_browse(db: Engine):
+    # Fetch data
+    df = fetch_vendors_df(db)
 
+    # Global text search
+    q = st.text_input(
+        "Global search across all fields (non-FTS, case-insensitive; matches partial words).",
+        placeholder="e.g., plumb returns any record with 'plumb' anywhere",
+        key="browse_query",
+    ).strip()
+
+    if q:
+        q_lower = q.lower()
+        mask = pd.Series([False] * len(df))
+        for col in df.columns:
+            if df[col].dtype == object:
+                mask = mask | df[col].fillna("").str.lower().str.contains(q_lower, na=False)
+        df = df[mask]
+
+    # Phone display formatting (leave DB untouched)
+    def _fmt_phone(val: str) -> str:
+        if val is None:
+            return ""
+        s = re.sub(r"\D+", "", str(val))
+        return f"({s[0:3]}) {s[3:6]}-{s[6:10]}" if len(s) == 10 else (str(val) if val else "")
+
+    df_disp = df.copy()
+    if "phone" in df_disp.columns:
+        df_disp["phone"] = df_disp["phone"].apply(_fmt_phone)
+
+    # Build 'url' and 'WEBSITE' columns from DB 'website' (back-compat)
+    if "website" in df_disp.columns:
+        df_disp["url"] = df_disp["website"].fillna("").astype(str)
+    else:
+        df_disp["url"] = ""
+    df_disp["WEBSITE"] = df_disp["url"].fillna("").astype(str)
+
+    # Ensure URLs are strings with a scheme (for other views that might use 'website')
+    df_disp = _sanitize_urls(df_disp, "website")
+
+    # ---- Column widths via secrets (best-effort) ----
+    def _merge_widths():
+        merged = {}
+        for sect in ("browse_column_widths", "COLUMN_WIDTHS_PX_READONLY"):
+            obj = _read_secret_early(sect, None)
+            if isinstance(obj, dict):
+                merged.update(obj)
+        return merged
+
+    _widths = _merge_widths()
+
+    def _w(name, default):
+        try:
+            return int(_widths.get(name, default))
+        except Exception:
+            return default
+
+    id_w      = _w("id", 80)
+    cat_w     = _w("category", 140)
+    svc_w     = _w("service", 160)
+    name_w    = _w("business_name", 220)
+    contact_w = _w("contact_name", 160)
+    phone_w   = _w("phone", 140)
+    addr_w    = _w("address", 260)
+    url_w     = _w("url", 220)            # legacy width key supported by secrets
+    link_w    = _w("Website", 140)        # 'Website' or custom key in secrets
+    notes_w   = _w("notes", 520)
+    keys_w    = _w("keywords", 420)
 
     # --- Build AgGrid options ---
     gob = GridOptionsBuilder.from_dataframe(df_disp)
@@ -581,30 +646,9 @@ def tab_browse(db: Engine):
     if "address" in df_disp:       gob.configure_column("address", header_name=H("address"), width=addr_w)
     if "url" in df_disp:           gob.configure_column("url", header_name=H("url"), width=url_w)
 
-# Clickable WEBSITE link column — return an HTML STRING (not a DOM node)
-from st_aggrid import JsCode
-link_renderer = JsCode("""
-function(params) {
-  const raw = params.value || "";
-  if (!raw) { return ""; }
-  let url = String(raw).trim();
-  // ensure scheme; prefer https
-  if (!/^https?:\\/\\//i.test(url)) { url = "https://" + url; }
-  return `<a href="${url}" target="_blank" rel="noopener noreferrer">Open</a>`;
-}
-""")
+    # Clickable WEBSITE link column — return an HTML STRING (not a DOM node)
+    _add_website_link_column(gob, df_disp, link_w)
 
-if "WEBSITE" in df_disp:
-    gob.configure_column(
-        "WEBSITE",
-        header_name=H("Website"),
-        width=link_w,
-        sortable=False,
-        filter=False,
-        cellRenderer=link_renderer,
-    )
-
-    
     # Notes & Keywords: NO WRAP (fixed row height + ellipsis); uppercase headers
     nowrap_style = {"whiteSpace": "nowrap", "overflow": "hidden", "textOverflow": "ellipsis"}
     if "notes" in df_disp:
@@ -643,8 +687,6 @@ if "WEBSITE" in df_disp:
         key="browse_grid_fixed_layout_v6",
         height=None,
     )
-
-
 
 
 def tab_vendor_crud(db: Engine):
@@ -901,7 +943,7 @@ def tab_services(db: Engine):
 
     st.markdown("---")
     st.markdown("**How to edit Services:**")
-    st.markdown(
+    st.markmarkdown(
         "- Add new names here, or rename to merge history.  \n"
         "- You can’t delete a service that’s still used by any vendor; reassign or rename first."
     )
