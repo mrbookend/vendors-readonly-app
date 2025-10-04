@@ -2,19 +2,15 @@
 # Vendors Admin — streamlined:
 # - Wide layout via secrets (page_title, page_max_width_px=2300 default, sidebar_state)
 # - DB: Turso/libSQL via sqlite+libsql://… with auth token; guarded fallback to local SQLite vendors.db
-# - Browse Vendors: single global, case-insensitive, partial-word filter across all fields (non-FTS)
+# - Browse Vendors: AgGrid with explicit column widths, wrapping, and stable behavior
 # - Add / Edit / Delete Vendor:
 #       * Business Name REQUIRED
 #       * Category REQUIRED (must exist in categories lib)
 #       * Service OPTIONAL (must exist in services lib if provided)
 #       * Phone must be 10 digits (US) or blank; normalized to ########## on save
 #       * Immediate page refresh after any mutation
-# - Category Admin & Service Admin:
-#       * Add, Rename, Delete (with guardrails), Usage counts, Orphan surfacing
-# - Maintenance tab:
-#       * Repair services table (ensures schema=id,name; migrates from old shapes)
-#       * Normalize phones; Trim/Title business names
-#       * Backfill audit columns (created_at / updated_at / updated_by) if present
+# - Category Admin & Service Admin: add/rename/delete, usage counts, orphan surfacing
+# - Maintenance tab: repair services table, normalize phones, title-case names, backfill audit cols
 # - Debug tab with engine status and schema snapshot
 
 from __future__ import annotations
@@ -29,6 +25,9 @@ from sqlalchemy import create_engine, text as sql_text
 from sqlalchemy.engine import Engine
 from sqlalchemy.exc import NoSuchModuleError, SQLAlchemyError
 from urllib.parse import urlparse, parse_qsl, urlencode, urlunparse
+
+# AgGrid (table with column width control & wrapping)
+from st_aggrid import AgGrid, GridOptionsBuilder, GridUpdateMode
 
 # =========================
 # Page Layout / Secrets
@@ -515,7 +514,99 @@ def tab_browse(db: Engine):
                 mask = mask | df[col].fillna("").str.lower().str.contains(q_lower, na=False)
         df = df[mask]
 
-    st.dataframe(df, use_container_width=True, hide_index=True)
+    # --- Sidebar controls for column widths ---
+    with st.sidebar.expander("Browse table layout", expanded=False):
+        id_w     = st.number_input("ID width",              value=80,  min_value=50,  max_value=400,  step=10)
+        cat_w    = st.number_input("Category width",        value=140, min_value=80,  max_value=600,  step=10)
+        svc_w    = st.number_input("Service width",         value=160, min_value=80,  max_value=600,  step=10)
+        name_w   = st.number_input("Business name width",   value=220, min_value=120, max_value=800,  step=10)
+        contact_w= st.number_input("Contact name width",    value=160, min_value=100, max_value=600,  step=10)
+        phone_w  = st.number_input("Phone width",           value=120, min_value=100, max_value=300,  step=10)
+        addr_w   = st.number_input("Address width",         value=260, min_value=120, max_value=900,  step=10)
+        site_w   = st.number_input("Website width",         value=200, min_value=120, max_value=700,  step=10)
+        notes_w  = st.number_input("Notes width",           value=520, min_value=200, max_value=1600, step=20)
+        keys_w   = st.number_input("Keywords width",        value=420, min_value=200, max_value=1600, step=20)
+
+        wrap_notes = st.checkbox("Wrap Notes", value=True)
+        wrap_keys  = st.checkbox("Wrap Keywords", value=True)
+
+    # --- Build AgGrid options ---
+    gob = GridOptionsBuilder.from_dataframe(df)
+
+    # General defaults
+    gob.configure_grid_options(
+        domLayout="autoHeight",                 # grid grows with rows
+        ensureDomOrder=True,
+        suppressFieldDotNotation=True,
+        suppressMovableColumns=False,
+    )
+    gob.configure_default_column(
+        resizable=True,
+        sortable=True,
+        filter=True,
+        wrapHeaderText=True,
+        autoHeaderHeight=True,
+        minWidth=90,
+    )
+
+    # Column-specific configs (stable ordering)
+    col_order = [
+        "id","category","service","business_name","contact_name","phone",
+        "address","website","notes","keywords"
+    ]
+    existing = [c for c in col_order if c in df.columns] + [c for c in df.columns if c not in col_order]
+
+    if "id" in df:
+        gob.configure_column("id", header_name="ID", width=id_w, pinned=None)
+    if "category" in df:
+        gob.configure_column("category", width=cat_w)
+    if "service" in df:
+        gob.configure_column("service", width=svc_w)
+    if "business_name" in df:
+        gob.configure_column("business_name", width=name_w)
+    if "contact_name" in df:
+        gob.configure_column("contact_name", width=contact_w)
+    if "phone" in df:
+        gob.configure_column("phone", width=phone_w)
+    if "address" in df:
+        gob.configure_column("address", width=addr_w)
+    if "website" in df:
+        gob.configure_column("website", width=site_w)
+
+    # Notes & Keywords: wide + wrapping
+    if "notes" in df:
+        gob.configure_column(
+            "notes",
+            width=notes_w,
+            cellStyle={"whiteSpace": "normal"} if wrap_notes else {"whiteSpace": "nowrap"},
+            autoHeight=wrap_notes,  # grows row height if wrapping
+        )
+    if "keywords" in df:
+        gob.configure_column(
+            "keywords",
+            width=keys_w,
+            cellStyle={"whiteSpace": "normal"} if wrap_keys else {"whiteSpace": "nowrap"},
+            autoHeight=wrap_keys,
+        )
+
+    grid_options = gob.build()
+    # Enforce stable field order
+    grid_options["columnDefs"] = sorted(
+        grid_options["columnDefs"],
+        key=lambda d: existing.index(d.get("field")) if d.get("field") in existing else 1e9
+    )
+
+    AgGrid(
+        df,
+        gridOptions=grid_options,
+        theme="balham",
+        fit_columns_on_grid_load=True,  # initial fit only; manual resizes persist
+        enable_enterprise_modules=False,
+        allow_unsafe_jscode=False,
+        reload_data=False,
+        update_mode=GridUpdateMode.NO_UPDATE,
+        height=None,                     # auto via domLayout
+    )
 
 def tab_vendor_crud(db: Engine):
     st.subheader("Add / Edit / Delete Vendor")
