@@ -497,6 +497,7 @@ def selectbox(label: str, options: List[str], key: str, index: Optional[int] = N
 # =========================
 
 def tab_browse(db: Engine):
+    # Fetch data
     df = fetch_vendors_df(db)
 
     # Global text search
@@ -549,10 +550,7 @@ def tab_browse(db: Engine):
     _widths = _merge_widths()
 
     def _w(name, default, *fallback_names):
-        """
-        Fetch width for 'name' from secrets; if missing, try any fallback names; else use default.
-        Ensures an int is returned even if secrets are strings.
-        """
+        """Fetch width for 'name' from secrets; if missing, try fallback names; else use default."""
         for key in (name,) + fallback_names:
             if key in _widths:
                 try:
@@ -576,7 +574,7 @@ def tab_browse(db: Engine):
     # --- Build AgGrid options ---
     gob = GridOptionsBuilder.from_dataframe(df_disp)
 
-    # General defaults (ALL FILTERS OFF)
+    # General defaults: filters ON globally, small minWidth so secrets are respected
     gob.configure_grid_options(
         domLayout="autoHeight",
         ensureDomOrder=True,
@@ -586,10 +584,10 @@ def tab_browse(db: Engine):
     gob.configure_default_column(
         resizable=True,
         sortable=True,
-        filter=False,            # no header filters anywhere
+        filter=True,          # ← filters ON by default
         wrapHeaderText=True,
         autoHeaderHeight=True,
-        minWidth=90,
+        minWidth=40,          # ← allow very narrow columns (e.g., id=45)
     )
 
     # Helper to uppercase headers
@@ -603,8 +601,8 @@ def tab_browse(db: Engine):
     ]
     existing = [c for c in col_order if c in df_disp.columns] + [c for c in df_disp.columns if c not in col_order]
 
-    # Per-column configs (uppercase headers, no filters)
-    if "id" in df_disp:            gob.configure_column("id", header_name=H("id"), width=id_w)
+    # Per-column configs (uppercase headers)
+    if "id" in df_disp:            gob.configure_column("id", header_name=H("id"), width=id_w, filter=False)  # ID filter OFF
     if "category" in df_disp:      gob.configure_column("category", header_name=H("category"), width=cat_w)
     if "service" in df_disp:       gob.configure_column("service", header_name=H("service"), width=svc_w)
     if "business_name" in df_disp: gob.configure_column("business_name", header_name=H("business_name"), width=name_w)
@@ -671,7 +669,7 @@ def tab_browse(db: Engine):
         allow_unsafe_jscode=True,         # needed for clickable link renderer
         reload_data=True,
         update_mode=GridUpdateMode.NO_UPDATE,
-        key="browse_grid_fixed_layout_v3",
+        key="browse_grid_fixed_layout_v4",
         height=None,
     )
 
