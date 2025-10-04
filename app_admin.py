@@ -18,7 +18,6 @@ from __future__ import annotations
 
 import os
 import re
-import time
 from typing import List, Dict, Optional, Tuple
 
 import pandas as pd
@@ -29,7 +28,7 @@ from sqlalchemy.engine import Engine
 # Optional import of st_aggrid; provide a clear error if missing
 try:
     from st_aggrid import AgGrid, GridOptionsBuilder, GridUpdateMode
-except Exception as e:
+except Exception:
     AgGrid = None
     GridOptionsBuilder = None
     GridUpdateMode = None
@@ -67,7 +66,6 @@ def build_engine() -> Tuple[Engine, Dict[str, str]]:
     # Prefer Streamlit secrets if set
     url = None
     auth_token = None
-    using_remote = False
 
     try:
         url = st.secrets.get("TURSO_DATABASE_URL", None)
@@ -99,7 +97,6 @@ def build_engine() -> Tuple[Engine, Dict[str, str]]:
             # Lightweight probe
             with engine.connect() as conn:
                 conn.execute(sql_text("SELECT 1"))
-            using_remote = True
             info.update({"using_remote": True, "sqlalchemy_url": sa_url})
         except Exception as e:
             st.warning(f"Turso connection failed ({e}). Falling back to local SQLite vendors.db.")
@@ -137,9 +134,22 @@ def norm_phone(s: Optional[str]) -> Optional[str]:
 def title_case_name(s: Optional[str]) -> Optional[str]:
     if not s:
         return None
-    # Conservative title case (doesn't wreck Mc/Mac, Jr, etc., but simple here)
     return " ".join([w.capitalize() for w in s.split()])
 
+
+def _safe_index(options: List[str], value: str) -> int:
+    """Return index of value in options or 0 if missing."""
+    try:
+        return options.index(value)
+    except ValueError:
+        return 0
+
+
+def _rerun():
+    try:
+        st.rerun()
+    except Exception:
+        st.experimental_rerun()
 
 # -----------------------------
 # Data accessors
@@ -167,7 +177,6 @@ def load_all(engine: Engine) -> Dict[str, pd.DataFrame]:
 def refresh_data_cache():
     load_all.clear()
 
-
 # -----------------------------
 # UI helpers
 # -----------------------------
@@ -188,7 +197,6 @@ def quick_filter(df: pd.DataFrame, placeholder: str = "Global search (partial, c
         except Exception:
             continue
     return df[mask]
-
 
 # -----------------------------
 # Browse tab (AgGrid)
@@ -219,7 +227,8 @@ def tab_browse(engine: Engine, data: Dict[str, pd.DataFrame]):
         "created_at","updated_at","updated_by",
     ]
     cols_present = [c for c in default_order if c in df.columns]
-    df = df[cols_present]
+    if cols_present:
+        df = df[cols_present]
 
     # Global quick filter
     df_filtered = quick_filter(df)
@@ -232,8 +241,8 @@ def tab_browse(engine: Engine, data: Dict[str, pd.DataFrame]):
         pass
 
     if AgGrid is None:
-        st.error("st_aggrid is not installed. Add 'st-aggrid' to your requirements.txt.")
-        st.dataframe(df_filtered)
+        st.error("st_aggrid is not installed. Add 'st-aggrid==0.3.5' to requirements.txt.")
+        st.dataframe(df_filtered, use_container_width=True, hide_index=True)
         return
 
     gob = GridOptionsBuilder.from_dataframe(df_filtered)
@@ -242,13 +251,16 @@ def tab_browse(engine: Engine, data: Dict[str, pd.DataFrame]):
 
     # Apply explicit widths if given
     for c in df_filtered.columns:
-        width = int(col_widths.get(c, 0)) if col_widths else 0
+        try:
+            width = int(col_widths.get(c, 0)) if col_widths else 0
+        except Exception:
+            width = 0
         if width > 0:
             gob.configure_column(c, width=width)
 
     grid_options = gob.build()
 
-    grid_resp = AgGrid(
+    AgGrid(
         df_filtered,
         gridOptions=grid_options,
         update_mode=GridUpdateMode.NO_UPDATE,
@@ -256,7 +268,6 @@ def tab_browse(engine: Engine, data: Dict[str, pd.DataFrame]):
         fit_columns_on_grid_load=False,
         allow_unsafe_jscode=False,  # avoid React #31 issues from HTML renderers
     )
-
 
 # -----------------------------
 # Add / Edit / Delete tab
@@ -335,21 +346,36 @@ def tab_edit(engine: Engine, data: Dict[str, pd.DataFrame]):
                 )
             st.success("Vendor added.")
             refresh_data_cache()
-            st.experimental_rerun()
+            _rerun()
 
     with st.expander("Edit / Delete Vendor", expanded=False):
-        # Select a vendor by ID or name
+        # Select a vendor by ID
         id_list = vendors["id"].tolist() if "id" in vendors.columns else []
         id_selected = st.selectbox("Select Vendor ID", options=[""] + [str(x) for x in id_list], index=0, key="edit_pick_id")
         if id_selected:
-            vid = int(id_selected)
-            row = vendors.loc[vendors["id"] == vid].iloc[0].to_dict()
+            try:
+                vid = int(id_selected)
+            except Exception:
+                st.stop()
+
+            row = vendors.loc[vendors["id"] == vid]
+            if row.empty:
+                st.warning("Selected vendor not found.")
+                st.stop()
+            row = row.iloc[0].to_dict()
+
+            categories_opts = [""] + categories
+            services_opts = [""] + services
 
             c1, c2, c3 = st.columns([1,1,1])
             with c1:
-                category = st.selectbox("Category (required)", options=[""] + categories, index=( [""] + categories ).index(str(row.get("category") or "")), key="edit_category")
+                category = st.selectbox("Category (required)", options=categories_opts,
+                                        index=_safe_index(categories_opts, str(row.get("category") or "")),
+                                        key="edit_category")
             with c2:
-                service = st.selectbox("Service (optional)", options=[""] + services, index=( [""] + services ).index(str(row.get("service") or "")), key="edit_service")
+                service = st.selectbox("Service (optional)", options=services_opts,
+                                       index=_safe_index(services_opts, str(row.get("service") or "")),
+                                       key="edit_service")
             with c3:
                 business_name = st.text_input("Business Name (required)", str(row.get("business_name") or ""), key="edit_business_name")
             c4, c5, c6 = st.columns([1,1,1])
@@ -414,7 +440,7 @@ def tab_edit(engine: Engine, data: Dict[str, pd.DataFrame]):
                         )
                     st.success("Vendor updated.")
                     refresh_data_cache()
-                    st.experimental_rerun()
+                    _rerun()
 
             with cB:
                 if st.button("Delete Vendor", type="secondary", key="btn_delete_vendor"):
@@ -422,8 +448,7 @@ def tab_edit(engine: Engine, data: Dict[str, pd.DataFrame]):
                         conn.execute(sql_text("DELETE FROM vendors WHERE id=:id"), {"id": vid})
                     st.success("Vendor deleted.")
                     refresh_data_cache()
-                    st.experimental_rerun()
-
+                    _rerun()
 
 # -----------------------------
 # Category & Service Admin
@@ -460,7 +485,7 @@ def tab_refdata(engine: Engine, data: Dict[str, pd.DataFrame]):
                     conn.execute(sql_text("INSERT OR IGNORE INTO categories(name) VALUES(:n)"), {"n": new_cat.strip()})
                 st.success("Category added.")
                 refresh_data_cache()
-                st.experimental_rerun()
+                _rerun()
 
         cat_to_rename = st.selectbox("Rename Category", options=[""] + existing_cats, index=0, key="rename_cat_from")
         cat_new_name = st.text_input("New name", "", key="rename_cat_to")
@@ -475,7 +500,7 @@ def tab_refdata(engine: Engine, data: Dict[str, pd.DataFrame]):
                     conn.execute(sql_text("UPDATE vendors SET category=:to WHERE category=:frm"), {"to": cat_new_name.strip(), "frm": cat_to_rename})
                 st.success("Category renamed (and vendor rows updated).")
                 refresh_data_cache()
-                st.experimental_rerun()
+                _rerun()
 
         cat_to_delete = st.selectbox("Delete Category (only if unused)", options=[""] + existing_cats, index=0, key="delete_cat")
         if st.button("Delete Category", key="btn_delete_cat"):
@@ -488,7 +513,7 @@ def tab_refdata(engine: Engine, data: Dict[str, pd.DataFrame]):
                     conn.execute(sql_text("DELETE FROM categories WHERE name=:n"), {"n": cat_to_delete})
                 st.success("Category deleted.")
                 refresh_data_cache()
-                st.experimental_rerun()
+                _rerun()
 
         # Orphans used by vendors but missing in categories table
         used_cats = set(vendors["category"].dropna().astype(str).unique())
@@ -511,7 +536,7 @@ def tab_refdata(engine: Engine, data: Dict[str, pd.DataFrame]):
                     conn.execute(sql_text("INSERT OR IGNORE INTO services(name) VALUES(:n)"), {"n": new_svc.strip()})
                 st.success("Service added.")
                 refresh_data_cache()
-                st.experimental_rerun()
+                _rerun()
 
         svc_to_rename = st.selectbox("Rename Service", options=[""] + existing_svcs, index=0, key="rename_svc_from")
         svc_new_name = st.text_input("New name", "", key="rename_svc_to")
@@ -526,7 +551,7 @@ def tab_refdata(engine: Engine, data: Dict[str, pd.DataFrame]):
                     conn.execute(sql_text("UPDATE vendors SET service=:to WHERE service=:frm"), {"to": svc_new_name.strip(), "frm": svc_to_rename})
                 st.success("Service renamed (and vendor rows updated).")
                 refresh_data_cache()
-                st.experimental_rerun()
+                _rerun()
 
         svc_to_delete = st.selectbox("Delete Service (only if unused)", options=[""] + existing_svcs, index=0, key="delete_svc")
         if st.button("Delete Service", key="btn_delete_svc"):
@@ -539,14 +564,13 @@ def tab_refdata(engine: Engine, data: Dict[str, pd.DataFrame]):
                     conn.execute(sql_text("DELETE FROM services WHERE name=:n"), {"n": svc_to_delete})
                 st.success("Service deleted.")
                 refresh_data_cache()
-                st.experimental_rerun()
+                _rerun()
 
         used_svcs = set(vendors["service"].dropna().astype(str).unique())
         known_svcs = set(existing_svcs)
         svc_orphans = sorted(list(used_svcs - known_svcs))
         if svc_orphans:
             st.info("Orphan services in vendors (not in services table): " + ", ".join(svc_orphans))
-
 
 # -----------------------------
 # Maintenance tab
@@ -593,7 +617,6 @@ def tab_maint(engine: Engine, data: Dict[str, pd.DataFrame]):
             st.success("Backfilled created_at/updated_at/updated_by.")
             refresh_data_cache()
 
-
 # -----------------------------
 # Debug tab
 # -----------------------------
@@ -628,7 +651,6 @@ def tab_debug(engine: Engine, engine_info: Dict[str, str], data: Dict[str, pd.Da
         },
     }
     st.json(schema)
-
 
 # -----------------------------
 # Main

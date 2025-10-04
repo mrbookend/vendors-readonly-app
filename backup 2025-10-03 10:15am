@@ -1,7 +1,19 @@
-from layout_header import apply_layout
-apply_layout()
-# app_readonly.py — Vendors Directory (Read-only, Live DB via Turso or local fallback)
-return
+# app_readonly.py — Read‑Only Vendors (stability‑first v3.2)
+# 
+# Goals
+# - Preserve original look/feel and column order (zero surprise)
+# - Secrets control labels, widths, sticky first column, help text
+# - Fix Help crash (no nested expanders; Markdown rendering)
+# - Turso (libSQL) primary DB, local SQLite fallback
+# - Simple quick filter (client‑side contains across all string cols)
+# - Minimal CSS for wrapping/widths; no other visual drift
+# - Download CSV button; Status & Secrets (debug) pinned at END
+# - Website: clickable link (display text = "Website") only when URL is valid,
+#   and a full URL text column immediately to the right.
+#
+# Expected schema: vendors(id, category, service, business_name, contact_name, phone, address, website, notes, keywords)
+#
+# Version: 3.2 (2025‑10‑03)
 
 from __future__ import annotations
 
@@ -291,59 +303,35 @@ DEBUG_KEYS = (
 
 
 def render_status_debug():
-   with st.expander("Status & Secrets (debug)", expanded=False):
-    # --- Engine / Dialect facts
-    engine_meta = {
-        "sqlalchemy_url": str(engine.url),
-        "dialect": getattr(engine.dialect, "name", "?"),
-        "driver": getattr(engine.dialect, "driver", "?"),
-    }
-    using_remote = (engine_meta["driver"] == "libsql")  # True => Turso active; False => local SQLite
+    with st.expander("Status & Secrets (debug)", expanded=False):
+        try:
+            keys = list(st.secrets.keys())
+        except Exception:
+            keys = []
 
-    # Probe connection for extra hints (non-fatal if it fails)
-    probe = {}
-    try:
-        with engine.connect() as conn:
-            # When local SQLite, show on-disk DB path via PRAGMA database_list
-            try:
-                rows = conn.exec_driver_sql("PRAGMA database_list").fetchall()
-                # rows like: [(0, 'main', '/path/to/vendors.db'), ...]
-                if rows and len(rows[0]) >= 3:
-                    probe["sqlite_db_path"] = rows[0][2]
-            except Exception as e:
-                probe["pragma_error"] = repr(e)
-    except Exception as e:
-        probe["connect_error"] = repr(e)
+        backend = (
+            "libsql" if str(_read_secret_early("TURSO_DATABASE_URL", "")).startswith("sqlite+libsql://") else "sqlite"
+        )
+        dsn = _read_secret_early("TURSO_DATABASE_URL", "")
+        auth = "token_set" if bool(_read_secret_early("TURSO_AUTH_TOKEN", None)) else "none"
 
-    st.subheader("DB (resolved)")
-    st.code({
-        "using_remote": using_remote,  # <- this is the truth signal
-        **engine_meta
-    }, language="json")
+        st.write("DB")
+        st.code({"backend": backend, "dsn": dsn, "auth": auth})
 
-    if probe:
-        st.subheader("DB Probe")
-        st.code(probe, language="json")
+        st.write("Secrets keys (present)")
+        st.code(keys)
 
-    # --- Secrets overview (kept concise)
-    try:
-        keys = list(st.secrets.keys())
-    except Exception:
-        keys = []
-    st.subheader("Secrets keys (present)")
-    st.write(keys if keys else "No st.secrets or cannot enumerate in this environment.")
+        st.write("Help MD:", "present" if bool(HELP_MD) else "(missing or empty)")
+        st.write("Sticky first col enabled:", STICKY_FIRST)
 
-    st.subheader("Help Content")
-    st.write({"title": HELP_TITLE, "md_len": len(HELP_MD or "")})
+        st.write("Raw COLUMN_WIDTHS_PX_READONLY (type)", type(COLUMN_WIDTHS_PX).__name__)
+        st.code(COLUMN_WIDTHS_PX)
 
-    st.subheader("Raw column widths (from secrets, merged with defaults)")
-    st.code(COLUMN_WIDTHS_PX, language="json")
+        st.write("Column label overrides (if any)")
+        st.code(LABEL_OVERRIDES)
 
-    st.subheader("Column label overrides (if any)")
-    st.code(LABEL_OVERRIDES, language="json")
-
-    st.subheader("Effective column order")
-    st.code(COLUMN_ORDER, language="json")
+        st.write("Effective column order")
+        st.code(COLUMN_ORDER)
 
 
 # -----------------------------
